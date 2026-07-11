@@ -2650,6 +2650,23 @@ test_deadline_terminates_descendant_processes() {
     pass "deadline wrapper terminates descendant processes"
 }
 
+test_post_start_propagates_silent_start_failure() {
+    local fixture="$TMP_ROOT/post-start-fixture" rc
+    mkdir -p "$fixture/scripts" "$fixture/logs" "$fixture/data"
+    cp "$ROOT_DIR/scripts/post-start.sh" "$fixture/scripts/post-start.sh"
+    printf '#!/usr/bin/env bash\nexit 37\n' > "$fixture/g2ray.sh"
+
+    set +e
+    G2RAY_LOG_DIR="$fixture/logs" bash "$fixture/scripts/post-start.sh"
+    rc=$?
+    set -e
+
+    [[ "$rc" -eq 37 ]] || fail "post-start returned $rc instead of silent-start status 37"
+    grep -Fq 'post_start failed rc=37' "$fixture/logs/g2ray.log" \
+        || fail "post-start did not log the real silent-start failure status"
+    pass "post-start propagates silent-start failures"
+}
+
 test_port_visibility_is_throttled
 test_codespace_detection_uses_shared_environment_in_headless_ssh
 test_codespace_detection_uses_local_metadata_when_gh_is_unauthenticated
@@ -2688,6 +2705,7 @@ test_route_health_refresh_does_not_let_unusable_cache_starve_builtins
 test_route_refresh_backoff_preserves_cache_without_probe_storms
 test_self_heal_defers_external_repairs_while_traffic_is_active
 test_deadline_terminates_descendant_processes
+test_post_start_propagates_silent_start_failure
 test_route_preference_write_failures_return_failure
 test_pinned_route_is_a_durable_candidate_source
 test_cached_route_health_is_a_durable_candidate_source

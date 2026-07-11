@@ -27,8 +27,71 @@ const QUOTA_CRON_NEAR_RESET_WINDOW_MS = 6 * 60 * 60 * 1000;
 
 export default {
   async fetch(request, env, ctx) {
-    const url = new URL(request.url);
+    return observedFetch(request, env, ctx);
+  },
 
+  async scheduled(controller, env, ctx) {
+    if (!quotaSurvivalCronEnabled(env)) return;
+    const task = handleQuotaSurvivalCron(controller, env);
+    if (ctx && typeof ctx.waitUntil === "function") {
+      ctx.waitUntil(task);
+    } else {
+      await task;
+    }
+  }
+};
+
+async function observedFetch(request, env, ctx) {
+  const startedAt = Date.now();
+  const url = new URL(request.url);
+  const requestId = request.headers.get("cf-ray") ||
+    (globalThis.crypto?.randomUUID ? globalThis.crypto.randomUUID() : `${startedAt}-${Math.random().toString(16).slice(2)}`);
+  let response;
+  try {
+    response = await routeFetchRequest(request, env, ctx, url);
+  } catch (error) {
+    console.error(JSON.stringify({
+      event: "worker_request_failed",
+      request_id: requestId,
+      method: request.method,
+      path: url.pathname,
+      duration_ms: Date.now() - startedAt,
+      error: shortError(error)
+    }));
+    response = json({ ok: false, error: "internal_error", request_id: requestId }, 500);
+  }
+
+  const headers = new Headers(response.headers);
+  headers.set("x-g2ray-request-id", requestId);
+  const requestEvent = JSON.stringify({
+    event: "worker_request",
+    request_id: requestId,
+    method: request.method,
+    path: url.pathname,
+    status: response.status,
+    duration_ms: Date.now() - startedAt,
+    colo: request.cf?.colo || null
+  });
+  if (response.status >= 500) {
+    console.error(requestEvent);
+  } else if (response.status >= 400) {
+    console.warn(requestEvent);
+  } else if (requestLogsEnabled(env)) {
+    console.log(requestEvent);
+  }
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
+}
+
+function requestLogsEnabled(env = {}) {
+  const value = String(env.WORKER_REQUEST_LOGS ?? "1").trim().toLowerCase();
+  return !["0", "false", "no", "off"].includes(value);
+}
+
+async function routeFetchRequest(request, env, ctx, url = new URL(request.url)) {
     if ((url.pathname === "/" || url.pathname === "/wake") && request.method === "GET") {
       return html(renderDashboard());
     }
@@ -54,18 +117,7 @@ export default {
     }
 
     return json({ ok: false, error: "not_found" }, 404);
-  },
-
-  async scheduled(controller, env, ctx) {
-    if (!quotaSurvivalCronEnabled(env)) return;
-    const task = handleQuotaSurvivalCron(controller, env);
-    if (ctx && typeof ctx.waitUntil === "function") {
-      ctx.waitUntil(task);
-    } else {
-      await task;
-    }
-  }
-};
+}
 
 async function handleWake(request, env, ctx) {
   const context = await requireAuthorizedContext(request, env);

@@ -913,8 +913,11 @@ test_cloudflare_worker_waker_is_safe_to_publish() {
         || fail 'Worker local Wrangler cache is not ignored'
     [[ -f "$WORKER_DIR/package-lock.json" ]] \
         || fail 'Worker npm lockfile is missing, so Wrangler installs can drift'
-    grep_fixed '"wrangler": "4.97.0"' "$WORKER_DIR/package.json" \
-        || fail 'Worker package.json does not pin Wrangler'
+    node -e '
+      const value = require(process.argv[1]).devDependencies?.wrangler || "";
+      if (!/^\d+\.\d+\.\d+$/.test(value)) process.exit(1);
+    ' "$WORKER_DIR/package.json" \
+        || fail 'Worker package.json does not pin Wrangler to an exact version'
     grep_fixed 'env.GITHUB_TOKEN' "$WORKER_SCRIPT" \
         || fail 'Worker does not read GitHub token from Cloudflare secret env'
     grep_fixed 'env.WAKE_SECRET' "$WORKER_SCRIPT" \

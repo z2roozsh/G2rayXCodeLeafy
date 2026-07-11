@@ -50,6 +50,7 @@ function baseEnv(overrides = {}) {
     GITHUB_TOKEN: "github-token",
     CODESPACE_NAME: "behavior-space",
     ROUTE_READY_STABLE_SLEEP_MS: "0",
+    WORKER_REQUEST_LOGS: "0",
     ...overrides
   };
 }
@@ -1332,6 +1333,7 @@ async function testResponsesIncludeSecurityHeaders() {
   assert.equal(htmlResponse.headers.get("x-content-type-options"), "nosniff");
   assert.equal(htmlResponse.headers.get("referrer-policy"), "no-referrer");
   assert.equal(htmlResponse.headers.get("x-frame-options"), "DENY");
+  assert.ok(htmlResponse.headers.get("x-g2ray-request-id"));
   assert.match(htmlResponse.headers.get("content-security-policy") || "", /frame-ancestors 'none'/);
 
   const jsonResponse = await worker.fetch(makeRequest("/api/history", "wrong-secret"), baseEnv(), {});

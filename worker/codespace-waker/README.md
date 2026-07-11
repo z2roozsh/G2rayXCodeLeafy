@@ -65,6 +65,12 @@ CODESPACE_NAME = "your-codespace-slug"
 
 If you use the Cloudflare dashboard instead of Wrangler, add `CODESPACE_NAME` as a **Plaintext** variable.
 
+The tracked example enables Workers Logs. Successful and failed requests emit a
+structured event with `request_id`, route path, HTTP status, duration, and
+Cloudflare colo; responses return the same ID in `x-g2ray-request-id`. Set
+`WORKER_REQUEST_LOGS=0` only when you intentionally want to suppress successful
+request events. Errors are still logged.
+
 Optional: add `CODESPACE_PORT` as a **Plaintext** variable only if you changed the panel's `XRAY_PORT`. Leave it unset for the default port `443`.
 
 Optional: add `CODESPACE_FORWARDING_DOMAIN` as a **Plaintext** variable only if GitHub changes the Codespaces forwarding domain from `app.github.dev`. The Worker also accepts `CODESPACE_PORT_FORWARDING_DOMAIN` and `GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN`.
@@ -122,6 +128,11 @@ In the Cloudflare dashboard, add both `GITHUB_TOKEN` and `WAKE_SECRET` as **Secr
 npm run deploy
 ```
 
+The `predeploy` check prints the exact `CODESPACE_NAME` from the ignored local
+`wrangler.toml` and refuses placeholders or malformed names. Read that line
+before accepting a deployment so an old account's Worker is not overwritten
+with the wrong Codespace target.
+
 Wrangler prints the Worker URL, for example:
 
 ```text
@@ -131,6 +142,11 @@ https://g2ray-codespace-waker.YOUR_SUBDOMAIN.workers.dev
 The panel accepts the Worker URL with or without `https://`, and with or without `/wake`. It stores the normalized `/wake` URL.
 
 If you are using the G2ray panel, return to **Option 15: Recovery / Waker Setup** after deploy, paste this Worker URL, and run the panel's Worker test. This saves only non-sensitive Worker metadata locally so diagnostics and the recovery card know which Worker is configured.
+
+For filtered networks, deploy a second Worker endpoint with the same Codespace
+and wake secret, then save it as the Android account's Backup Worker URL. The
+client automatically fails over when the primary endpoint is unreachable or
+returns an endpoint-specific server/auth/not-found failure.
 
 ## 5. Start The Codespace Manually
 

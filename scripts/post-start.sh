@@ -15,8 +15,9 @@ printf '%s [INFO] post_start begin\n' "$(ts)" >> "$LOG_DIR/g2ray.log" 2>/dev/nul
 if bash "$BASE_DIR/g2ray.sh" --silent-start >> "$LOG_DIR/post-start.log" 2>&1; then
     printf '%s [INFO] post_start complete\n' "$(ts)" >> "$LOG_DIR/g2ray.log" 2>/dev/null || true
     exit 0
+else
+    rc=$?
 fi
 
-rc=$?
 printf '%s [WARN] post_start failed rc=%s\n' "$(ts)" "$rc" >> "$LOG_DIR/g2ray.log" 2>/dev/null || true
 exit "$rc"
