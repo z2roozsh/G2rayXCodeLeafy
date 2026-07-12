@@ -1736,7 +1736,9 @@ waker_metadata_summary() {
         echo -e "Status      : configured"
         echo -e "Worker URL  : ${WHITE}${worker_url}${NC}"
         echo -e "Codespace   : ${WHITE}${codespace:-$CODESPACE_NAME}${NC}"
-        echo -e "Worker ID   : ${WHITE}${worker_codespace_id:-${codespace:-$CODESPACE_NAME}}${NC}"
+        if [[ -n "$worker_codespace_id" && "$worker_codespace_id" != "${codespace:-$CODESPACE_NAME}" ]]; then
+            echo -e "Selection ID: ${WHITE}${worker_codespace_id}${NC}"
+        fi
         echo -e "Secret      : fingerprint=${wake_fingerprint:-unknown} ${DIM}(raw secret is not stored)${NC}"
         echo -e "Last setup  : ${DIM}${configured_at:-unknown}${NC}"
     else
@@ -1826,44 +1828,46 @@ show_waker_recovery_guide() {
 }
 
 setup_cloudflare_waker() {
-    local wake_secret wake_fingerprint worker_url worker_codespace_id ready do_test
+    local wake_secret wake_fingerprint worker_url ready do_test
     CODESPACE_NAME=$(_detect_codespace_name 2>/dev/null || true)
     refresh_port_domains
-    wake_secret=$(generate_wake_secret)
-    wake_fingerprint=$(fingerprint_secret "$wake_secret")
 
     refresh_screen
     echo -e "\n  ${RED}Cloudflare Worker Waker Setup${NC}\n"
     echo -e "  ${WHITE}Detected Codespace:${NC} ${GREEN}${CODESPACE_NAME}${NC}"
     echo -e "  ${WHITE}Codespaces app domain:${NC} ${GREEN}${PORT_DOMAIN}${NC}\n"
-    echo -e "  First, set GitHub Codespaces ${WHITE}Default idle timeout${NC} to ${WHITE}240 minutes${NC}:"
-    echo -e "  GitHub -> Settings -> Codespaces -> Default idle timeout -> 240 minutes.\n"
-    echo -e "  To survive monthly quota exhaustion, mark this Codespace as ${WHITE}Keep codespace${NC}:"
-    echo -e "  GitHub -> Codespaces -> this Codespace -> ${WHITE}...${NC} menu -> ${WHITE}Keep codespace${NC}."
-    echo -e "  Same configs survive next month only if this same Codespace is not deleted.\n"
-    echo -e "  ${WHITE}${B}Step 1 - Create a GitHub token${NC}"
-    echo -e "  Recommended classic token path:"
+    echo -e "  ${WHITE}${B}1. Create a GitHub token${NC}"
     echo -e "  ${WHITE}https://github.com/settings/tokens/new?scopes=codespace${NC}"
-    echo -e "  Or open GitHub -> Settings -> Developer settings -> Personal access tokens -> Tokens (classic)."
-    echo -e "  Generate a new classic token and select only the ${WHITE}codespace${NC} scope."
-    echo -e "  Do not paste the GitHub token into G2ray."
-    echo -e "  Save it privately, then put it directly into Cloudflare as secret ${WHITE}GITHUB_TOKEN${NC}.\n"
-    echo -e "  ${WHITE}${B}Step 2 - Create a Worker${NC}"
-    echo -e "  In Cloudflare, create a Hello World Worker, open its editor, and replace the code with:"
+    echo -e "  Select the ${WHITE}codespace${NC} scope and copy the token.\n"
+    echo -e "  ${WHITE}${B}2. Paste the Worker code${NC}"
+    echo -e "  Cloudflare -> Workers & Pages -> your Worker -> Edit code."
+    echo -e "  Replace all code with this file, then click Deploy:"
     echo -e "  ${WHITE}${BASE_DIR}/worker/codespace-waker/src/index.js${NC}\n"
-    echo -e "  In Cloudflare -> Worker -> Settings -> Variables and Secrets, add:"
-    echo -e "  ${WHITE}CODESPACE_NAME${NC} as a ${WHITE}Plaintext${NC} variable with this value:"
-    echo -e "  ${GREEN}${CODESPACE_NAME}${NC}\n"
-    echo -e "  Add these as ${WHITE}Secret${NC} variables:"
-    echo -e "  ${WHITE}GITHUB_TOKEN${NC} -> the GitHub token you created"
-    echo -e "  ${WHITE}WAKE_SECRET${NC}  -> the wake secret below\n"
-    echo -e "  Optional: if you changed XRAY_PORT, add ${WHITE}CODESPACE_PORT${NC} as a Plaintext variable."
-    echo -e "  Leave it unset for the default port 443.\n"
-    echo -e "  Optional: bind ${WHITE}WAKER_KV${NC} and set ${WHITE}QUOTA_SURVIVAL_CRON_ENABLED=true${NC}"
-    echo -e "  only if you want quota-block history and conservative post-reset checks.\n"
-    echo -e "  The wake secret is shown once. Save it now and paste it into Cloudflare:"
-    echo -e "  ${GREEN}${wake_secret}${NC}"
-    echo -e "  ${DIM}Fingerprint saved locally: ${wake_fingerprint}${NC}\n"
+    echo -e "  ${WHITE}${B}3. Choose one shared wake key${NC}"
+    echo -e "  Use the same ${WHITE}WAKE_SECRET${NC} in Cloudflare and in the Android app."
+    echo -e "  For an existing Worker, paste its current key below."
+    echo -ne "  ${GREEN}Shared wake key (hidden; Enter generates a new first key):${NC} "
+    read -r -s wake_secret || { echo ""; return 1; }
+    echo ""
+    if [[ -z "$wake_secret" ]]; then
+        wake_secret=$(generate_wake_secret) || return 1
+        echo -e "  Generated key: ${GREEN}${wake_secret}${NC}"
+        echo -e "  ${YELLOW}Save it now. Use this exact same key everywhere.${NC}"
+    else
+        wake_secret=$(one_line "$wake_secret")
+        echo -e "  ${GREEN}Using the existing shared wake key.${NC}"
+    fi
+    wake_fingerprint=$(fingerprint_secret "$wake_secret")
+    echo -e "  ${DIM}Key fingerprint: ${wake_fingerprint}${NC}\n"
+    echo -e "  ${WHITE}${B}4. Add exactly these Cloudflare variables${NC}"
+    echo -e "  Worker -> Settings -> Variables and Secrets:"
+    echo -e "  ${WHITE}CODESPACE_NAME${NC}  Plaintext  ${GREEN}${CODESPACE_NAME}${NC}"
+    echo -e "  ${WHITE}GITHUB_TOKEN${NC}    Secret     ${DIM}<your GitHub token>${NC}"
+    echo -e "  ${WHITE}WAKE_SECRET${NC}     Secret     ${DIM}<the shared key above>${NC}\n"
+    echo -e "  For another Codespace in this same Worker, add only:"
+    echo -e "  ${WHITE}CODESPACE_2_NAME${NC}  Plaintext  ${DIM}<second Codespace name>${NC}"
+    echo -e "  ${WHITE}GITHUB_TOKEN_2${NC}    Secret     ${DIM}<its account token>${NC}"
+    echo -e "  Keep the same ${WHITE}WAKE_SECRET${NC}. No KV or Wrangler is required.\n"
     echo -ne "  ${GREEN}Is the Worker deployed with those values? (y/n):${NC} "
     read -r ready || { touch "$WAKER_PROMPT_FILE" 2>/dev/null || true; return 0; }
     [[ "$ready" =~ ^[Yy]$ ]] || { echo -e "  ${DIM}Setup paused. Open option 15 when ready.${NC}"; sleep 2; return 0; }
@@ -1877,16 +1881,7 @@ setup_cloudflare_waker() {
         sleep 2
         return 1
     fi
-    echo -ne "  ${GREEN}Worker registry ID (Enter uses ${CODESPACE_NAME}):${NC} "
-    read -r worker_codespace_id || worker_codespace_id=""
-    worker_codespace_id=$(one_line "$worker_codespace_id")
-    [[ -n "$worker_codespace_id" ]] || worker_codespace_id="$CODESPACE_NAME"
-    if [[ ! "$worker_codespace_id" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]; then
-        echo -e "  ${RED}Invalid Worker registry ID. Use letters, numbers, _ or - only.${NC}"
-        sleep 2
-        return 1
-    fi
-    save_waker_metadata "$worker_url" "$(fingerprint_secret "$wake_secret")" "$CODESPACE_NAME" "$worker_codespace_id"
+    save_waker_metadata "$worker_url" "$wake_fingerprint" "$CODESPACE_NAME" "$CODESPACE_NAME"
     touch "$WAKER_PROMPT_FILE" 2>/dev/null || true
     echo -e "  ${GREEN}Saved non-sensitive waker metadata.${NC}"
     echo -e "  ${DIM}GitHub token and raw wake secret were not stored in G2ray.${NC}\n"

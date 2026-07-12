@@ -104,6 +104,19 @@ async function testMissingWakeSecretIsConfigurationError() {
   console.log("PASS: Worker reports missing wake secret as configuration error");
 }
 
+async function testMissingCodespaceNameIsActionable() {
+  const response = await worker.fetch(
+    makeRequest("/api/health"),
+    baseEnv({ CODESPACE_NAME: "" }),
+    {}
+  );
+  const body = await responseJson(response);
+  assert.equal(response.status, 500);
+  assert.equal(body.error, "missing_codespace_name");
+  assert.match(body.next_action, /CODESPACE_NAME/);
+  console.log("PASS: Worker reports missing CODESPACE_NAME with dashboard guidance");
+}
+
 async function testGithubRateLimitClassification() {
   const resetEpoch = Math.ceil(Date.now() / 1000) + 120;
   globalThis.fetch = async (input) => {
@@ -1327,6 +1340,8 @@ async function testHistoryRejectsBadSecretClearly() {
   assert.equal(response.status, 401);
   assert.equal(body.ok, false);
   assert.equal(body.error, "unauthorized");
+  assert.equal(body.next_action_code, "fix_wake_secret");
+  assert.match(body.next_action, /WAKE_SECRET/);
   console.log("PASS: Worker history rejects bad wake secret clearly");
 }
 
@@ -1871,6 +1886,90 @@ async function testWakeSkipsGithubStartWhenCodespaceIsAvailableButRouteSettling(
   console.log("PASS: Worker wake does not restart an available Codespace just because its route is settling");
 }
 
+async function testSimpleDashboardSetupAcceptsRealCodespaceName() {
+  const authorizations = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      authorizations.push(init.headers?.authorization || "");
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        idle_timeout_minutes: 120
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const env = baseEnv();
+  const directoryResponse = await worker.fetch(makeRequest("/api/codespaces"), env, {});
+  const directory = await responseJson(directoryResponse);
+  assert.equal(directoryResponse.status, 200);
+  assert.equal(directory.multi_codespace, false);
+  assert.equal(directory.default_codespace_id, "behavior-space");
+  assert.equal(directory.codespaces[0].id, "behavior-space");
+
+  const healthResponse = await worker.fetch(
+    makeRequest("/api/health?route=false", "secret", { codespace_id: "behavior-space" }),
+    env,
+    {}
+  );
+  const health = await responseJson(healthResponse);
+  assert.equal(healthResponse.status, 200);
+  assert.equal(health.codespace_id, "behavior-space");
+  assert.equal(health.codespace, "behavior-space");
+  const staleIdResponse = await worker.fetch(
+    makeRequest("/api/health?route=false", "secret", { codespace_id: "legacy-default" }),
+    env,
+    {}
+  );
+  const staleIdHealth = await responseJson(staleIdResponse);
+  assert.equal(staleIdResponse.status, 200);
+  assert.equal(staleIdHealth.codespace_id, "behavior-space");
+  assert.deepEqual(authorizations, ["Bearer github-token", "Bearer github-token"]);
+  console.log("PASS: Worker simple dashboard setup accepts the real Codespace name");
+}
+
+async function testDashboardVariablesSupportMultipleCodespacesWithoutKv() {
+  const authorizations = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      authorizations.push(init.headers?.authorization || "");
+      return new Response(JSON.stringify({
+        name: "standby-space",
+        state: "Available",
+        pending_operation: false,
+        idle_timeout_minutes: 120
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const env = baseEnv({
+    CODESPACE_2_NAME: "standby-space",
+    GITHUB_TOKEN_2: "standby-token"
+  });
+  const directoryResponse = await worker.fetch(makeRequest("/api/codespaces"), env, {});
+  const directory = await responseJson(directoryResponse);
+  assert.equal(directoryResponse.status, 200);
+  assert.equal(directory.multi_codespace, true);
+  assert.equal(directory.codespaces.length, 2);
+  assert.equal(directory.codespaces[1].id, "standby-space");
+
+  const healthResponse = await worker.fetch(
+    makeRequest("/api/health?route=false", "secret", { codespace_id: "standby-space" }),
+    env,
+    {}
+  );
+  const health = await responseJson(healthResponse);
+  assert.equal(healthResponse.status, 200);
+  assert.equal(health.codespace_id, "standby-space");
+  assert.deepEqual(authorizations, ["Bearer standby-token"]);
+  console.log("PASS: Worker dashboard variables support multiple Codespaces without KV");
+}
+
 async function testWorkerRegistrySelectsBoundTokenAndReturnsSafeDirectory() {
   const kv = makeKv();
   await kv.put("codespace-registry:v1", JSON.stringify({
@@ -1951,6 +2050,7 @@ try {
   await testFailedSecretRateLimit();
   await testFailedSecretRateLimitCapsKvWrites();
   await testMissingWakeSecretIsConfigurationError();
+  await testMissingCodespaceNameIsActionable();
   await testGithubRateLimitClassification();
   await testGithubScopeFailureClassification();
   await testGithubUnknownForbiddenClassificationIsNeutral();
@@ -1994,6 +2094,8 @@ try {
   await testHealthRouteUrlUsesForwardingDomainOverride();
   await testWakeSkipsGithubStartWhenAlreadyAvailableAndRouteReady();
   await testWakeSkipsGithubStartWhenCodespaceIsAvailableButRouteSettling();
+  await testSimpleDashboardSetupAcceptsRealCodespaceName();
+  await testDashboardVariablesSupportMultipleCodespacesWithoutKv();
   await testWorkerRegistrySelectsBoundTokenAndReturnsSafeDirectory();
 } finally {
   globalThis.fetch = originalFetch;

@@ -18,6 +18,7 @@ const QUOTA_INCIDENT_KEY_PREFIX = "quota-incident:";
 const CODESPACE_REGISTRY_KEY = "codespace-registry:v1";
 const QUOTA_CRON_CURSOR_KEY = "quota-cron-cursor:v1";
 const MAX_REGISTERED_CODESPACES = 20;
+const MAX_DASHBOARD_CODESPACES = 10;
 const HISTORY_LIMIT = 50;
 const FAILED_AUTH_KEY_PREFIX = "failed-auth:";
 const SUCCESSFUL_WAKE_KEY_PREFIX = "successful-wake:";
@@ -172,9 +173,9 @@ function wakeFastPathEnabled(env = {}) {
 }
 
 async function alreadyWarmCodespaceData(name, token, env, routePorts = [codespacePort(env)]) {
-  const firstRouteData = await probeCodespaceRoutes(name, routePorts, env, { stable: false });
   const status = await getCodespaceStatus(name, token, env);
   if (!isCodespaceAvailable(status)) return { status, data: null };
+  const firstRouteData = await probeCodespaceRoutes(name, routePorts, env, { stable: false });
 
   // A GitHub start call cannot repair a Codespace that is already Available.
   // Keep that distinction honest: report the existing edge state and let the
@@ -336,6 +337,17 @@ async function requireAuthorizedContext(request, env, options = {}) {
 
   const requestedId = await readRequestedCodespaceId(request);
   const registry = await readCodespaceRegistry(env);
+  if (!registry.entries.length) {
+    return {
+      ok: false,
+      status: 500,
+      body: {
+        ok: false,
+        error: "missing_codespace_name",
+        next_action: "Add CODESPACE_NAME as a plaintext Worker variable, then retry."
+      }
+    };
+  }
   const entry = selectCodespaceEntry(registry, requestedId);
   if (!entry) {
     return {
@@ -392,7 +404,16 @@ async function requireWakeSecret(request, env) {
   if (!(await secretsEqual(suppliedSecret, env.WAKE_SECRET))) {
     const limited = await rateLimitFailedAuth(request, env);
     if (limited) return limited;
-    return { ok: false, status: 401, body: { ok: false, error: "unauthorized" } };
+    return {
+      ok: false,
+      status: 401,
+      body: {
+        ok: false,
+        error: "unauthorized",
+        next_action_code: "fix_wake_secret",
+        next_action: "The wake key does not match Cloudflare WAKE_SECRET. Use the same exact key in the Worker page, panel, and Android app."
+      }
+    };
   }
   return { ok: true };
 }
@@ -434,21 +455,44 @@ async function readCodespaceRegistry(env) {
     }
   }
 
-  const legacyName = String(env.CODESPACE_NAME || "").trim();
-  if (!legacyName) return { multi: false, defaultCodespaceId: null, entries: [] };
+  const dashboardEntries = readDashboardCodespaceEntries(env);
+  if (!dashboardEntries.length) return { multi: false, defaultCodespaceId: null, entries: [] };
   return {
-    multi: false,
-    defaultCodespaceId: "legacy-default",
-    entries: [{
-      id: "legacy-default",
-      label: legacyName,
-      name: legacyName,
-      tokenBinding: "GITHUB_TOKEN",
-      routePorts: normalizeRoutePorts([codespacePort(env)]),
-      priority: 0,
-      enabled: true
-    }]
+    multi: dashboardEntries.length > 1,
+    defaultCodespaceId: dashboardEntries[0].id,
+    entries: dashboardEntries
   };
+}
+
+function readDashboardCodespaceEntries(env) {
+  const entries = [];
+  const ids = new Set();
+  const names = new Set();
+  for (let slot = 1; slot <= MAX_DASHBOARD_CODESPACES; slot += 1) {
+    const suffix = slot === 1 ? "" : `_${slot}`;
+    const name = String(env[`CODESPACE${suffix}_NAME`] || "").trim();
+    if (!name) continue;
+    const configuredId = String(env[`CODESPACE${suffix}_ID`] || "").trim();
+    const id = configuredId || name;
+    if (!/^[a-z0-9][a-z0-9-]*$/i.test(name) ||
+        !/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(id) ||
+        ids.has(id) || names.has(name)) continue;
+    ids.add(id);
+    names.add(name);
+    const portValue = slot === 1
+      ? env.CODESPACE_PORT
+      : env[`CODESPACE_${slot}_PORT`];
+    entries.push({
+      id,
+      label: String(env[`CODESPACE${suffix}_LABEL`] || name).trim().slice(0, 96) || name,
+      name,
+      tokenBinding: slot === 1 ? "GITHUB_TOKEN" : `GITHUB_TOKEN_${slot}`,
+      routePorts: normalizeRoutePorts([portValue || DEFAULT_CODESPACE_PORT]),
+      priority: slot - 1,
+      enabled: true
+    });
+  }
+  return entries;
 }
 
 function normalizeRegistryEntries(value) {
@@ -497,6 +541,9 @@ function normalizePriority(value) {
 }
 
 function selectCodespaceEntry(registry, requestedId) {
+  if (registry.multi === false && registry.entries.length === 1) {
+    return registry.entries[0].enabled ? registry.entries[0] : null;
+  }
   const id = String(requestedId || registry.defaultCodespaceId || "").trim();
   return registry.entries.find((entry) => entry.id === id && entry.enabled) || null;
 }
@@ -2100,6 +2147,7 @@ document.getElementById("history").addEventListener("click", loadHistory);
 document.getElementById("copy").addEventListener("click", copyStatus);
 document.getElementById("stop").addEventListener("click", stopPolling);
 secretInput.addEventListener("change", loadCodespaces);
+secretInput.addEventListener("paste", () => setTimeout(loadCodespaces, 0));
 
 function wakeSecret() {
   return secretInput.value.trim();
@@ -2144,7 +2192,7 @@ async function callApi(path, includeCodespace = true) {
 }
 
 async function loadCodespaces() {
-  if (!wakeSecret()) return;
+  if (!wakeSecret()) return false;
   try {
     const data = await callApi("/api/codespaces", false);
     if (!data.ok) throw new Error(data.next_action || data.error || "Could not load Codespaces");
@@ -2158,11 +2206,18 @@ async function loadCodespaces() {
       codespaceSelect.appendChild(option);
     }
     codespaceSelect.disabled = codespaceSelect.options.length === 0;
+    return !codespaceSelect.disabled;
   } catch (error) {
     codespaceSelect.innerHTML = "<option value=\"\">Codespace load failed</option>";
     codespaceSelect.disabled = true;
     renderError(error);
+    return false;
   }
+}
+
+async function ensureCodespaceSelection() {
+  if (!codespaceSelect.disabled && selectedCodespaceId()) return true;
+  return loadCodespaces();
 }
 
 async function startWake() {
@@ -2171,6 +2226,7 @@ async function startWake() {
   const steps = ["Authenticating wake secret", "Calling GitHub start API", "Codespace started", "Checking XHTTP route", "Route ready or settling"];
   setProgress(steps, 0);
   try {
+    if (!(await ensureCodespaceSelection())) return;
     setProgress(steps, 1);
     const data = await callApi("/api/wake");
     setProgress(steps, data.route_ready ? 4 : data.start_accepted ? 3 : data.ok ? 4 : 1);
@@ -2189,6 +2245,7 @@ async function checkHealth() {
   setButtons(true);
   setProgress(["Authenticating wake secret", "Checking GitHub state", "Probing XHTTP route", "Showing result"], 1);
   try {
+    if (!(await ensureCodespaceSelection())) return;
     const data = await callApi("/api/health");
     setProgress(["Authenticating wake secret", "Checking GitHub state", "Probing XHTTP route", "Showing result"], 3);
     renderResult(data);
@@ -2205,6 +2262,7 @@ async function checkHealth() {
 async function loadHistory() {
   setButtons(true);
   try {
+    if (!(await ensureCodespaceSelection())) return;
     const data = await callApi("/api/history");
     renderHistory(data);
   } catch (error) {

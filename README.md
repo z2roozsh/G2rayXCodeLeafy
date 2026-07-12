@@ -49,7 +49,7 @@ Tracks real-time RX/TX traffic and resource usage (CPU/RAM). The quota panel is 
 #### 📦 Private Local Exports
 The panel writes copy-ready configs and a base64 subscription file inside your Codespace only. These generated files are ignored by git because they contain live connection credentials. Use them for your own devices and private tests; do not commit, publish, or share them as a public subscription.
 
-Every export refresh also writes `g2ray-codespace-bundle.json` locally. It contains that Codespace's name, optional Worker registry ID, and its VLESS links, but never a Worker URL, GitHub token, or wake key. The Android client can extract the links from this private bundle after you select or create the matching Codespace entry.
+Every export refresh also writes `g2ray-codespace-bundle.json` locally. It contains that Codespace's name, Worker selection name, and its VLESS links, but never a Worker URL, GitHub token, or wake key. The Android client can extract the links from this private bundle after you select or create the matching Codespace entry.
 
 <div align="center">
 
@@ -236,7 +236,7 @@ The helper uses GitHub's Codespaces start API, waits until the Codespace is avai
 
 For a standby Codespace, keep the old Codespace marked **Keep codespace** where GitHub allows it, then create a second Codespace only when you need current-month compute. The Android client keeps each Codespace's configs separate: select a Codespace on Home, test its local configs, then start VPN with the chosen config. It never silently changes an existing VPN session to another Codespace.
 
-One Cloudflare Worker can wake all of them when it is configured with the optional KV registry described in [the Worker guide](worker/codespace-waker/README.md#multi-codespace-registry). Use one shared wake key and one per-account GitHub token binding. The old Codespace remains saved in the app for the next billing reset; it will not be automatically started while GitHub reports quota blocked.
+One Cloudflare Worker can wake all of them without Wrangler or KV. Keep the first `CODESPACE_NAME` / `GITHUB_TOKEN`, then add `CODESPACE_2_NAME` / `GITHUB_TOKEN_2` in the Cloudflare dashboard for the standby Codespace. Continue with numbered pairs when needed and keep one shared `WAKE_SECRET`. The old Codespace remains saved in the app for the next billing reset; it will not be automatically started while GitHub reports quota blocked.
 
 Linux recovery after Worker wake:
 
@@ -334,11 +334,11 @@ If you want a phone/browser/curl-accessible manual wake button, this repo includ
 
 The Worker also provides a **Health dashboard** page for mobile use. The page itself can load in a browser, but wake, health, history, and copyable status actions require your wake secret. It shows GitHub state, XHTTP route readiness, route latency, idle timeout, last-used time, last failure, quota survival state, retention/deletion risk, copyable status text, route history summary, latency trend, and optional KV-backed history. This is external health only; it does not expose your UUID, VLESS links, or the panel's full option `14) Diagnostics` output.
 
-The panel can guide this from **Option 15: Recovery / Waker Setup**. It detects the current Codespace name, generates a wake secret, reminds you to set Default idle timeout to 240 minutes, and saves only non-sensitive metadata such as the Worker URL and wake-secret fingerprint.
+The panel guides this from **Option 15: Recovery / Waker Setup**. It detects the current Codespace name, lets you reuse the existing shared wake key or generate the first one, and saves only non-sensitive metadata such as the Worker URL and wake-key fingerprint.
 
 After the Worker starts the Codespace, it briefly probes the `app.github.dev` XHTTP route. If the response says `route_ready: true`, your existing VLESS configs should work again. If it says `route_ready: false` with HTTP `404`, GitHub has started the Codespace but the port route is still settling; wait 1-2 minutes and retry, or open the panel and use option `6) Recover Now`.
 
-Do not paste the GitHub token into G2ray. Create the token in GitHub, save it privately, and enter it directly in Cloudflare as the `GITHUB_TOKEN` secret. The wake secret is shown once by the panel; save it privately and enter it directly in Cloudflare as the `WAKE_SECRET` secret.
+Do not paste the GitHub token into G2ray. Create the token in GitHub, save it privately, and enter it directly in Cloudflare as the `GITHUB_TOKEN` secret. If the panel generates your first shared wake key, save it and use that exact value for Cloudflare `WAKE_SECRET` and the Android app. For later Codespaces, paste the existing key instead of generating another one.
 
 Classic token path:
 
@@ -355,6 +355,8 @@ Cloudflare dashboard binding types:
 - `GITHUB_TOKEN`: **Secret** variable.
 - `WAKE_SECRET`: **Secret** variable.
 
+For additional Codespaces in the same Worker, add `CODESPACE_2_NAME` as Plaintext and `GITHUB_TOKEN_2` as Secret, then use `_3`, `_4`, and so on up to `_10`. Keep the same `WAKE_SECRET`; KV is not required.
+
 Optional Cloudflare dashboard bindings:
 
 - `WAKER_KV`: KV namespace binding for dashboard history. Recommended for public deployments because it also enables failed wake-secret lockout and optional successful-wake cooldown; without KV, use a long random wake secret and rotate it if exposed.
@@ -363,7 +365,7 @@ Optional Cloudflare dashboard bindings:
 - `TELEGRAM_BOT_TOKEN`: **Secret** variable for Telegram alerts.
 - `TELEGRAM_CHAT_ID`: **Secret** variable for Telegram alerts.
 - `WAKE_COOLDOWN_SECONDS`: **Plaintext** optional seconds to prevent repeated successful wake requests from spamming GitHub when KV is configured. Leave unset for no successful-wake cooldown. Any nonzero value below `60` is treated as `60` because Cloudflare KV expiration TTLs require at least 60 seconds.
-- `WAKE_FAST_PATH`: **Plaintext** optional toggle for the Worker's warm-route fast path. Default: `1`. When enabled, `/wake` first does a cheap route probe and, if the Codespace route is already stable and GitHub says it is Available, skips the GitHub `/start` call.
+- `WAKE_FAST_PATH`: **Plaintext** optional toggle for the Worker's warm-route fast path. Default: `1`. When enabled, `/wake` checks GitHub state first. It probes the route only when the Codespace is already Available, avoiding a dead route-probe delay before a cold start.
 - `CODESPACE_FORWARDING_DOMAIN`: **Plaintext** optional override for Codespaces route hostnames if GitHub changes the forwarding domain from `app.github.dev`. The Worker also accepts `CODESPACE_PORT_FORWARDING_DOMAIN` and `GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN`.
 - `ROUTE_POLL_AFTER_SECONDS`: **Plaintext** optional browser/API retry hint while the route is settling. Default: `5`.
 - `GITHUB_STATE_WAIT_MS`, `ROUTE_WAIT_MS`, `ROUTE_POLL_INTERVAL_MS`, `ROUTE_FETCH_TIMEOUT_MS`: **Plaintext** optional Worker control-plane timings. Defaults return start/route progress quickly so the app/dashboard can poll instead of holding a single request open; changing these does not force GitHub's edge to settle faster.
@@ -375,21 +377,7 @@ The Worker URL can be entered with or without `https://`, and with or without `/
 
 If a client network times out connecting to the `workers.dev` Waker hostname, attach a custom domain directly to the Worker (for example `wake.yourdomain.com`) and save that URL in panel option `15` and the Android account. This is an alternate **Waker control-plane** hostname only; it does not proxy the Codespaces tunnel and therefore does not need Cloudflare paid Host/SNI origin overrides. Cloudflare documents this as a Worker Custom Domain under **Workers & Pages > Worker > Settings > Domains & Routes**.
 
-Quick setup:
-
-```bash
-cd worker/codespace-waker
-npm ci
-cp wrangler.toml.example wrangler.toml
-# edit wrangler.toml and set CODESPACE_NAME
-npx --no-install wrangler secret put GITHUB_TOKEN
-npx --no-install wrangler secret put WAKE_SECRET
-npm run deploy
-```
-
-The Codespace devcontainer installs Node.js 22 for current Wrangler. If you deploy from your laptop instead, use Node.js 22 or newer and run `npm ci` in `worker/codespace-waker` so Wrangler comes from the pinned local package, not from a floating global install.
-
-After deploy, copy the Worker URL that Wrangler prints, return to panel option `15) Recovery / Waker Setup`, answer that the Worker is deployed, paste the Worker URL, and run the panel's Worker test. This saves only non-sensitive Worker metadata locally so diagnostics and the recovery card can show the configured Worker.
+Quick setup: open Cloudflare **Workers & Pages**, paste `worker/codespace-waker/src/index.js` into **Edit code**, deploy it, then add `CODESPACE_NAME`, `GITHUB_TOKEN`, and `WAKE_SECRET` under **Settings > Variables and Secrets**. Return to panel option `15`, paste the Worker URL, and run the built-in test.
 
 Wake call:
 
@@ -421,7 +409,7 @@ try {
 
 The browser form is preferred because it keeps the wake secret out of shell history. See `worker/codespace-waker/README.md` for the full setup and token guidance.
 
-If you create a new Codespace, change region, rename/recreate the Codespace, or change `XRAY_PORT`, update the Worker's `CODESPACE_NAME` and optional `CODESPACE_PORT` bindings, redeploy the Worker, then return to option `15` and save/test the Worker URL again.
+If you replace the primary Codespace, update `CODESPACE_NAME` and `GITHUB_TOKEN`. To retain it and add a standby, add the next numbered pair such as `CODESPACE_2_NAME` and `GITHUB_TOKEN_2`. Redeploy the Worker code only when the code itself changes, then return to option `15` and test the Worker URL again.
 
 ---
 

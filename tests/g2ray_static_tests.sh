@@ -1454,18 +1454,20 @@ test_panel_guides_cloudflare_waker_setup() {
         || fail 'wizard does not warn users not to store GitHub tokens in the panel'
     grep_fixed 'https://github.com/settings/tokens/new?scopes=codespace' "$SCRIPT" \
         || fail 'wizard does not give a direct GitHub token creation path'
-    grep_fixed 'as a ${WHITE}Plaintext${NC} variable' "$SCRIPT" \
+    grep_fixed 'CODESPACE_NAME${NC}  Plaintext' "$SCRIPT" \
         || fail 'wizard does not clarify the CODESPACE_NAME Cloudflare binding type'
-    grep_fixed 'Add these as ${WHITE}Secret${NC} variables' "$SCRIPT" \
+    grep_fixed 'GITHUB_TOKEN${NC}    Secret' "$SCRIPT" \
         || fail 'wizard does not clarify GitHub token and wake secret binding types'
+    grep_fixed 'WAKE_SECRET${NC}     Secret' "$SCRIPT" \
+        || fail 'wizard does not clarify WAKE_SECRET as a Cloudflare secret'
     grep_fixed 'Worker wake URL (https optional, /wake optional)' "$SCRIPT" \
         || fail 'wizard does not clarify acceptable Worker URL formats'
-    grep_fixed 'CODESPACE_PORT' "$SCRIPT" \
-        || fail 'wizard does not mention the optional custom port Worker binding'
+    grep_fixed 'No KV or Wrangler is required' "$SCRIPT" \
+        || fail 'wizard does not clarify that the dashboard setup needs no KV or Wrangler'
     grep_fixed 'route_ready: false' "$SCRIPT" \
         || fail 'recovery guide does not explain route settling after wake'
-    grep_fixed 'The wake secret is shown once' "$SCRIPT" \
-        || fail 'wizard does not warn that the raw wake secret is not persisted'
+    grep_fixed 'Use this exact same key everywhere' "$SCRIPT" \
+        || fail 'wizard does not tell users to keep one shared wake key'
     grep_fixed '^https://([A-Za-z0-9][A-Za-z0-9.-]*[.][A-Za-z0-9.-]+)' "$SCRIPT" \
         || fail 'waker URL normalization does not reject obvious non-URL secret input'
     grep_fixed 'printf '\''https://%s%s/wake'\''' "$SCRIPT" \
@@ -1476,10 +1478,6 @@ test_panel_guides_cloudflare_waker_setup() {
         || fail 'reset path does not clear saved waker metadata'
     grep_fixed 'touch "$WAKER_PROMPT_FILE"' "$SCRIPT" \
         || fail 'reset/prompt paths do not preserve the one-time prompt marker'
-    grep_fixed 'Default idle timeout' "$SCRIPT" \
-        || fail 'wizard does not guide users to the GitHub idle timeout setting'
-    grep_fixed '240 minutes' "$SCRIPT" \
-        || fail 'wizard does not recommend the 240 minute idle timeout'
     grep_fixed 'Authorization: Bearer' "$SCRIPT" \
         || fail 'wizard/test flow does not use the safer bearer secret form'
     grep_fixed 'WAKER_TEST_TIMEOUT_SEC' "$SCRIPT" \
@@ -1534,21 +1532,21 @@ test_docs_cover_panel_waker_setup() {
         || fail 'README fresh-start flow does not tell users which panel option to choose'
     grep_fixed 'Do not paste the GitHub token into G2ray' "$README" \
         || fail 'README does not warn against storing GitHub tokens in the panel'
-    grep_fixed 'The wake secret is shown once' "$README" \
-        || fail 'README does not explain one-time wake secret handling'
+    grep_fixed 'paste the existing key instead of generating another one' "$README" \
+        || fail 'README does not explain shared wake-key reuse'
     grep_fixed 'Recovery / Waker Setup' "$README" \
         || fail 'README does not name the recovery setup screen'
-    grep_fixed 'set Default idle timeout to 240 minutes' "$README" \
-        || fail 'README does not connect recovery setup to the 240 minute idle timeout'
+    grep_fixed 'Default idle timeout** to **240 minutes' "$README" \
+        || fail 'README does not retain the 240 minute idle-timeout recommendation'
     grep_fixed 'Recovery / Waker Setup' "$WORKER_README" \
         || fail 'Worker README does not mention the panel setup flow'
     grep_fixed 'GET /wake` page is public' "$README" \
         || fail 'README does not clarify that the Worker page is public but actions are protected'
     grep_fixed 'GET /wake` page is public' "$WORKER_README" \
         || fail 'Worker README does not clarify that the page is public but actions are protected'
-    grep_fixed 'return to panel option `15) Recovery / Waker Setup`' "$README" \
+    grep_fixed 'Return to panel option `15`' "$README" \
         || fail 'README does not tell users to return to option 15 after Worker deployment'
-    grep_fixed 'return to **Option 15: Recovery / Waker Setup** after deploy' "$WORKER_README" \
+    grep_fixed 'Return to **Option 15: Recovery / Waker Setup**' "$WORKER_README" \
         || fail 'Worker README does not tell users to return to option 15 after deploy'
     grep_fixed 'bash ./g2ray.sh --silent-start' "$README" \
         || fail 'README does not document the post-pull runtime refresh command'
@@ -1602,12 +1600,14 @@ test_docs_cover_panel_waker_setup() {
         || fail 'README does not explain Worker route settling failures'
     grep_fixed 'with or without `https://`, and with or without `/wake`' "$README" \
         || fail 'README does not clarify accepted Worker URL formats'
-    grep_fixed 'CODESPACE_NAME` as a **Plaintext** variable' "$WORKER_README" \
+    grep_fixed '| Plaintext | `CODESPACE_NAME`' "$WORKER_README" \
         || fail 'Worker README does not clarify CODESPACE_NAME dashboard binding type'
     grep_fixed 'CODESPACE_PORT` as a **Plaintext** variable only if you changed' "$WORKER_README" \
         || fail 'Worker README does not document the optional CODESPACE_PORT binding'
-    grep_fixed 'GITHUB_TOKEN` and `WAKE_SECRET` as **Secret** variables' "$WORKER_README" \
-        || fail 'Worker README does not clarify Worker secret binding types'
+    grep_fixed '| Secret | `GITHUB_TOKEN`' "$WORKER_README" \
+        || fail 'Worker README does not clarify GITHUB_TOKEN as a secret'
+    grep_fixed '| Secret | `WAKE_SECRET`' "$WORKER_README" \
+        || fail 'Worker README does not clarify WAKE_SECRET as a secret'
     grep_fixed 'route_ready: false` with HTTP `404`' "$WORKER_README" \
         || fail 'Worker README does not explain the route-settling response'
     grep_fixed 'notification_status: "deferred"' "$WORKER_README" \
