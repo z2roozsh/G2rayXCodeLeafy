@@ -120,6 +120,7 @@ QR_DIR="$DATA_DIR/qr"
 MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
 SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
 CONFIG_META_FILE="$BASE_DIR/configs-meta.json"
+CODESPACE_BUNDLE_FILE="$BASE_DIR/g2ray-codespace-bundle.json"
 EXPORT_INPUT_HASH_FILE="$DATA_DIR/export_input.hash"
 CODESPACE_ENV_JSON_FILE="${G2RAY_CODESPACE_ENV_JSON_FILE:-/workspaces/.codespaces/shared/environment-variables.json}"
 CODESPACE_SHARED_ENV_FILE="${G2RAY_CODESPACE_SHARED_ENV_FILE:-/workspaces/.codespaces/shared/.env}"
@@ -1710,28 +1711,32 @@ waker_metadata_value() {
 }
 
 save_waker_metadata() {
-    local worker_url="$1" wake_fingerprint="$2" codespace="${3:-$CODESPACE_NAME}" configured_at content
+    local worker_url="$1" wake_fingerprint="$2" codespace="${3:-$CODESPACE_NAME}" worker_codespace_id="${4:-$codespace}" configured_at content
     worker_url=$(normalize_waker_url "$worker_url") || return 1
     wake_fingerprint=$(one_line "$wake_fingerprint")
     codespace=$(one_line "$codespace")
+    worker_codespace_id=$(one_line "$worker_codespace_id")
+    [[ "$worker_codespace_id" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || worker_codespace_id="$codespace"
     configured_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
-    content=$(printf 'worker_url=%s\ncodespace_name=%s\nwake_secret_fingerprint=%s\nconfigured_at=%s\n' \
-        "$worker_url" "$codespace" "$wake_fingerprint" "$configured_at")
+    content=$(printf 'worker_url=%s\ncodespace_name=%s\nworker_codespace_id=%s\nwake_secret_fingerprint=%s\nconfigured_at=%s\n' \
+        "$worker_url" "$codespace" "$worker_codespace_id" "$wake_fingerprint" "$configured_at")
     _atomic_write "$WAKER_METADATA_FILE" "$content"
     chmod 600 "$WAKER_METADATA_FILE" 2>/dev/null || true
-    log_event INFO "waker_metadata saved worker_url_hash=$(fingerprint_secret "$worker_url") codespace=${codespace}"
+    log_event INFO "waker_metadata saved worker_url_hash=$(fingerprint_secret "$worker_url") codespace=${codespace} worker_codespace_id=${worker_codespace_id}"
 }
 
 waker_metadata_summary() {
-    local worker_url codespace wake_fingerprint configured_at
+    local worker_url codespace worker_codespace_id wake_fingerprint configured_at
     worker_url=$(waker_metadata_value worker_url)
     codespace=$(waker_metadata_value codespace_name)
+    worker_codespace_id=$(waker_metadata_value worker_codespace_id)
     wake_fingerprint=$(waker_metadata_value wake_secret_fingerprint)
     configured_at=$(waker_metadata_value configured_at)
     if [[ -n "$worker_url" ]]; then
         echo -e "Status      : configured"
         echo -e "Worker URL  : ${WHITE}${worker_url}${NC}"
         echo -e "Codespace   : ${WHITE}${codespace:-$CODESPACE_NAME}${NC}"
+        echo -e "Worker ID   : ${WHITE}${worker_codespace_id:-${codespace:-$CODESPACE_NAME}}${NC}"
         echo -e "Secret      : fingerprint=${wake_fingerprint:-unknown} ${DIM}(raw secret is not stored)${NC}"
         echo -e "Last setup  : ${DIM}${configured_at:-unknown}${NC}"
     else
@@ -1741,7 +1746,7 @@ waker_metadata_summary() {
 }
 
 test_cloudflare_waker() {
-    local worker_url="${1:-}" wake_secret="${2:-}" response status ok reason codespace route_ready route_status route_latency next_action
+    local worker_url="${1:-}" wake_secret="${2:-}" response status ok reason codespace route_ready route_status route_latency next_action worker_codespace_id
     worker_url=$(normalize_waker_url "${worker_url:-$(waker_metadata_value worker_url)}" 2>/dev/null || true)
     if [[ -z "$worker_url" ]]; then
         echo -ne "  ${GREEN}Worker wake URL:${NC} "
@@ -1757,6 +1762,10 @@ test_cloudflare_waker() {
         read -r -s wake_secret || { echo ""; return 1; }
         echo ""
     fi
+
+    worker_codespace_id=$(waker_metadata_value worker_codespace_id)
+    [[ -n "$worker_codespace_id" ]] || worker_codespace_id="$(waker_metadata_value codespace_name)"
+    [[ "$worker_codespace_id" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || worker_codespace_id=""
     if [[ -z "$wake_secret" ]]; then
         echo -e "  ${RED}Missing wake secret.${NC}"
         return 1
@@ -1769,6 +1778,7 @@ test_cloudflare_waker() {
         printf 'max-time = "%s"\n' "$WAKER_TEST_TIMEOUT_SEC"
         printf 'silent\nshow-error\n'
         printf 'header = "Authorization: Bearer %s"\n' "$wake_secret"
+        [[ -n "$worker_codespace_id" ]] && printf 'header = "Content-Type: application/json"\ndata = "{\\"codespace_id\\":\\"%s\\"}"\n' "$worker_codespace_id"
     } | curl --config - 2>&1) || {
         echo -e "  ${RED}Worker call failed.${NC}"
         printf '%s\n' "$response" | sed 's/^/  /'
@@ -1816,7 +1826,7 @@ show_waker_recovery_guide() {
 }
 
 setup_cloudflare_waker() {
-    local wake_secret wake_fingerprint worker_url ready do_test
+    local wake_secret wake_fingerprint worker_url worker_codespace_id ready do_test
     CODESPACE_NAME=$(_detect_codespace_name 2>/dev/null || true)
     refresh_port_domains
     wake_secret=$(generate_wake_secret)
@@ -1867,7 +1877,16 @@ setup_cloudflare_waker() {
         sleep 2
         return 1
     fi
-    save_waker_metadata "$worker_url" "$(fingerprint_secret "$wake_secret")" "$CODESPACE_NAME"
+    echo -ne "  ${GREEN}Worker registry ID (Enter uses ${CODESPACE_NAME}):${NC} "
+    read -r worker_codespace_id || worker_codespace_id=""
+    worker_codespace_id=$(one_line "$worker_codespace_id")
+    [[ -n "$worker_codespace_id" ]] || worker_codespace_id="$CODESPACE_NAME"
+    if [[ ! "$worker_codespace_id" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]]; then
+        echo -e "  ${RED}Invalid Worker registry ID. Use letters, numbers, _ or - only.${NC}"
+        sleep 2
+        return 1
+    fi
+    save_waker_metadata "$worker_url" "$(fingerprint_secret "$wake_secret")" "$CODESPACE_NAME" "$worker_codespace_id"
     touch "$WAKER_PROMPT_FILE" 2>/dev/null || true
     echo -e "  ${GREEN}Saved non-sensitive waker metadata.${NC}"
     echo -e "  ${DIM}GitHub token and raw wake secret were not stored in G2ray.${NC}\n"
@@ -4616,6 +4635,7 @@ write_config_metadata() {
   "hash": "$(json_escape "$hash")",
   "mobile_config_file": "$(json_escape "$MOBILE_CONFIG_FILE")",
   "subscription_file": "$(json_escape "$SUBSCRIPTION_FILE")",
+  "codespace_bundle_file": "$(json_escape "$CODESPACE_BUNDLE_FILE")",
   "subscription_scope": "local_codespace_only",
   "performance_profile": "$(json_escape "$(effective_performance_profile)")",
   "saved_performance_profile": "$(json_escape "$PERFORMANCE_PROFILE")",
@@ -4627,8 +4647,33 @@ write_config_metadata() {
   "latency_focus": $(latency_focus_enabled && printf true || printf false),
   "domain_link_exported": $(domain_link_export_enabled && printf true || printf false)
 }
+
 JSON
     chmod 600 "$CONFIG_META_FILE" 2>/dev/null || true
+}
+
+write_codespace_import_bundle() {
+    local links="$1" generated worker_codespace_id first=true link bundle
+    generated=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
+    worker_codespace_id="$(waker_metadata_value worker_codespace_id)"
+    [[ -n "$worker_codespace_id" ]] || worker_codespace_id="${G2RAY_WORKER_CODESPACE_ID:-$CODESPACE_NAME}"
+    bundle=$(
+        printf '{\n'
+        printf '  "schema_version": 1,\n'
+        printf '  "generated_at": "%s",\n' "$(json_escape "$generated")"
+        printf '  "codespace_name": "%s",\n' "$(json_escape "$CODESPACE_NAME")"
+        printf '  "worker_codespace_id": "%s",\n' "$(json_escape "$worker_codespace_id")"
+        printf '  "configs": [\n'
+        while IFS= read -r link; do
+            [[ -n "$link" ]] || continue
+            if [[ "$first" != true ]]; then printf ',\n'; fi
+            printf '    "%s"' "$(json_escape "$link")"
+            first=false
+        done <<< "$links"
+        printf '\n  ]\n}\n'
+    )
+    _atomic_write "$CODESPACE_BUNDLE_FILE" "$bundle" || return 1
+    chmod 600 "$CODESPACE_BUNDLE_FILE" 2>/dev/null || true
 }
 
 write_config_exports_from_links() {
@@ -4640,6 +4685,7 @@ write_config_exports_from_links() {
         encoded=$(printf '%s\n' "$links" | base64 | tr -d '\n')
         _atomic_write "$SUBSCRIPTION_FILE" "$encoded" || return 1
     fi
+    write_codespace_import_bundle "$links" || return 1
     count=$(printf '%s\n' "$links" | awk 'NF {c++} END {print c+0}')
     hash=$(fingerprint_secret "$links")
     write_config_metadata "$count" "$hash"
@@ -4648,7 +4694,7 @@ write_config_exports_from_links() {
 
 clear_config_exports() {
     local reason="${1:-no_exportable_links}"
-    rm -f "$MOBILE_CONFIG_FILE" "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE" 2>/dev/null || true
+    rm -f "$MOBILE_CONFIG_FILE" "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE" "$CODESPACE_BUNDLE_FILE" 2>/dev/null || true
     log_event WARN "config_exports cleared reason=${reason}"
 }
 
@@ -5602,6 +5648,7 @@ bench_rebind_runtime_paths() {
     MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
     SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
     CONFIG_META_FILE="$BASE_DIR/configs-meta.json"
+    CODESPACE_BUNDLE_FILE="$BASE_DIR/g2ray-codespace-bundle.json"
     EXPORT_INPUT_HASH_FILE="$DATA_DIR/export_input.hash"
 }
 
@@ -5962,6 +6009,7 @@ while true; do
             echo -e "  ${RED}● Configs & QR Codes${NC}"
             echo -e "  ${DIM}Raw links are printed without color codes and saved locally to:${NC}"
             echo -e "  ${DIM}Local base64 subscription file:${NC} ${WHITE}${SUBSCRIPTION_FILE}${NC}"
+            echo -e "  ${DIM}Codespace bundle for the Android app:${NC} ${WHITE}${CODESPACE_BUNDLE_FILE}${NC}"
             echo -e "  ${DIM}Generated exports are ignored by git and are not published through the repo.${NC}"
             echo -e "  ${WHITE}${MOBILE_CONFIG_FILE}${NC}\n"
             _INDEX=1

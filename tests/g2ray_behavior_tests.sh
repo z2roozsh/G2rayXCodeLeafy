@@ -51,6 +51,7 @@ reset_runtime_paths() {
     DOMAIN_LINK_EXPORT_FILE="$DATA_DIR/export_domain_link.txt"
     SUBSCRIPTION_FILE="$TMP_ROOT/configs-subscription-base64.txt"
     CONFIG_META_FILE="$TMP_ROOT/configs-meta.json"
+    CODESPACE_BUNDLE_FILE="$TMP_ROOT/g2ray-codespace-bundle.json"
     LAST_GOOD_ROUTE_FILE="$DATA_DIR/last_good_route.txt"
     PINNED_ROUTE_FILE="$DATA_DIR/pinned_route.txt"
     MANUAL_ROUTE_CANDIDATES_FILE="$DATA_DIR/manual_route_candidates.txt"
@@ -1337,6 +1338,13 @@ test_config_exports_write_local_only_metadata() {
     write_config_exports_from_links "vless://example-one" "vless://example-two" >/dev/null
 
     python -m json.tool "$CONFIG_META_FILE" >/dev/null || fail "config metadata is not valid JSON"
+    python -m json.tool "$CODESPACE_BUNDLE_FILE" >/dev/null || fail "Codespace import bundle is not valid JSON"
+    grep -Fq '"codespace_name": "behavior-space"' "$CODESPACE_BUNDLE_FILE" \
+        || fail "Codespace import bundle is missing its Codespace name"
+    grep -Fq '"configs": [' "$CODESPACE_BUNDLE_FILE" \
+        || fail "Codespace import bundle is missing its config list"
+    ! grep -Eqi 'wake[_-]?secret|github[_-]?token' "$CODESPACE_BUNDLE_FILE" \
+        || fail "Codespace import bundle must not contain Worker credentials"
     grep -Fq '"config_count": 2' "$CONFIG_META_FILE" || fail "config metadata missing count"
     grep -Fq '"subscription_scope": "local_codespace_only"' "$CONFIG_META_FILE" \
         || fail "config metadata does not mark subscription as local-only"

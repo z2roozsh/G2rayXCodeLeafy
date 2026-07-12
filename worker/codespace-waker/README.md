@@ -2,7 +2,7 @@
 
 Personal test and educational use only: this helper is provided for private recovery experiments and learning. Do not use it to publish generated configs or operate a public access service. Use it only in ways that comply with applicable laws, GitHub Codespaces policies, Cloudflare policies, and network rules.
 
-This Cloudflare Worker gives you a manual wake page for one GitHub Codespace through GitHub's official Codespaces API. The `GET /wake` page is public so it can load in your browser, but `POST /wake` and the `/api/*` actions require your wake secret.
+This Cloudflare Worker gives you a manual wake page for one or more GitHub Codespaces through GitHub's official Codespaces API. The `GET /wake` page is public so it can load in your browser, but `POST /wake` and the `/api/*` actions require your wake secret.
 
 It does not expose VLESS configs, keep the Codespace alive forever, or bypass quota, billing, deletion, or account restrictions.
 
@@ -65,6 +65,17 @@ CODESPACE_NAME = "your-codespace-slug"
 
 If you use the Cloudflare dashboard instead of Wrangler, add `CODESPACE_NAME` as a **Plaintext** variable.
 
+### Multi-Codespace registry
+
+For a quota-standby Codespace or more than one GitHub account, use one shared Worker with `WAKER_KV` and a registry at KV key `codespace-registry:v1`. Start from [`codespaces.registry.example.json`](codespaces.registry.example.json). Each entry has a stable app-facing `id`, its GitHub Codespace `name`, the primary XHTTP forwarding `route_ports` (normally `[443]`), and a `token_binding` naming its own Worker secret. The registry stores only the secret *name*, never the token value. WS fallback health is exercised by the Android client itself; do not use its WS port as proof that the XHTTP route is ready.
+
+1. Create and bind `WAKER_KV`; enable `MULTI_CODESPACE_REGISTRY = "true"` in `wrangler.toml`.
+2. Add one Worker secret per GitHub account, for example `GITHUB_TOKEN_PRIMARY` and `GITHUB_TOKEN_STANDBY`.
+3. Upload the edited registry JSON to key `codespace-registry:v1` with Wrangler or the Cloudflare KV dashboard.
+4. Keep the same `WAKE_SECRET` for every entry. The Android app saves it once under **Settings > Shared Worker** and sends the selected `codespace_id` with every wake/health request.
+
+The authenticated endpoint `POST /api/codespaces` returns only safe fields (`id`, label, Codespace name, ports, priority). It never returns GitHub token bindings or token values.
+
 The tracked example enables Workers Logs. Successful and failed requests emit a
 structured event with `request_id`, route path, HTTP status, duration, and
 Cloudflare colo; responses return the same ID in `x-g2ray-request-id`. Set
@@ -120,6 +131,13 @@ npx --no-install wrangler secret put WAKE_SECRET
 Paste the GitHub token for `GITHUB_TOKEN`.
 Paste your random wake secret for `WAKE_SECRET`.
 
+In multi-Codespace mode, keep the one `WAKE_SECRET` and replace the legacy `GITHUB_TOKEN` with one secret for every registry token binding, for example:
+
+```bash
+npx --no-install wrangler secret put GITHUB_TOKEN_PRIMARY
+npx --no-install wrangler secret put GITHUB_TOKEN_STANDBY
+```
+
 In the Cloudflare dashboard, add both `GITHUB_TOKEN` and `WAKE_SECRET` as **Secret** variables, not plaintext variables.
 
 ## 4. Deploy
@@ -162,9 +180,28 @@ EOF
 unset WAKE_SECRET
 ```
 
+In multi-Codespace mode, target a non-default registry entry by adding a JSON
+body. This keeps the shared wake key unchanged while selecting the intended
+GitHub account/Codespace token inside the Worker:
+
+```bash
+read -rsp "Wake secret: " WAKE_SECRET; echo
+curl --config - <<EOF
+request = "POST"
+url = "https://g2ray-codespace-waker.YOUR_SUBDOMAIN.workers.dev/wake"
+header = "Authorization: Bearer ${WAKE_SECRET}"
+header = "Content-Type: application/json"
+data = "{\"codespace_id\":\"quota-standby\"}"
+EOF
+unset WAKE_SECRET
+```
+
+Replace `quota-standby` with the entry `id` from the KV registry, not the long
+GitHub Codespace name.
+
 Opening the Worker URL in a browser and entering the wake secret in the form is preferred because it keeps the secret out of shell history. The `curl --config -` form also keeps the expanded secret out of process arguments; use it only on machines you trust.
 
-If you create a new Codespace, change region, rename/recreate the Codespace, or change the panel's `XRAY_PORT`, update `CODESPACE_NAME` and optional `CODESPACE_PORT`, redeploy the Worker, then return to panel option `15` and save/test the Worker URL again.
+In legacy single-Codespace mode, creating or replacing a Codespace requires changing `CODESPACE_NAME` and redeploying. In multi-Codespace mode, add or update the one registry entry and its token binding instead; the Worker URL and shared wake key remain unchanged. Add the new Codespace in Android, import only its local bundle, and select it when you need to switch.
 
 For automation that only needs GitHub state and wants to avoid an external route probe, call `POST /api/health?route=false`. Normal browser health checks should use `/api/health` so the dashboard can report route readiness.
 

@@ -15,6 +15,9 @@ const FETCH_TIMEOUT_MS = 10000;
 const ROUTE_FETCH_TIMEOUT_MS = 4000;
 const HISTORY_KEY_PREFIX = "history:";
 const QUOTA_INCIDENT_KEY_PREFIX = "quota-incident:";
+const CODESPACE_REGISTRY_KEY = "codespace-registry:v1";
+const QUOTA_CRON_CURSOR_KEY = "quota-cron-cursor:v1";
+const MAX_REGISTERED_CODESPACES = 20;
 const HISTORY_LIMIT = 50;
 const FAILED_AUTH_KEY_PREFIX = "failed-auth:";
 const SUCCESSFUL_WAKE_KEY_PREFIX = "successful-wake:";
@@ -108,6 +111,10 @@ async function routeFetchRequest(request, env, ctx, url = new URL(request.url)) 
       return handleHistory(request, env);
     }
 
+    if (url.pathname === "/api/codespaces" && request.method === "POST") {
+      return handleCodespaces(request, env);
+    }
+
     if (url.pathname === "/wake" && request.method === "POST") {
       return handleWake(request, env, ctx);
     }
@@ -127,12 +134,13 @@ async function handleWake(request, env, ctx) {
   if (cooldown) return json(cooldown.body, cooldown.status, retryHeaders(cooldown.body));
 
   const warmRoute = wakeFastPathEnabled(env)
-    ? await alreadyWarmCodespaceData(context.codespaceName, context.token, env)
+    ? await alreadyWarmCodespaceData(context.codespaceName, context.token, env, context.routePorts)
     : null;
   const data = withSurvivalFields(
-    warmRoute?.data || await startCodespaceData(context.codespaceName, context.token, env, warmRoute?.status),
+    warmRoute?.data || await startCodespaceData(context.codespaceName, context.token, env, warmRoute?.status, context.routePorts),
     env
   );
+  addCodespaceIdentity(data, context);
   data.next_action = data.next_action || nextActionForWake(data, data.route_probe || {});
   data.next_action_code = data.next_action_code || nextActionCodeFor(data, data.route_probe || {});
   const responseStatus = responseStatusFor(data);
@@ -163,22 +171,22 @@ function wakeFastPathEnabled(env = {}) {
   return !["0", "false", "no", "off"].includes(value);
 }
 
-async function alreadyWarmCodespaceData(name, token, env) {
-  const firstProbe = await probeXhttpRoute(name, codespacePort(env), 1, Date.now(), env);
+async function alreadyWarmCodespaceData(name, token, env, routePorts = [codespacePort(env)]) {
+  const firstRouteData = await probeCodespaceRoutes(name, routePorts, env, { stable: false });
   const status = await getCodespaceStatus(name, token, env);
   if (!isCodespaceAvailable(status)) return { status, data: null };
 
   // A GitHub start call cannot repair a Codespace that is already Available.
   // Keep that distinction honest: report the existing edge state and let the
   // caller poll rather than issuing a needless /start request.
-  const routeProbe = firstProbe.usable
-    ? await waitForXhttpRoute(name, codespacePort(env), env)
-    : firstProbe;
-  if (firstProbe.usable) {
-    routeProbe.attempts = Number(routeProbe.attempts || 0) + Number(firstProbe.attempts || 1);
-  }
-  routeProbe.fast_path_precheck_attempts = Number(firstProbe.attempts || 1);
-  const routeReady = isRouteReadyProbe(routeProbe);
+  const routeData = firstRouteData.route_probes.some((probe) => probe.usable)
+    ? await probeCodespaceRoutes(name, routePorts, env)
+    : firstRouteData;
+  // Surface the complete probe count. The first inexpensive check is still a
+  // real edge request and callers use `attempts` to understand settling time.
+  routeData.route_probe.fast_path_precheck_attempts = 1;
+  routeData.route_probe.attempts += 1;
+  const routeReady = routeData.route_ready;
 
   return {
     status,
@@ -188,10 +196,12 @@ async function alreadyWarmCodespaceData(name, token, env) {
       wake_fast_path: true,
       start_accepted: false,
       route_ready: routeReady,
-      route_probe: routeProbe,
+      route_probe: routeData.route_probe,
+      route_probes: routeData.route_probes,
+      preferred_route_port: routeData.preferred_route_port,
       next_action: routeReady
         ? "Try the same VLESS config again."
-        : nextActionForWake(status, routeProbe),
+        : nextActionForWake(status, routeData.route_probe),
       message: routeReady
         ? "Codespace is already available and the XHTTP route is usable."
         : "Codespace is already available, but the XHTTP route is still settling. No GitHub start request was sent."
@@ -206,7 +216,7 @@ async function handleHealth(request, env, ctx) {
   const url = new URL(request.url);
   const checkRoute = url.searchParams.get("route") !== "false";
   const codespaceName = context.codespaceName;
-  const status = await getCodespaceStatus(codespaceName, env.GITHUB_TOKEN, env);
+  const status = await getCodespaceStatus(codespaceName, context.token, env);
   // A forwarded-port probe cannot become useful until GitHub has brought the
   // Codespace online. Skipping it while shutdown keeps Health cheap and avoids
   // presenting a stale-route 404 as though it were an Xray problem.
@@ -216,35 +226,47 @@ async function handleHealth(request, env, ctx) {
     : !checkRoute
       ? "route_check_skipped"
       : "codespace_not_available";
-  const routeProbe = routeChecked
-    ? await waitForXhttpRoute(codespaceName, codespacePort(env), env)
-      : {
-        url: routeUrl(codespaceName, codespacePort(env), env),
-        usable: false,
-        http_status: null,
-        latency_ms: null,
-        attempts: 0,
-        waited_ms: 0,
-        stable_probes: 0,
-        error: skippedRouteReason,
-        route_failure_reason: skippedRouteReason === "route_check_skipped" ? "not_checked" : skippedRouteReason
+  const routeData = routeChecked
+    ? await probeCodespaceRoutes(codespaceName, context.routePorts, env)
+    : {
+        route_ready: false,
+        preferred_route_port: context.routePorts[0],
+        route_probe: {
+          url: routeUrl(codespaceName, context.routePorts[0], env),
+          usable: false,
+          http_status: null,
+          latency_ms: null,
+          attempts: 0,
+          waited_ms: 0,
+          stable_probes: 0,
+          error: skippedRouteReason,
+          route_failure_reason: skippedRouteReason === "route_check_skipped" ? "not_checked" : skippedRouteReason
+        },
+        route_probes: []
       };
   const data = withSurvivalFields({
     ...status,
     route_check_requested: checkRoute,
     route_checked: routeChecked,
-    route_ready: routeChecked ? isRouteReadyProbe(routeProbe) : null,
-    route_probe: routeProbe,
+    route_ready: routeChecked ? routeData.route_ready : null,
+    route_probe: routeData.route_probe,
+    route_probes: routeData.route_probes,
+    preferred_route_port: routeData.preferred_route_port,
     next_action: status.ok && !checkRoute
       ? "Route probe skipped. Use Check Health normally when you need route readiness."
-      : nextActionForWake(status, routeProbe),
+      : nextActionForWake({ ...status, route_ready: routeData.route_ready }, routeData.route_probe),
     next_action_code: status.ok && !checkRoute
       ? "route_check_skipped"
-      : nextActionCodeFor(status, routeProbe),
+      : nextActionCodeFor({ ...status, route_ready: routeData.route_ready }, routeData.route_probe),
     message: status.ok && !checkRoute
       ? "GitHub state checked; route probe skipped by request."
-      : healthMessage(status, routeProbe)
+      : routeData.route_ready
+        ? context.routePorts.length === 1
+          ? "Codespace is available and the XHTTP route is usable."
+          : "Codespace is available and at least one configured route is usable."
+        : healthMessage(status, routeData.route_probe)
   }, env);
+  addCodespaceIdentity(data, context);
   const responseStatus = responseStatusFor(data);
   applyResponseHints(data, responseStatus, env);
   const event = await enrichEventWithHistoryContext(env, eventFromResult("health", codespaceName, data));
@@ -275,6 +297,8 @@ async function handleHistory(request, env) {
   const quotaIncident = await readQuotaIncident(env, context.codespaceName);
   return json({
     ok: true,
+    codespace_id: context.codespaceId,
+    codespace_label: context.codespaceLabel,
     codespace: context.codespaceName,
     history_enabled: Boolean(env.WAKER_KV),
     quota_incident: quotaIncident,
@@ -282,10 +306,77 @@ async function handleHistory(request, env) {
   }, 200);
 }
 
+async function handleCodespaces(request, env) {
+  const auth = await requireWakeSecret(request, env);
+  if (!auth.ok) return json(auth.body, auth.status, retryHeaders(auth.body));
+
+  const registry = await readCodespaceRegistry(env);
+  const entries = registry.entries
+    .filter((entry) => entry.enabled)
+    .map((entry) => ({
+      id: entry.id,
+      label: entry.label,
+      codespace: entry.name,
+      route_ports: entry.routePorts,
+      priority: entry.priority,
+      is_default: entry.id === registry.defaultCodespaceId
+    }));
+  return json({
+    ok: true,
+    multi_codespace: registry.multi,
+    default_codespace_id: registry.defaultCodespaceId,
+    codespaces: entries
+  });
+}
+
 async function requireAuthorizedContext(request, env, options = {}) {
   const requireGithubToken = options.githubToken !== false;
-  const suppliedSecret = await readSuppliedSecret(request);
+  const auth = await requireWakeSecret(request, env);
+  if (!auth.ok) return auth;
 
+  const requestedId = await readRequestedCodespaceId(request);
+  const registry = await readCodespaceRegistry(env);
+  const entry = selectCodespaceEntry(registry, requestedId);
+  if (!entry) {
+    return {
+      ok: false,
+      status: requestedId ? 404 : 400,
+      body: {
+        ok: false,
+        error: requestedId ? "codespace_not_registered" : "codespace_id_required",
+        next_action: requestedId
+          ? "Add this Codespace to the Worker registry, then retry."
+          : "Choose a Codespace before waking or checking health."
+      }
+    };
+  }
+
+  const token = String(env[entry.tokenBinding] || "").trim();
+  if (requireGithubToken && !token) {
+    return {
+      ok: false,
+      status: 500,
+      body: {
+        ok: false,
+        error: "missing_github_token_binding",
+        codespace_id: entry.id,
+        next_action: "Configure the GitHub token secret assigned to this Codespace, then retry."
+      }
+    };
+  }
+
+  return {
+    ok: true,
+    codespaceId: entry.id,
+    codespaceLabel: entry.label,
+    codespaceName: entry.name,
+    routePorts: entry.routePorts,
+    token
+  };
+}
+
+async function requireWakeSecret(request, env) {
+  const suppliedSecret = await readSuppliedSecret(request);
   if (!env.WAKE_SECRET) {
     return {
       ok: false,
@@ -298,27 +389,123 @@ async function requireAuthorizedContext(request, env, options = {}) {
       }
     };
   }
-
   if (!(await secretsEqual(suppliedSecret, env.WAKE_SECRET))) {
     const limited = await rateLimitFailedAuth(request, env);
     if (limited) return limited;
     return { ok: false, status: 401, body: { ok: false, error: "unauthorized" } };
   }
+  return { ok: true };
+}
 
-  const codespaceName = String(env.CODESPACE_NAME || "").trim();
-  if (!codespaceName) {
-    return { ok: false, status: 500, body: { ok: false, error: "missing_codespace_name" } };
+async function readRequestedCodespaceId(request) {
+  const url = new URL(request.url);
+  const queryValue = String(url.searchParams.get("codespace_id") || "").trim();
+  if (queryValue) return queryValue;
+  const contentType = request.headers.get("content-type") || "";
+  if (!contentType.includes("application/json")) return "";
+  try {
+    const body = await request.clone().json();
+    return body && typeof body === "object" ? String(body.codespace_id || "").trim() : "";
+  } catch {
+    return "";
+  }
+}
+
+async function readCodespaceRegistry(env) {
+  if (env.WAKER_KV) {
+    try {
+      const text = await env.WAKER_KV.get(CODESPACE_REGISTRY_KEY);
+      if (text) {
+        const parsed = JSON.parse(text);
+        const entries = normalizeRegistryEntries(parsed && parsed.codespaces);
+        if (entries.length) {
+          const configuredDefault = String(parsed.default_codespace_id || "").trim();
+          return {
+            multi: true,
+            defaultCodespaceId: entries.some((entry) => entry.id === configuredDefault && entry.enabled)
+              ? configuredDefault
+              : entries.find((entry) => entry.enabled)?.id || null,
+            entries
+          };
+        }
+      }
+    } catch (error) {
+      console.warn("codespace_registry_read_failed", shortError(error));
+    }
   }
 
-  if (requireGithubToken && !env.GITHUB_TOKEN) {
-    return { ok: false, status: 500, body: { ok: false, error: "missing_github_token" } };
-  }
-
+  const legacyName = String(env.CODESPACE_NAME || "").trim();
+  if (!legacyName) return { multi: false, defaultCodespaceId: null, entries: [] };
   return {
-    ok: true,
-    codespaceName,
-    token: env.GITHUB_TOKEN || ""
+    multi: false,
+    defaultCodespaceId: "legacy-default",
+    entries: [{
+      id: "legacy-default",
+      label: legacyName,
+      name: legacyName,
+      tokenBinding: "GITHUB_TOKEN",
+      routePorts: normalizeRoutePorts([codespacePort(env)]),
+      priority: 0,
+      enabled: true
+    }]
   };
+}
+
+function normalizeRegistryEntries(value) {
+  if (!Array.isArray(value)) return [];
+  const ids = new Set();
+  const names = new Set();
+  const entries = [];
+  for (const raw of value.slice(0, MAX_REGISTERED_CODESPACES)) {
+    if (!raw || typeof raw !== "object") continue;
+    const id = String(raw.id || "").trim();
+    const name = String(raw.name || "").trim();
+    const tokenBinding = String(raw.token_binding || "").trim();
+    if (!/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(id) ||
+        !/^[a-z0-9][a-z0-9-]*$/i.test(name) ||
+        !/^GITHUB_TOKEN_[A-Z0-9_]+$/.test(tokenBinding) ||
+        ids.has(id) || names.has(name)) continue;
+    ids.add(id);
+    names.add(name);
+    entries.push({
+      id,
+      name,
+      label: String(raw.label || name).trim().slice(0, 96) || name,
+      tokenBinding,
+      routePorts: normalizeRoutePorts(raw.route_ports),
+      priority: normalizePriority(raw.priority),
+      enabled: raw.enabled !== false
+    });
+  }
+  return entries;
+}
+
+function normalizeRoutePorts(value) {
+  const ports = Array.isArray(value) ? value : [DEFAULT_CODESPACE_PORT];
+  const result = [];
+  for (const raw of ports) {
+    const port = Number.parseInt(String(raw), 10);
+    if (Number.isInteger(port) && port > 0 && port <= 65535 && !result.includes(port)) result.push(port);
+    if (result.length >= 4) break;
+  }
+  return result.length ? result : [DEFAULT_CODESPACE_PORT];
+}
+
+function normalizePriority(value) {
+  const parsed = Number.parseInt(String(value), 10);
+  return Number.isInteger(parsed) ? Math.max(-1000, Math.min(1000, parsed)) : 0;
+}
+
+function selectCodespaceEntry(registry, requestedId) {
+  const id = String(requestedId || registry.defaultCodespaceId || "").trim();
+  return registry.entries.find((entry) => entry.id === id && entry.enabled) || null;
+}
+
+function addCodespaceIdentity(data, context) {
+  if (!data || !context) return data;
+  data.codespace_id = context.codespaceId;
+  data.codespace_label = context.codespaceLabel;
+  return data;
 }
 
 async function rateLimitFailedAuth(request, env) {
@@ -412,7 +599,7 @@ async function sha256Hex(value) {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function startCodespaceData(name, token, env, priorStatus = null) {
+async function startCodespaceData(name, token, env, priorStatus = null, routePorts = [codespacePort(env)]) {
   const endpoint = `https://api.github.com/user/codespaces/${encodeURIComponent(name)}/start`;
   let res;
   try {
@@ -478,8 +665,8 @@ async function startCodespaceData(name, token, env, priorStatus = null) {
     };
   }
 
-  const routeProbe = await waitForXhttpRoute(name, codespacePort(env), env);
-  const routeReady = isRouteReadyProbe(routeProbe);
+  const routeData = await probeCodespaceRoutes(name, routePorts, env);
+  const routeReady = routeData.route_ready;
 
   return {
     ok: true,
@@ -496,8 +683,10 @@ async function startCodespaceData(name, token, env, priorStatus = null) {
     github_wait_ms: readyState.waited_ms,
     github_wait_attempts: readyState.attempts,
     route_ready: routeReady,
-    route_probe: routeProbe,
-    next_action: nextActionForWake(readyState, routeProbe),
+    route_probe: routeData.route_probe,
+    route_probes: routeData.route_probes,
+    preferred_route_port: routeData.preferred_route_port,
+    next_action: nextActionForWake({ ...readyState, route_ready: routeReady }, routeData.route_probe),
     message: routeReady
       ? "Codespace start request accepted and the XHTTP route is usable."
       : "Codespace start request accepted, but the XHTTP route is still settling. The Codespace post-start recovery should keep working headlessly; keep this page open or press Check Health again shortly."
@@ -974,6 +1163,7 @@ function eventFromResult(kind, codespace, data) {
     ts: new Date().toISOString(),
     kind,
     ok: Boolean(data.ok),
+    codespace_id: data.codespace_id || null,
     codespace,
     github_status: data.status || null,
     state: data.state || null,
@@ -1190,20 +1380,14 @@ function quotaSurvivalCronEnabled(env) {
 }
 
 async function handleQuotaSurvivalCron(controller, env) {
-  const codespaceName = String(env.CODESPACE_NAME || "").trim();
-  if (!env.WAKER_KV || !codespaceName || !env.GITHUB_TOKEN) {
-    return { ok: false, skipped: "missing_kv_codespace_or_token" };
-  }
-
-  const incident = await readQuotaIncident(env, codespaceName);
-  if (!incident || incident.quota_drought_active !== true) {
-    return { ok: true, skipped: "no_active_quota_drought" };
-  }
-
   const now = currentDate(env, controller && controller.scheduledTime);
-  if (!quotaCronCheckAllowed(incident, now)) {
-    return { ok: true, skipped: "quota_cron_throttled" };
-  }
+  if (!env.WAKER_KV) return { ok: false, skipped: "missing_kv" };
+  const registry = await readCodespaceRegistry(env);
+  const selected = await selectDueQuotaCronCodespace(env, registry, now);
+  if (!selected) return { ok: true, skipped: "no_due_quota_drought" };
+
+  const { entry, incident } = selected;
+  const codespaceName = entry.name;
 
   const nearReset = quotaCronNearReset(incident, now);
   if (nearReset && !quotaCronWakeAllowed(incident, now)) {
@@ -1215,10 +1399,11 @@ async function handleQuotaSurvivalCron(controller, env) {
   }
   const data = withSurvivalFields(
     nearReset
-      ? await startCodespaceData(codespaceName, env.GITHUB_TOKEN, env)
-      : await getCodespaceStatus(codespaceName, env.GITHUB_TOKEN, env),
+      ? await startCodespaceData(codespaceName, String(env[entry.tokenBinding] || ""), env, null, entry.routePorts)
+      : await getCodespaceStatus(codespaceName, String(env[entry.tokenBinding] || ""), env),
     env
   );
+  addCodespaceIdentity(data, { codespaceId: entry.id, codespaceLabel: entry.label });
   const event = eventFromResult(nearReset ? "cron_wake" : "cron_health", codespaceName, data);
   await recordHistory(env, {
     ...event,
@@ -1239,6 +1424,27 @@ async function handleQuotaSurvivalCron(controller, env) {
     await env.WAKER_KV.put(quotaIncidentKey(codespaceName), JSON.stringify(result.incident));
   }
   return { ok: true, near_reset: nearReset, quota_blocked: data.quota_blocked === true };
+}
+
+async function selectDueQuotaCronCodespace(env, registry, now) {
+  const entries = registry.entries.filter((entry) => entry.enabled && String(env[entry.tokenBinding] || "").trim());
+  if (!entries.length) return null;
+  let cursor = 0;
+  try {
+    cursor = Number.parseInt(await env.WAKER_KV.get(QUOTA_CRON_CURSOR_KEY) || "0", 10) || 0;
+  } catch {}
+
+  for (let offset = 0; offset < entries.length; offset += 1) {
+    const index = (cursor + offset) % entries.length;
+    const entry = entries[index];
+    const incident = await readQuotaIncident(env, entry.name);
+    if (!incident || incident.quota_drought_active !== true || !quotaCronCheckAllowed(incident, now)) continue;
+    try {
+      await env.WAKER_KV.put(QUOTA_CRON_CURSOR_KEY, String((index + 1) % entries.length));
+    } catch {}
+    return { entry, incident };
+  }
+  return null;
 }
 
 function quotaCronCheckAllowed(incident, now) {
@@ -1375,7 +1581,7 @@ async function readSuppliedSecret(request) {
   const contentType = request.headers.get("content-type") || "";
   if (contentType.includes("application/json")) {
     try {
-      const body = await request.json();
+      const body = await request.clone().json();
       return body && typeof body === "object" ? String(body.wake_secret || "") : "";
     } catch {
       return "";
@@ -1384,7 +1590,7 @@ async function readSuppliedSecret(request) {
 
   if (contentType.includes("application/x-www-form-urlencoded") || contentType.includes("multipart/form-data")) {
     try {
-      const form = await request.formData();
+      const form = await request.clone().formData();
       return String(form.get("wake_secret") || "");
     } catch {
       return "";
@@ -1437,6 +1643,25 @@ function configuredNumber(env, name, fallback, min, max) {
 function configuredCooldownSeconds(env, name, fallback, max) {
   const value = configuredNumber(env, name, fallback, 0, max);
   return value > 0 && value < 60 ? 60 : value;
+}
+
+async function probeCodespaceRoutes(name, routePorts, env, options = {}) {
+  const ports = normalizeRoutePorts(routePorts);
+  const probes = await Promise.all(ports.map(async (port) => {
+    const probe = options.stable === false
+      ? await probeXhttpRoute(name, port, 1, Date.now(), env)
+      : await waitForXhttpRoute(name, port, env);
+    return { ...probe, port };
+  }));
+  const preferred = probes.find((probe) => isRouteReadyProbe(probe))
+    || probes.find((probe) => probe.usable)
+    || probes[0];
+  return {
+    route_ready: probes.some((probe) => isRouteReadyProbe(probe)),
+    route_probe: preferred,
+    route_probes: probes,
+    preferred_route_port: preferred?.port || ports[0]
+  };
 }
 
 async function waitForXhttpRoute(name, port, env) {
@@ -1683,7 +1908,7 @@ function renderDashboard() {
     margin: 14px 0;
   }
   label { display: block; color: var(--muted); font-size: 14px; margin-bottom: 8px; }
-  input {
+  input, select {
     width: 100%;
     border: 1px solid var(--line);
     border-radius: 6px;
@@ -1778,12 +2003,14 @@ function renderDashboard() {
 <body>
 <main>
   <h1>G2ray Codespace Waker</h1>
-  <p>Mobile wake UI for one GitHub Codespace. Actions require your wake secret; the page starts the Codespace, checks the app.github.dev XHTTP route, and shows whether configs should be usable.</p>
+  <p>Mobile wake UI for your registered GitHub Codespaces. Actions require your wake secret; the page starts the selected Codespace, checks its app.github.dev route, and shows whether configs should be usable.</p>
 
   <section class="card">
     <h2>Start</h2>
     <label for="secret">Wake secret</label>
     <input id="secret" type="password" autocomplete="off" placeholder="Paste WAKE_SECRET">
+    <label for="codespace">Codespace</label>
+    <select id="codespace" disabled><option value="">Enter wake secret to load Codespaces</option></select>
     <div class="actions">
       <button id="start" class="primary" type="button">Start Codespace</button>
       <button id="health" type="button">Check Health</button>
@@ -1855,6 +2082,7 @@ function renderDashboard() {
 
 <script>
 const secretInput = document.getElementById("secret");
+const codespaceSelect = document.getElementById("codespace");
 const resultEl = document.getElementById("result");
 const progressEl = document.getElementById("progress");
 const historyList = document.getElementById("historyList");
@@ -1871,6 +2099,7 @@ document.getElementById("health").addEventListener("click", checkHealth);
 document.getElementById("history").addEventListener("click", loadHistory);
 document.getElementById("copy").addEventListener("click", copyStatus);
 document.getElementById("stop").addEventListener("click", stopPolling);
+secretInput.addEventListener("change", loadCodespaces);
 
 function wakeSecret() {
   return secretInput.value.trim();
@@ -1893,19 +2122,47 @@ function setProgress(items, activeIndex) {
   });
 }
 
-async function callApi(path) {
+function selectedCodespaceId() {
+  return codespaceSelect.value.trim() || null;
+}
+
+async function callApi(path, includeCodespace = true) {
   const secret = wakeSecret();
   if (!secret) throw new Error("Wake secret is required.");
   const res = await fetch(path, {
     method: "POST",
     headers: {
       "authorization": "Bearer " + secret,
-      "accept": "application/json"
-    }
+      "accept": "application/json",
+      "content-type": "application/json"
+    },
+    body: includeCodespace ? JSON.stringify({ codespace_id: selectedCodespaceId() }) : undefined
   });
   const data = await res.json().catch(() => ({ ok: false, error: "invalid_json_response" }));
   if (!res.ok && !data.status) data.status = res.status;
   return data;
+}
+
+async function loadCodespaces() {
+  if (!wakeSecret()) return;
+  try {
+    const data = await callApi("/api/codespaces", false);
+    if (!data.ok) throw new Error(data.next_action || data.error || "Could not load Codespaces");
+    const previous = selectedCodespaceId();
+    codespaceSelect.innerHTML = "";
+    for (const entry of data.codespaces || []) {
+      const option = document.createElement("option");
+      option.value = entry.id;
+      option.textContent = entry.label + " (" + entry.codespace + ")";
+      option.selected = entry.id === (previous || data.default_codespace_id);
+      codespaceSelect.appendChild(option);
+    }
+    codespaceSelect.disabled = codespaceSelect.options.length === 0;
+  } catch (error) {
+    codespaceSelect.innerHTML = "<option value=\"\">Codespace load failed</option>";
+    codespaceSelect.disabled = true;
+    renderError(error);
+  }
 }
 
 async function startWake() {

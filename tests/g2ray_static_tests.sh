@@ -918,8 +918,8 @@ test_cloudflare_worker_waker_is_safe_to_publish() {
       if (!/^\d+\.\d+\.\d+$/.test(value)) process.exit(1);
     ' "$WORKER_DIR/package.json" \
         || fail 'Worker package.json does not pin Wrangler to an exact version'
-    grep_fixed 'env.GITHUB_TOKEN' "$WORKER_SCRIPT" \
-        || fail 'Worker does not read GitHub token from Cloudflare secret env'
+    grep_fixed 'env[entry.tokenBinding]' "$WORKER_SCRIPT" \
+        || fail 'Worker does not resolve the selected Codespace GitHub token from Cloudflare secret env'
     grep_fixed 'env.WAKE_SECRET' "$WORKER_SCRIPT" \
         || fail 'Worker does not require a separate wake secret'
     grep_fixed 'authorization: `Bearer ${token}`' "$WORKER_SCRIPT" \
@@ -932,11 +932,11 @@ test_cloudflare_worker_waker_is_safe_to_publish() {
         || fail 'Worker does not redact GitHub error response details'
     grep_fixed 'idle_timeout_minutes:' "$WORKER_SCRIPT" \
         || fail 'Worker success response does not retain useful redacted status fields'
-    grep_fixed 'waitForXhttpRoute(name, codespacePort(env), env)' "$WORKER_SCRIPT" \
-        || fail 'Worker does not wait for the Codespaces XHTTP route after start'
-    grep_fixed 'waitForXhttpRoute(codespaceName, codespacePort(env), env)' "$WORKER_SCRIPT" \
-        || fail 'Worker health check does not use stable XHTTP route readiness'
-    grep_fixed 'route_ready: routeChecked ? isRouteReadyProbe(routeProbe) : null' "$WORKER_SCRIPT" \
+    grep_fixed 'probeCodespaceRoutes(name, routePorts, env)' "$WORKER_SCRIPT" \
+        || fail 'Worker does not wait for the selected Codespace XHTTP route after start'
+    grep_fixed 'probeCodespaceRoutes(codespaceName, context.routePorts, env)' "$WORKER_SCRIPT" \
+        || fail 'Worker health check does not use stable selected-Codespace route readiness'
+    grep_fixed 'route_ready: routeChecked ? routeData.route_ready : null' "$WORKER_SCRIPT" \
         || fail 'Worker route_ready is not derived from stable route probe state'
     grep_fixed 'url.searchParams.get("route") !== "false"' "$WORKER_SCRIPT" \
         || fail 'Worker health API does not support a cheap route-skip status check'
@@ -977,8 +977,8 @@ test_worker_dashboard_and_history_features() {
         || fail 'Worker does not expose a dashboard health API'
     grep_fixed '/api/history' "$WORKER_SCRIPT" \
         || fail 'Worker does not expose a dashboard history API'
-    grep_fixed 'getCodespaceStatus(codespaceName, env.GITHUB_TOKEN, env)' "$WORKER_SCRIPT" \
-        || fail 'Worker health API does not query the GitHub Codespace state'
+    grep_fixed 'getCodespaceStatus(codespaceName, context.token, env)' "$WORKER_SCRIPT" \
+        || fail 'Worker health API does not query the selected GitHub Codespace state'
     grep_fixed 'recordHistory(env, {' "$WORKER_SCRIPT" \
         || fail 'Worker does not persist wake/health events when KV is configured'
     grep_fixed 'env.WAKER_KV' "$WORKER_SCRIPT" \

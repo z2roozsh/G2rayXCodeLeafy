@@ -26,3 +26,9 @@ CODESPACE_NAME = "YOUR_CODESPACE_NAME"
 # [[kv_namespaces]]
 # binding = "WAKER_KV"
 # id = "YOUR_KV_NAMESPACE_ID"
+
+# Multi-Codespace mode: uncomment this and the KV binding above, then put the
+# registry JSON from codespaces.registry.example.json into KV key
+# codespace-registry:v1. Give every registry token_binding its own Worker
+# secret, for example GITHUB_TOKEN_PRIMARY and GITHUB_TOKEN_STANDBY.
+# MULTI_CODESPACE_REGISTRY = "true"

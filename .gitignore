@@ -7,6 +7,8 @@
 /configs-subscription-base64.txt.*
 /configs-meta.json
 /configs-meta.json.*
+/g2ray-codespace-bundle.json
+/g2ray-codespace-bundle.json.*
 /g2ray-support-*.tar.gz
 /g2ray.sh.*
 /.env

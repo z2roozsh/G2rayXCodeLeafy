@@ -7,12 +7,14 @@ if (!globalThis.crypto) {
   globalThis.crypto = webcrypto;
 }
 
-function makeRequest(path, secret = "secret") {
+function makeRequest(path, secret = "secret", body = undefined) {
   return new Request(`https://worker.example${path}`, {
     method: "POST",
     headers: {
-      authorization: `Bearer ${secret}`
-    }
+      authorization: `Bearer ${secret}`,
+      ...(body === undefined ? {} : { "content-type": "application/json" })
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) })
   });
 }
 
@@ -1869,6 +1871,82 @@ async function testWakeSkipsGithubStartWhenCodespaceIsAvailableButRouteSettling(
   console.log("PASS: Worker wake does not restart an available Codespace just because its route is settling");
 }
 
+async function testWorkerRegistrySelectsBoundTokenAndReturnsSafeDirectory() {
+  const kv = makeKv();
+  await kv.put("codespace-registry:v1", JSON.stringify({
+    default_codespace_id: "alpha",
+    codespaces: [
+      {
+        id: "alpha",
+        label: "Primary Codespace",
+        name: "alpha-space",
+        token_binding: "GITHUB_TOKEN_ALPHA",
+        route_ports: [443, 8443],
+        priority: 10
+      },
+      {
+        id: "beta",
+        label: "Quota standby",
+        name: "beta-space",
+        token_binding: "GITHUB_TOKEN_BETA",
+        route_ports: [443]
+      }
+    ]
+  }));
+  const authorizations = [];
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      authorizations.push(init.headers?.authorization || "");
+      return new Response(JSON.stringify({
+        name: "beta-space",
+        state: "Available",
+        pending_operation: false,
+        idle_timeout_minutes: 120
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.includes("app.github.dev")) return new Response("", { status: 200 });
+    throw new Error(`unexpected fetch ${url}`);
+  };
+  const env = baseEnv({
+    WAKER_KV: kv,
+    GITHUB_TOKEN_ALPHA: "alpha-token",
+    GITHUB_TOKEN_BETA: "beta-token"
+  });
+  const directoryResponse = await worker.fetch(makeRequest("/api/codespaces"), env, {});
+  const directory = await responseJson(directoryResponse);
+  assert.equal(directoryResponse.status, 200);
+  assert.equal(directory.multi_codespace, true);
+  assert.equal(directory.codespaces.length, 2);
+  assert.equal(directory.codespaces[0].token_binding, undefined);
+  assert.deepEqual(directory.codespaces[0].route_ports, [443, 8443]);
+
+  const healthResponse = await worker.fetch(makeRequest("/api/health", "secret", { codespace_id: "beta" }), env, {});
+  const health = await responseJson(healthResponse);
+  assert.equal(healthResponse.status, 200);
+  assert.equal(health.codespace_id, "beta");
+  assert.equal(health.codespace_label, "Quota standby");
+  assert.equal(health.codespace, "beta-space");
+  assert.equal(health.preferred_route_port, 443);
+  assert.deepEqual(authorizations, ["Bearer beta-token"]);
+
+  const jsonAuthResponse = await worker.fetch(
+    makeRequest("/api/health", "", { wake_secret: "secret", codespace_id: "alpha" }),
+    env,
+    {}
+  );
+  const jsonAuth = await responseJson(jsonAuthResponse);
+  assert.equal(jsonAuthResponse.status, 200);
+  assert.equal(jsonAuth.codespace_id, "alpha");
+  assert.deepEqual(authorizations, ["Bearer beta-token", "Bearer alpha-token"]);
+
+  const unknownResponse = await worker.fetch(makeRequest("/api/health", "secret", { codespace_id: "missing" }), env, {});
+  const unknown = await responseJson(unknownResponse);
+  assert.equal(unknownResponse.status, 404);
+  assert.equal(unknown.error, "codespace_not_registered");
+  console.log("PASS: Worker registry isolates Codespaces, token bindings, and route ports");
+}
+
 try {
   await testFailedSecretRateLimit();
   await testFailedSecretRateLimitCapsKvWrites();
@@ -1916,6 +1994,7 @@ try {
   await testHealthRouteUrlUsesForwardingDomainOverride();
   await testWakeSkipsGithubStartWhenAlreadyAvailableAndRouteReady();
   await testWakeSkipsGithubStartWhenCodespaceIsAvailableButRouteSettling();
+  await testWorkerRegistrySelectsBoundTokenAndReturnsSafeDirectory();
 } finally {
   globalThis.fetch = originalFetch;
 }

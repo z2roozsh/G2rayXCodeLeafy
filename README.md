@@ -49,6 +49,8 @@ Tracks real-time RX/TX traffic and resource usage (CPU/RAM). The quota panel is 
 #### 📦 Private Local Exports
 The panel writes copy-ready configs and a base64 subscription file inside your Codespace only. These generated files are ignored by git because they contain live connection credentials. Use them for your own devices and private tests; do not commit, publish, or share them as a public subscription.
 
+Every export refresh also writes `g2ray-codespace-bundle.json` locally. It contains that Codespace's name, optional Worker registry ID, and its VLESS links, but never a Worker URL, GitHub token, or wake key. The Android client can extract the links from this private bundle after you select or create the matching Codespace entry.
+
 <div align="center">
 
 | Private Client Import |
@@ -229,6 +231,12 @@ gh auth refresh -h github.com -s codespace
 ```
 
 The helper uses GitHub's Codespaces start API, waits until the Codespace is available, and opens it in VS Code. If GitHub returns `HTTP 402`, the Codespace is quota or billing blocked and must wait for quota reset or a billing setting change.
+
+### Multiple Codespaces and quota switching
+
+For a standby Codespace, keep the old Codespace marked **Keep codespace** where GitHub allows it, then create a second Codespace only when you need current-month compute. The Android client keeps each Codespace's configs separate: select a Codespace on Home, test its local configs, then start VPN with the chosen config. It never silently changes an existing VPN session to another Codespace.
+
+One Cloudflare Worker can wake all of them when it is configured with the optional KV registry described in [the Worker guide](worker/codespace-waker/README.md#multi-codespace-registry). Use one shared wake key and one per-account GitHub token binding. The old Codespace remains saved in the app for the next billing reset; it will not be automatically started while GitHub reports quota blocked.
 
 Linux recovery after Worker wake:
 
