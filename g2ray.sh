@@ -652,7 +652,7 @@ quiet_info_event_important() {
 log_event() {
     local level="$1"; shift || true
     local ts msg
-    if latency_focus_enabled && [[ "$level" != "ERROR" ]]; then
+    if latency_focus_enabled && [[ "$level" == "INFO" ]] && ! quiet_info_event_important "$*"; then
         return 0
     fi
     msg="$*"
@@ -2685,7 +2685,9 @@ upgrade_config_dns() {
         "disableCache": false,
         "disableFallback": false,
         "disableFallbackIfMatch": false,
-        "enableParallelQuery": true
+        "enableParallelQuery": true,
+        "serveStale": true,
+        "serveExpiredTTL": 600
       }
       | (.routing.domainStrategy) = "AsIs"
       | (.routing.rules) = (
@@ -3407,7 +3409,9 @@ JSONEOF
     "disableCache": false,
     "disableFallback": false,
     "disableFallbackIfMatch": false,
-    "enableParallelQuery": true
+    "enableParallelQuery": true,
+    "serveStale": true,
+    "serveExpiredTTL": 600
   },
   "inbounds": [
     {

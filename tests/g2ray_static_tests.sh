@@ -347,6 +347,10 @@ test_xray_version_can_be_pinned() {
 test_generated_config_uses_resilient_dns_fallback() {
     grep_fixed '"enableParallelQuery": true' "$SCRIPT" \
         || fail 'generated Xray DNS config does not race equivalent fallback resolvers'
+    grep_fixed '"serveStale": true' "$SCRIPT" \
+        || fail 'generated Xray DNS config does not serve cached answers during short resolver outages'
+    grep_fixed '"serveExpiredTTL": 600' "$SCRIPT" \
+        || fail 'generated Xray DNS config does not bound stale-answer lifetime'
     grep_fixed '"disableFallback": false' "$SCRIPT" \
         || fail 'generated Xray DNS config does not explicitly keep fallback enabled'
     grep_fixed '"disableFallbackIfMatch": false' "$SCRIPT" \

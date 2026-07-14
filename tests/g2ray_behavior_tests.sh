@@ -1947,17 +1947,17 @@ test_low_overhead_keeps_important_state_logs() {
     pass "low-overhead mode preserves important state-transition INFO logs"
 }
 
-test_latency_focus_mode_suppresses_noncritical_logs() {
+test_latency_focus_mode_suppresses_noncritical_info_but_preserves_warnings() {
     reset_runtime_paths
     enable_latency_focus_mode
     log_event INFO "latency_focus_info_should_skip"
-    log_event WARN "latency_focus_warn_should_skip"
+    log_event WARN "latency_focus_warn_should_stay"
     log_event ERROR "latency_focus_error_should_stay"
     ! grep -Fq "latency_focus_info_should_skip" "$LOG_FILE" || fail "latency focus mode did not suppress INFO logs"
-    ! grep -Fq "latency_focus_warn_should_skip" "$LOG_FILE" || fail "latency focus mode did not suppress WARN logs"
+    grep -Fq "latency_focus_warn_should_stay" "$LOG_FILE" || fail "latency focus mode suppressed WARN logs"
     grep -Fq "latency_focus_error_should_stay" "$LOG_FILE" || fail "latency focus mode suppressed ERROR logs"
     disable_latency_focus_mode
-    pass "latency-focus mode suppresses noncritical logs while preserving errors"
+    pass "latency-focus mode suppresses noncritical INFO while preserving warnings and errors"
 }
 
 test_latency_focus_env_can_be_overridden_by_toggle() {
@@ -2757,7 +2757,7 @@ test_bench_json_reports_deterministic_budgets
 test_low_overhead_mode_suppresses_info_logs
 test_low_overhead_env_can_be_overridden_by_toggle
 test_low_overhead_keeps_important_state_logs
-test_latency_focus_mode_suppresses_noncritical_logs
+test_latency_focus_mode_suppresses_noncritical_info_but_preserves_warnings
 test_latency_focus_env_can_be_overridden_by_toggle
 test_panel_modes_apply_real_performance_profiles
 test_performance_profile_settings_are_available
