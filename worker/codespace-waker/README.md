@@ -62,7 +62,7 @@ The authenticated endpoint `POST /api/codespaces` returns only safe fields: sele
 
 Wrangler configuration remains available for automated deployments, but it is not part of the recommended manual setup. The KV registry in [`codespaces.registry.example.json`](codespaces.registry.example.json) remains an advanced option for custom labels, priorities, ports, or more than ten entries. Dashboard variables take effect automatically when no valid KV registry is present.
 
-If you choose the advanced KV registry, each entry declares its own token binding and primary XHTTP route port. Do not list the optional WS port as proof that the XHTTP route is ready.
+If you choose the advanced KV registry, each entry declares its own token binding and route ports. The first port in `route_ports` is the primary XHTTP route and gates `route_ready`; any later ports are optional alternatives and are still returned in `route_probes`/`preferred_route_port`, but they cannot make the primary XHTTP health claim true. Do not list the optional WS port as the first port or treat it as proof that the XHTTP route is ready.
 
 The tracked example enables Workers Logs. Successful and failed requests emit a
 structured event with `request_id`, route path, HTTP status, duration, and

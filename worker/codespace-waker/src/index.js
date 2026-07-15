@@ -183,10 +183,10 @@ async function alreadyWarmCodespaceData(name, token, env, routePorts = [codespac
   const routeData = firstRouteData.route_probes.some((probe) => probe.usable)
     ? await probeCodespaceRoutes(name, routePorts, env)
     : firstRouteData;
-  // Surface the complete probe count. The first inexpensive check is still a
-  // real edge request and callers use `attempts` to understand settling time.
+  // Keep the fast-path check visible without folding a probe from one port
+  // into another port's attempt count. `attempts` belongs to the reported
+  // route probe; the precheck is a separate diagnostic field.
   routeData.route_probe.fast_path_precheck_attempts = 1;
-  routeData.route_probe.attempts += 1;
   const routeReady = routeData.route_ready;
 
   return {
@@ -1700,14 +1700,20 @@ async function probeCodespaceRoutes(name, routePorts, env, options = {}) {
       : await waitForXhttpRoute(name, port, env);
     return { ...probe, port };
   }));
+  const primary = probes.find((probe) => probe.port === ports[0]) || probes[0];
+  const primaryReady = isRouteReadyProbe(primary);
   const preferred = probes.find((probe) => isRouteReadyProbe(probe))
     || probes.find((probe) => probe.usable)
     || probes[0];
   return {
-    route_ready: probes.some((probe) => isRouteReadyProbe(probe)),
-    route_probe: preferred,
+    // The first configured port is the primary XHTTP route. Optional ports
+    // (for example the WS fallback on 8443) are reported and can be selected
+    // as alternatives, but must not make the primary XHTTP health claim true.
+    route_ready: primaryReady,
+    route_probe: primaryReady ? preferred : primary,
     route_probes: probes,
-    preferred_route_port: preferred?.port || ports[0]
+    preferred_route_port: preferred?.port || ports[0],
+    primary_route_port: ports[0]
   };
 }
 

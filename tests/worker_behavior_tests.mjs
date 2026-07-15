@@ -1055,6 +1055,53 @@ async function testHealthTreatsHttp400RouteAsUsable() {
   console.log("PASS: Worker route readiness matches panel HTTP 400/200 semantics");
 }
 
+async function testOptionalPortCannotMasqueradeAsPrimaryXhttpReadiness() {
+  const kv = makeKv();
+  await kv.put("codespace-registry:v1", JSON.stringify({
+    default_codespace_id: "primary",
+    codespaces: [{
+      id: "primary",
+      label: "Primary Codespace",
+      name: "primary-space",
+      token_binding: "GITHUB_TOKEN_PRIMARY",
+      route_ports: [443, 8443]
+    }]
+  }));
+
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "primary-space",
+        state: "Available",
+        pending_operation: false
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.includes("primary-space-443.app.github.dev")) return new Response("", { status: 404 });
+    if (url.includes("primary-space-8443.app.github.dev")) return new Response("", { status: 200 });
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(
+    makeRequest("/api/health", "secret", { codespace_id: "primary" }),
+    baseEnv({
+      WAKER_KV: kv,
+      GITHUB_TOKEN_PRIMARY: "primary-token",
+      ROUTE_WAIT_MS: "1",
+      ROUTE_POLL_INTERVAL_MS: "1"
+    }),
+    {}
+  );
+  const body = await responseJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(body.route_ready, false);
+  assert.equal(body.route_probe.port, 443);
+  assert.equal(body.route_probe.http_status, 404);
+  assert.equal(body.preferred_route_port, 8443);
+  assert.equal(body.route_probes.find((probe) => probe.port === 8443).http_status, 200);
+  console.log("PASS: Worker does not claim primary XHTTP readiness from an optional port");
+}
+
 async function testWakeRequiresStableRouteReadiness() {
   let routeCalls = 0;
   globalThis.fetch = async (input) => {
@@ -1089,7 +1136,7 @@ async function testWakeRequiresStableRouteReadiness() {
   const body = await responseJson(response);
   assert.equal(response.status, 200);
   assert.equal(body.route_ready, true);
-  assert.equal(body.route_probe.attempts, 4);
+  assert.equal(body.route_probe.attempts, 3);
   assert.equal(body.route_probe.stable_probes, 2);
   console.log("PASS: Worker rejects transient single route success");
 }
@@ -2074,6 +2121,7 @@ try {
   await testScheduledQuotaCronKeepsRetryingAfterResetWhileStillBlocked();
   await testWakeFailureIncludesNextAction();
   await testHealthTreatsHttp400RouteAsUsable();
+  await testOptionalPortCannotMasqueradeAsPrimaryXhttpReadiness();
   await testWakeRequiresStableRouteReadiness();
   await testWakeWaitsBetweenStableRouteProbes();
   await testWakeDoesNotClaimReadyFromSingleDeadlineProbe();
