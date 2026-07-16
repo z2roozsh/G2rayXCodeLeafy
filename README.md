@@ -171,6 +171,7 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 - `G2RAY_GH_TIMEOUT_SEC` **(Optional)** — Maximum seconds for GitHub CLI control-plane calls. Default: `10`.
 - `G2RAY_LOG_MAX_BYTES` **(Optional)** — Maximum bytes per runtime log before rotation. Default: `1048576`.
 - `G2RAY_LOG_ROTATE_KEEP` **(Optional)** — Number of rotated log files to keep. Default: `3`.
+- `G2RAY_XRAY_CONFIGTEST_LOG_MAX_AGE_MIN` **(Optional)** — How long failed Xray configuration-test logs are retained before cleanup. Default: `1440` minutes (24 hours).
 - `G2RAY_SUPPORT_INCLUDE_NETWORK=1` **(Optional)** — Include full Codespace/domain/IP route metadata in support bundles. Default support bundles redact those network identifiers so they are safer to share.
 - `G2RAY_QUOTA_SECONDS` **(Optional)** — Local monthly quota estimate in seconds. Default: `216000` (60 wall-clock hours on a 2-core Codespace).
 

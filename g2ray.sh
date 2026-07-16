@@ -203,6 +203,7 @@ TCP_KEEPALIVE_IDLE_SEC="${G2RAY_TCP_KEEPALIVE_IDLE:-30}"
 [[ "$TCP_KEEPALIVE_IDLE_SEC" =~ ^[0-9]+$ ]] || TCP_KEEPALIVE_IDLE_SEC=30
 LOG_MAX_BYTES="${G2RAY_LOG_MAX_BYTES:-1048576}"
 LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
+XRAY_CONFIGTEST_LOG_MAX_AGE_MIN="${G2RAY_XRAY_CONFIGTEST_LOG_MAX_AGE_MIN:-1440}"
 [[ "$WAKER_TEST_TIMEOUT_SEC" =~ ^[0-9]+$ && "$WAKER_TEST_TIMEOUT_SEC" -ge 30 ]] || WAKER_TEST_TIMEOUT_SEC=180
 [[ "$RUNTIME_LOCK_WAIT_ATTEMPTS" =~ ^[0-9]+$ && "$RUNTIME_LOCK_WAIT_ATTEMPTS" -ge 1 ]] || RUNTIME_LOCK_WAIT_ATTEMPTS=900
 [[ "$ROUTE_READY_STABLE_PROBES" =~ ^[0-9]+$ && "$ROUTE_READY_STABLE_PROBES" -ge 1 ]] || ROUTE_READY_STABLE_PROBES=2
@@ -222,6 +223,7 @@ LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
 [[ "$LOCAL_PROBE_TIMEOUT_SEC" =~ ^[0-9]+$ && "$LOCAL_PROBE_TIMEOUT_SEC" -ge 1 ]] || LOCAL_PROBE_TIMEOUT_SEC=1
 [[ "$EXTERNAL_PROBE_TIMEOUT_SEC" =~ ^[0-9]+$ && "$EXTERNAL_PROBE_TIMEOUT_SEC" -ge 1 ]] || EXTERNAL_PROBE_TIMEOUT_SEC=5
 [[ "$CONNECT_TIMEOUT_SEC" =~ ^[0-9]+$ && "$CONNECT_TIMEOUT_SEC" -ge 1 ]] || CONNECT_TIMEOUT_SEC=2
+[[ "$XRAY_CONFIGTEST_LOG_MAX_AGE_MIN" =~ ^[0-9]+$ && "$XRAY_CONFIGTEST_LOG_MAX_AGE_MIN" -ge 60 ]] || XRAY_CONFIGTEST_LOG_MAX_AGE_MIN=1440
 [[ "$ACTIVE_TRAFFIC_WINDOW_SEC" =~ ^[0-9]+$ ]] || ACTIVE_TRAFFIC_WINDOW_SEC=180
 [[ "$G2RAY_SUPERVISOR_VERSION_CHECK_TICKS" =~ ^[0-9]+$ && "$G2RAY_SUPERVISOR_VERSION_CHECK_TICKS" -ge 1 ]] || G2RAY_SUPERVISOR_VERSION_CHECK_TICKS=15
 [[ "$G2RAY_LATENCY_FOCUS_ROUTE_REFRESH_TICKS" =~ ^[0-9]+$ && "$G2RAY_LATENCY_FOCUS_ROUTE_REFRESH_TICKS" -ge 1 ]] || G2RAY_LATENCY_FOCUS_ROUTE_REFRESH_TICKS=15
@@ -296,7 +298,7 @@ reapply_config_preserving_uuid_if_exists() {
 
 enable_low_overhead_mode() {
     if latency_focus_enabled; then
-        disable_latency_focus_mode
+        disable_latency_focus_mode --no-reapply
     fi
     rm -f "$LOW_OVERHEAD_DISABLED_FILE" 2>/dev/null || true
     printf 'enabled\n' > "$LOW_OVERHEAD_FILE"
@@ -311,7 +313,7 @@ disable_low_overhead_mode() {
     printf 'disabled\n' > "$LOW_OVERHEAD_DISABLED_FILE"
     chmod 600 "$LOW_OVERHEAD_DISABLED_FILE" 2>/dev/null || true
     restore_previous_performance_profile "$LOW_OVERHEAD_PREV_PROFILE_FILE"
-    reapply_config_preserving_uuid_if_exists
+    [[ "${1:-}" == "--no-reapply" ]] || reapply_config_preserving_uuid_if_exists
 }
 
 toggle_low_overhead_mode() {
@@ -339,7 +341,7 @@ latency_focus_enabled() {
 
 enable_latency_focus_mode() {
     if low_overhead_enabled; then
-        disable_low_overhead_mode
+        disable_low_overhead_mode --no-reapply
     fi
     rm -f "$LATENCY_FOCUS_DISABLED_FILE" 2>/dev/null || true
     printf 'enabled\n' > "$LATENCY_FOCUS_FILE"
@@ -354,7 +356,7 @@ disable_latency_focus_mode() {
     printf 'disabled\n' > "$LATENCY_FOCUS_DISABLED_FILE"
     chmod 600 "$LATENCY_FOCUS_DISABLED_FILE" 2>/dev/null || true
     restore_previous_performance_profile "$LATENCY_FOCUS_PREV_PROFILE_FILE"
-    reapply_config_preserving_uuid_if_exists
+    [[ "${1:-}" == "--no-reapply" ]] || reapply_config_preserving_uuid_if_exists
 }
 
 toggle_latency_focus_mode() {
@@ -1219,6 +1221,19 @@ xhttp_config_path() {
     printf '/'
 }
 
+xhttp_config_mode() {
+    local mode=""
+    if [[ -f "$CONFIG_FILE" ]] && command -v jq >/dev/null 2>&1; then
+        mode=$(jq -r '.inbounds[]? | select(.tag=="vless-in") | .streamSettings.xhttpSettings.mode // empty' "$CONFIG_FILE" 2>/dev/null \
+            | awk 'NF {print; exit}')
+    fi
+    if valid_xhttp_mode "$mode"; then
+        printf '%s' "$mode"
+        return 0
+    fi
+    xhttp_mode_value
+}
+
 xhttp_probe_metrics() {
     local target="${1:-external}" address="${2:-}" path url raw code elapsed ms curl_rc=0 error_hint="" reason timeout_sec
     path=$(xhttp_config_path)
@@ -1713,7 +1728,8 @@ waker_metadata_value() {
 }
 
 save_waker_metadata() {
-    local worker_url="$1" wake_fingerprint="$2" codespace="${3:-$CODESPACE_NAME}" worker_codespace_id="${4:-$codespace}" configured_at content
+    local worker_url="$1" wake_fingerprint="$2" codespace="${3:-$CODESPACE_NAME}" configured_at content
+    local worker_codespace_id="${4:-$codespace}"
     worker_url=$(normalize_waker_url "$worker_url") || return 1
     wake_fingerprint=$(one_line "$wake_fingerprint")
     codespace=$(one_line "$codespace")
@@ -2713,6 +2729,19 @@ upgrade_config_dns() {
     fi
 }
 
+prune_xray_configtest_logs() {
+    local dir age="$XRAY_CONFIGTEST_LOG_MAX_AGE_MIN" tmp_dir="${TMPDIR:-/tmp}"
+    [[ "$age" =~ ^[0-9]+$ && "$age" -ge 60 ]] || age=1440
+    if [[ -d "$LOG_DIR" ]]; then
+        find "$LOG_DIR" -maxdepth 1 -type f -name 'xray-configtest.*.log' \
+            -mmin +"$age" -delete 2>/dev/null || true
+    fi
+    if [[ "$tmp_dir" != "$LOG_DIR" && -d "$tmp_dir" ]]; then
+        find "$tmp_dir" -maxdepth 1 -type f -name 'g2ray-xray-configtest.*.log' \
+            -mmin +"$age" -delete 2>/dev/null || true
+    fi
+}
+
 xray_validate_config_file() {
     local config_file="${1:-}" tmp
     [[ -f "$config_file" ]] || return 1
@@ -2721,7 +2750,8 @@ xray_validate_config_file() {
         echo -e "  ${RED}ERROR: Xray config JSON is invalid.${NC}"
         return 1
     fi
-    tmp=$(mktemp "${LOG_DIR}/xray-configtest.XXXXXX.log" 2>/dev/null || mktemp "/tmp/xray-configtest.XXXXXX.log") || return 1
+    prune_xray_configtest_logs
+    tmp=$(mktemp "${LOG_DIR}/xray-configtest.XXXXXX.log" 2>/dev/null || mktemp "${TMPDIR:-/tmp}/g2ray-xray-configtest.XXXXXX.log") || return 1
     if sudo timeout 10 "$XRAY_BIN" run -test -c "$config_file" >"$tmp" 2>&1; then
         rm -f "$tmp" 2>/dev/null || true
         return 0
@@ -3586,7 +3616,7 @@ generate_link_for_address() {
     path=$(xhttp_config_path)
     [[ "$path" == /* ]] || path="/${path}"
     encoded_path=$(url_encode_query_value "$path")
-    xhttp_mode=$(xhttp_mode_value)
+    xhttp_mode=$(xhttp_config_mode)
     # Keep exported links broadly compatible: omit XHTTP `extra` unless the user
     # explicitly supplies a complete, valid object for a known-compatible client.
     local extra_json=""

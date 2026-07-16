@@ -1618,6 +1618,25 @@ test_xhttp_mode_is_persistent_and_link_consistent() {
     pass "XHTTP mode persists and exported links match server config"
 }
 
+test_generated_links_use_active_config_mode_over_env_override() {
+    reset_runtime_paths
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    GITHUB_USER="tester"
+    CODESPACES_EDGE_PORT=443
+    printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
+    cat > "$CONFIG_FILE" <<'JSON'
+{"inbounds":[{"tag":"vless-in","streamSettings":{"xhttpSettings":{"path":"/","mode":"stream-one"}}}]}
+JSON
+    printf 'packet-up\n' > "$XHTTP_MODE_FILE"
+    G2RAY_XHTTP_MODE="stream-up"
+    local link
+    link="$(generate_link_for_address "20.0.0.1" "-ip1")"
+    unset G2RAY_XHTTP_MODE
+    [[ "$link" == *"mode=stream-one"* ]] \
+        || fail "generated link followed preference/env mode instead of active config: $link"
+    pass "generated links use the active XHTTP config mode"
+}
+
 test_custom_xhttp_extra_json_is_validated() {
     reset_runtime_paths
     PORT_DOMAIN="behavior-space-443.app.github.dev"
@@ -2010,6 +2029,41 @@ test_panel_modes_apply_real_performance_profiles() {
         || fail "latency-focus disable did not reapply the restored profile with preserved UUID"
 
     pass "panel modes apply real performance profiles and preserve UUID"
+}
+
+test_switching_performance_modes_reapplies_once() {
+    reset_runtime_paths
+    local calls_file="$TMP_ROOT/profile-single-reapply-calls.txt"
+    : > "$calls_file"
+    printf '{}\n' > "$CONFIG_FILE"
+    generate_config() {
+        printf 'profile=%s effective=%s preserve=%s\n' \
+            "$PERFORMANCE_PROFILE" "$(effective_performance_profile)" "${G2RAY_PRESERVE_UUID:-0}" >> "$calls_file"
+    }
+
+    set_performance_profile max_throughput
+    toggle_low_overhead_mode >/dev/null
+    [[ "$(wc -l < "$calls_file")" -eq 1 ]] \
+        || fail "enabling low-overhead mode reapplied config more than once"
+
+    : > "$calls_file"
+    toggle_latency_focus_mode >/dev/null
+    [[ "$(wc -l < "$calls_file")" -eq 1 ]] \
+        || fail "switching from low-overhead to latency focus reapplied config more than once"
+    pass "switching mutually exclusive performance modes reapplies once"
+}
+
+test_xray_configtest_logs_prune_old_files() {
+    reset_runtime_paths
+    XRAY_CONFIGTEST_LOG_MAX_AGE_MIN=60
+    local old_file="$LOG_DIR/xray-configtest.old.log" fresh_file="$LOG_DIR/xray-configtest.fresh.log"
+    printf 'old\n' > "$old_file"
+    printf 'fresh\n' > "$fresh_file"
+    touch -d '2 hours ago' "$old_file"
+    prune_xray_configtest_logs
+    [[ ! -e "$old_file" ]] || fail "stale Xray validation log was not pruned"
+    [[ -e "$fresh_file" ]] || fail "fresh Xray validation log was pruned"
+    pass "stale Xray validation logs are pruned without deleting fresh diagnostics"
 }
 
 test_performance_profile_settings_are_available() {
@@ -2761,6 +2815,7 @@ test_refresh_config_exports_updates_input_hash_after_direct_refresh
 test_force_reconnect_skips_restart_when_identity_unknown
 test_generated_links_follow_configured_xhttp_path
 test_xhttp_mode_is_persistent_and_link_consistent
+test_generated_links_use_active_config_mode_over_env_override
 test_custom_xhttp_extra_json_is_validated
 test_websocket_fallback_is_advanced_opt_in
 test_websocket_fallback_exports_separate_alpn_variants
@@ -2775,7 +2830,9 @@ test_low_overhead_keeps_important_state_logs
 test_latency_focus_mode_suppresses_noncritical_info_but_preserves_warnings
 test_latency_focus_env_can_be_overridden_by_toggle
 test_panel_modes_apply_real_performance_profiles
+test_switching_performance_modes_reapplies_once
 test_performance_profile_settings_are_available
+test_xray_configtest_logs_prune_old_files
 test_route_settling_history_records_summary
 test_doctor_json_reports_probe_state
 test_doctor_json_sanitizes_invalid_port
