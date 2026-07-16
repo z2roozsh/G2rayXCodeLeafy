@@ -156,6 +156,7 @@ HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC="${G2RAY_HEADLESS_ROUTE_SETTLE_INITIAL_D
 ROUTE_READY_STABLE_PROBES="${G2RAY_ROUTE_READY_STABLE_PROBES:-2}"
 ROUTE_READY_STABLE_SLEEP_SEC="${G2RAY_ROUTE_READY_STABLE_SLEEP_SEC:-1}"
 ROUTE_HEALTH_TTL_SEC="${G2RAY_ROUTE_HEALTH_TTL_SEC:-300}"
+ROUTE_HEALTH_EXPORT_MAX_AGE_SEC="${G2RAY_ROUTE_HEALTH_EXPORT_MAX_AGE_SEC:-21600}"
 ROUTE_REFRESH_BACKOFF_INITIAL_SEC="${G2RAY_ROUTE_REFRESH_BACKOFF_INITIAL_SEC:-60}"
 ROUTE_REFRESH_BACKOFF_MAX_SEC="${G2RAY_ROUTE_REFRESH_BACKOFF_MAX_SEC:-600}"
 DNS_CACHE_TTL_SEC="${G2RAY_DNS_CACHE_TTL_SEC:-300}"
@@ -211,6 +212,7 @@ LOG_ROTATE_KEEP="${G2RAY_LOG_ROTATE_KEEP:-3}"
 [[ "$HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC" =~ ^[0-9]+$ ]] || HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC=5
 (( HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC > 30 )) && HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC=30
 [[ "$ROUTE_HEALTH_TTL_SEC" =~ ^[0-9]+$ && "$ROUTE_HEALTH_TTL_SEC" -ge 30 ]] || ROUTE_HEALTH_TTL_SEC=300
+[[ "$ROUTE_HEALTH_EXPORT_MAX_AGE_SEC" =~ ^[0-9]+$ && "$ROUTE_HEALTH_EXPORT_MAX_AGE_SEC" -ge "$ROUTE_HEALTH_TTL_SEC" ]] || ROUTE_HEALTH_EXPORT_MAX_AGE_SEC=21600
 [[ "$ROUTE_REFRESH_BACKOFF_INITIAL_SEC" =~ ^[0-9]+$ && "$ROUTE_REFRESH_BACKOFF_INITIAL_SEC" -ge 15 ]] || ROUTE_REFRESH_BACKOFF_INITIAL_SEC=60
 [[ "$ROUTE_REFRESH_BACKOFF_MAX_SEC" =~ ^[0-9]+$ && "$ROUTE_REFRESH_BACKOFF_MAX_SEC" -ge "$ROUTE_REFRESH_BACKOFF_INITIAL_SEC" ]] || ROUTE_REFRESH_BACKOFF_MAX_SEC=600
 [[ "$DNS_CACHE_TTL_SEC" =~ ^[0-9]+$ ]] || DNS_CACHE_TTL_SEC=300
@@ -4134,7 +4136,13 @@ route_health_cache_fresh() {
 
 cached_usable_fallback_ips() {
     [[ -s "$ROUTE_HEALTH_FILE" ]] || return 1
-    local last_good pinned stats_input
+    local cache_age last_good pinned stats_input
+    cache_age=$(file_age_sec "$ROUTE_HEALTH_FILE")
+    [[ "$ROUTE_HEALTH_EXPORT_MAX_AGE_SEC" =~ ^[0-9]+$ ]] || ROUTE_HEALTH_EXPORT_MAX_AGE_SEC=21600
+    if (( cache_age > ROUTE_HEALTH_EXPORT_MAX_AGE_SEC )); then
+        log_event WARN "fallback_route_filter stale_cache age_sec=${cache_age} max_age_sec=${ROUTE_HEALTH_EXPORT_MAX_AGE_SEC} action=domain_only"
+        return 1
+    fi
     pinned=$(pinned_route_value)
     last_good=$(last_good_route_fresh_value)
     stats_input="$ROUTE_STATS_FILE"
@@ -5840,6 +5848,7 @@ if [[ "${1:-}" == "--silent-start" ]]; then
         read -r _boot_code _boot_ms _boot_reason < <(xhttp_probe_metrics external)
         write_boot_status "needs_attention" "silent_start" "Xray listener could not start; background route settling was not started." "${_boot_code:-0}" "${_boot_ms:-0}"
         start_background_tasks || log_event WARN "headless_start reason=silent_start supervisor_start_deferred"
+        exit 1
     fi
     exit 0
 fi

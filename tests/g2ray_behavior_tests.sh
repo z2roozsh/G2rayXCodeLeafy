@@ -2620,6 +2620,20 @@ test_route_refresh_backoff_preserves_cache_without_probe_storms() {
     pass "route refresh backoff preserves cache and prevents probe storms"
 }
 
+test_stale_route_cache_is_not_exported_after_hard_age() {
+    reset_runtime_paths
+    printf '{}\n' > "$CONFIG_FILE"
+    printf '2026-05-30T00:00:00Z\t20.0.0.1\t200\t50\ttrue\tdns\tready\n' > "$ROUTE_HEALTH_FILE"
+    touch -d '7 hours ago' "$ROUTE_HEALTH_FILE"
+    ROUTE_HEALTH_EXPORT_MAX_AGE_SEC=21600
+
+    if cached_usable_fallback_ips >/dev/null 2>&1; then
+        fail "stale route cache was exported after the hard maximum age"
+    fi
+    grep -Fq 'stale_cache' "$LOG_FILE" || fail "stale route cache rejection was not logged"
+    pass "stale route cache is excluded from exports after the hard maximum age"
+}
+
 test_self_heal_defers_external_repairs_while_traffic_is_active() {
     (
         reset_runtime_paths
@@ -2711,6 +2725,7 @@ test_route_health_refresh_preserves_cache_when_all_probes_are_unusable
 test_route_health_refresh_mixes_provider_candidates_before_stale_cache_cap
 test_route_health_refresh_does_not_let_unusable_cache_starve_builtins
 test_route_refresh_backoff_preserves_cache_without_probe_storms
+test_stale_route_cache_is_not_exported_after_hard_age
 test_self_heal_defers_external_repairs_while_traffic_is_active
 test_deadline_terminates_descendant_processes
 test_post_start_propagates_silent_start_failure
