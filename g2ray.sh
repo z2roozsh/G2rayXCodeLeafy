@@ -4224,11 +4224,34 @@ route_candidate_health_summary() {
         return 0
     fi
 
-    local last
+    local last cache_age cache_status sample_range
     last=$(awk -F '\t' 'END{print $1}' "$ROUTE_HEALTH_FILE" 2>/dev/null)
+    cache_age=$(file_age_sec "$ROUTE_HEALTH_FILE")
+    if (( cache_age <= ROUTE_HEALTH_TTL_SEC )); then
+        cache_status="fresh"
+    elif (( cache_age <= ROUTE_HEALTH_EXPORT_MAX_AGE_SEC )); then
+        cache_status="stale"
+    else
+        cache_status="expired"
+    fi
+    sample_range=$(awk -F '\t' '
+        $2 ~ /^[0-9]+$/ {
+            value = $2 + 0
+            if (!seen++) { min = value; max = value }
+            if (value < min) min = value
+            if (value > max) max = value
+        }
+        END {
+            if (seen) printf "%d-%d", min, max
+            else printf "none"
+        }
+    ' "$ROUTE_STATS_FILE" 2>/dev/null)
     printf 'Last refresh : %s\n' "${last:-unknown}"
+    printf 'Cache status : %s age_sec=%s fresh_ttl=%ss export_max_age=%ss\n' \
+        "$cache_status" "$cache_age" "$ROUTE_HEALTH_TTL_SEC" "$ROUTE_HEALTH_EXPORT_MAX_AGE_SEC"
     printf 'Candidates   : pinned first, then best reliable usable routes\n'
     printf 'Probe scope  : Codespace-side route checks; your ISP/client path can still block some IPs\n'
+    printf 'Samples      : rolling per-route sample range=%s; low counts are provisional\n' "$sample_range"
     stats_input="$ROUTE_STATS_FILE"
     [[ -s "$stats_input" ]] || stats_input="/dev/null"
     awk -F '\t' -v pinned="$pinned" -v stats_file="$stats_input" '
@@ -4252,6 +4275,7 @@ route_candidate_health_summary() {
             ok = (ip in successes) ? successes[ip] : (($5 == "true") ? 1 : 0)
             recent = (ip in recent_failures) ? recent_failures[ip] : 0
             success_penalty = int(((total - ok) * 1000) / total) + (recent * 75)
+            confidence = (total >= 10 && ok >= total * 0.95) ? "high" : ((total >= 5 && ok >= total * 0.80) ? "medium" : "provisional")
             avg_ms = ((ip in avg) && avg[ip] > 0) ? avg[ip] : latency
             score_ms = ((ip in ewma) && ewma[ip] > 0) ? ewma[ip] : avg_ms
             last_ms = ((ip in latest) && latest[ip] > 0) ? latest[ip] : latency
@@ -4259,8 +4283,8 @@ route_candidate_health_summary() {
             pinned_rank = (ip == pinned) ? 0 : 1
             source = (NF >= 6 && $6 != "") ? $6 : "unknown"
             reason = (NF >= 7 && $7 != "") ? $7 : ((ip in last_reason) ? last_reason[ip] : "unknown")
-            line = sprintf("%-15s HTTP %-3s last=%sms avg=%sms success=%s/%s recent=%sms recent_fail=%s usable=%s source=%s reason=%s",
-                ip, $3, last_ms, avg_ms, ok, total, score_ms, recent, $5, source, reason)
+            line = sprintf("%-15s HTTP %-3s last=%sms avg=%sms success=%s/%s recent=%sms recent_fail=%s confidence=%s usable=%s source=%s reason=%s",
+                ip, $3, last_ms, avg_ms, ok, total, score_ms, recent, confidence, $5, source, reason)
             printf "%d\t%d\t%08d\t%08d\t%04d\t%08d\t%s\t%s\n",
                 pinned_rank, usable_rank, route_score, score_ms, success_penalty, last_ms, ip, line
         }

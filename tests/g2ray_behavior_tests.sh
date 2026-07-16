@@ -533,6 +533,13 @@ test_route_candidate_stats_track_average_and_success_rate() {
     printf '2026-05-30T00:00:00Z\t20.0.0.1\t200\t300\ttrue\n' > "$ROUTE_HEALTH_FILE"
     route_candidate_health_summary | grep -Fq 'avg=200ms success=2/3' \
         || fail "route candidate summary does not show average latency and success ratio"
+    route_summary=$(route_candidate_health_summary)
+    grep -Fq 'Cache status :' <<< "$route_summary" \
+        || fail "route candidate summary does not show cache freshness"
+    grep -Fq 'Samples      :' <<< "$route_summary" \
+        || fail "route candidate summary does not show sample confidence"
+    grep -Fq 'confidence=provisional' <<< "$route_summary" \
+        || fail "low-sample route was not marked provisional"
     pass "route candidate stats track rolling average and reliability"
 }
 
