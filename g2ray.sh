@@ -166,6 +166,8 @@ ROUTE_STATS_MAX_AGE_SEC="${G2RAY_ROUTE_STATS_MAX_AGE_SEC:-604800}"
 ROUTE_PROBE_CONCURRENCY="${G2RAY_ROUTE_PROBE_CONCURRENCY:-6}"
 ROUTE_PROBE_JITTER_SEC="${G2RAY_ROUTE_PROBE_JITTER_SEC:-0}"
 PORT_PUBLIC_TTL_SEC="${G2RAY_PORT_PUBLIC_TTL_SEC:-300}"
+PORT_PUBLIC_STARTUP_ATTEMPTS="${G2RAY_PORT_PUBLIC_STARTUP_ATTEMPTS:-4}"
+PORT_PUBLIC_STARTUP_RETRY_SEC="${G2RAY_PORT_PUBLIC_STARTUP_RETRY_SEC:-2}"
 LOCAL_PROBE_TIMEOUT_SEC="${G2RAY_LOCAL_PROBE_TIMEOUT_SEC:-1}"
 EXTERNAL_PROBE_TIMEOUT_SEC="${G2RAY_EXTERNAL_PROBE_TIMEOUT_SEC:-5}"
 CONNECT_TIMEOUT_SEC="${G2RAY_CONNECT_TIMEOUT_SEC:-2}"
@@ -220,6 +222,10 @@ XRAY_CONFIGTEST_LOG_MAX_AGE_MIN="${G2RAY_XRAY_CONFIGTEST_LOG_MAX_AGE_MIN:-1440}"
 [[ "$ROUTE_PROBE_CONCURRENCY" =~ ^[0-9]+$ && "$ROUTE_PROBE_CONCURRENCY" -ge 1 ]] || ROUTE_PROBE_CONCURRENCY=6
 (( ROUTE_PROBE_CONCURRENCY > 16 )) && ROUTE_PROBE_CONCURRENCY=16
 [[ "$ROUTE_REPAIR_COOLDOWN_SEC" =~ ^[0-9]+$ ]] || ROUTE_REPAIR_COOLDOWN_SEC=180
+[[ "$PORT_PUBLIC_STARTUP_ATTEMPTS" =~ ^[0-9]+$ && "$PORT_PUBLIC_STARTUP_ATTEMPTS" -ge 1 ]] || PORT_PUBLIC_STARTUP_ATTEMPTS=4
+(( PORT_PUBLIC_STARTUP_ATTEMPTS > 8 )) && PORT_PUBLIC_STARTUP_ATTEMPTS=8
+[[ "$PORT_PUBLIC_STARTUP_RETRY_SEC" =~ ^[0-9]+$ ]] || PORT_PUBLIC_STARTUP_RETRY_SEC=2
+(( PORT_PUBLIC_STARTUP_RETRY_SEC > 10 )) && PORT_PUBLIC_STARTUP_RETRY_SEC=10
 [[ "$LOCAL_PROBE_TIMEOUT_SEC" =~ ^[0-9]+$ && "$LOCAL_PROBE_TIMEOUT_SEC" -ge 1 ]] || LOCAL_PROBE_TIMEOUT_SEC=1
 [[ "$EXTERNAL_PROBE_TIMEOUT_SEC" =~ ^[0-9]+$ && "$EXTERNAL_PROBE_TIMEOUT_SEC" -ge 1 ]] || EXTERNAL_PROBE_TIMEOUT_SEC=5
 [[ "$CONNECT_TIMEOUT_SEC" =~ ^[0-9]+$ && "$CONNECT_TIMEOUT_SEC" -ge 1 ]] || CONNECT_TIMEOUT_SEC=2
@@ -2261,6 +2267,29 @@ force_public_runtime_ports() {
     return "$failed"
 }
 
+publish_runtime_ports_with_retry() {
+    local reason="${1:-startup}" max_attempts="${2:-$PORT_PUBLIC_STARTUP_ATTEMPTS}" delay_sec="${3:-$PORT_PUBLIC_STARTUP_RETRY_SEC}" attempt=1
+    [[ "$max_attempts" =~ ^[0-9]+$ && "$max_attempts" -ge 1 ]] || max_attempts=4
+    (( max_attempts > 8 )) && max_attempts=8
+    [[ "$delay_sec" =~ ^[0-9]+$ ]] || delay_sec=2
+    (( delay_sec > 10 )) && delay_sec=10
+
+    while (( attempt <= max_attempts )); do
+        if force_public_runtime_ports "$reason"; then
+            log_event INFO "port_public startup_ready reason=${reason} attempt=${attempt}"
+            return 0
+        fi
+        log_event WARN "port_public startup_retry reason=${reason} attempt=${attempt} max=${max_attempts}"
+        if (( attempt < max_attempts && delay_sec > 0 )); then
+            sleep "$delay_sec"
+        fi
+        attempt=$(( attempt + 1 ))
+    done
+
+    log_event WARN "port_public startup_exhausted reason=${reason} attempts=${max_attempts} action=background_retry"
+    return 1
+}
+
 repair_codespace_port_route() {
     command -v gh >/dev/null 2>&1 || return 1
     log_event WARN "route_repair begin port=${XRAY_PORT} domain=${PORT_DOMAIN}"
@@ -2366,7 +2395,7 @@ run_headless_route_settle() {
         return 1
     fi
 
-    force_public_runtime_ports "route_settle_start" >/dev/null 2>&1 || true
+    publish_runtime_ports_with_retry "route_settle_start" >/dev/null 2>&1 || true
     if wait_for_xhttp_route_ready "$reason" "$HEADLESS_ROUTE_SETTLE_WAIT_SEC"; then
         read -r xcode xms probe_reason < <(xhttp_probe_metrics external)
         reset_route_bad_count

@@ -161,6 +161,8 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 - `G2RAY_LOW_OVERHEAD=1` **(Optional)** — Starts the panel in low-overhead mode, which applies the `low_overhead` profile, reduces INFO logs, and reduces less-essential background route/export refreshes. You can also toggle this from option `18`. It can improve steadiness on constrained Codespaces, but it may reduce peak throughput.
 - `G2RAY_LATENCY_FOCUS=1` **(Optional)** — Starts the panel in latency-focus mode, which applies the `low_latency` profile, keeps heartbeat/self-heal active, and minimizes noncritical background route/export refreshes. You can also toggle this from option `49`. It aims to reduce queueing and idle stalls; it cannot remove ISP packet loss by itself.
 - `G2RAY_PORT_PUBLIC_TTL_SEC` **(Optional)** — Seconds to trust the last successful `gh codespace ports visibility 443:public` call before calling GitHub again. Default: `300`.
+- `G2RAY_PORT_PUBLIC_STARTUP_ATTEMPTS` **(Optional)** — Background attempts to publish configured runtime ports after a headless start, covering the short window before GitHub registers a forwarded port. Default: `4`; maximum: `8`.
+- `G2RAY_PORT_PUBLIC_STARTUP_RETRY_SEC` **(Optional)** — Delay between those background publication attempts. Default: `2`; maximum: `10`.
 - `G2RAY_WAKER_TEST_TIMEOUT_SEC` **(Optional)** — Seconds the panel waits when testing the Cloudflare Worker from option `15) Recovery / Waker Setup`. Default: `180`.
 - `G2RAY_EDGE_RECONNECT_THRESHOLD` **(Optional)** — Number of consecutive unreachable edge checks before self-heal may run a full reconnect. Default: `3`.
 - `G2RAY_RECONNECT_COOLDOWN_SEC` **(Optional)** — Minimum seconds between automatic full reconnects. Default: `300`.
@@ -238,6 +240,12 @@ The helper uses GitHub's Codespaces start API, waits until the Codespace is avai
 For a standby Codespace, keep the old Codespace marked **Keep codespace** where GitHub allows it, then create a second Codespace only when you need current-month compute. The Android client keeps each Codespace's configs separate: select a Codespace on Home, test its local configs, then start VPN with the chosen config. It never silently changes an existing VPN session to another Codespace.
 
 One Cloudflare Worker can wake all of them without Wrangler or KV. Keep the first `CODESPACE_NAME` / `GITHUB_TOKEN`, then add `CODESPACE_2_NAME` / `GITHUB_TOKEN_2` in the Cloudflare dashboard for the standby Codespace. Continue with numbered pairs when needed and keep one shared `WAKE_SECRET`. The old Codespace remains saved in the app for the next billing reset; it will not be automatically started while GitHub reports quota blocked.
+
+### Startup automation and port forwarding
+
+The checked-in devcontainer declares `forwardPorts` for the XHTTP port (`443`) and optional WebSocket port (`8443`), marks them public, and runs `scripts/post-start.sh` after every Codespace start. The headless startup path starts Xray, reasserts public visibility through the bounded GitHub CLI call, and retries briefly in the background when GitHub has not registered the forwarded port yet. The supervisor continues periodic visibility checks and route repair, so opening VS Code or the Ports tab is not part of the normal workflow.
+
+This automation controls the public Codespaces edge used by the mobile client. `gh codespace ports forward` is a local CLI tunnel for your own terminal and is not needed for the public VLESS links. An existing Codespace may need one **Rebuild container** after the devcontainer forwarding settings are first pulled; after that, startup is automatic. A repository/org policy that forbids public ports, a missing Codespaces token, or a GitHub service delay cannot be overridden by project code; diagnostics logs the exact failure and keeps retrying without claiming the route is ready.
 
 Linux recovery after Worker wake:
 

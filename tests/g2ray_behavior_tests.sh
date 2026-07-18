@@ -369,6 +369,29 @@ test_lifecycle_port_publish_forces_visibility_cache() {
     pass "lifecycle port publish bypasses the visibility cache"
 }
 
+test_startup_port_publish_retries_until_forwarding_is_registered() {
+    (
+        reset_runtime_paths
+        PORT_PUBLIC_STARTUP_ATTEMPTS=4
+        PORT_PUBLIC_STARTUP_RETRY_SEC=0
+        local publish_attempts=0
+        force_public_runtime_ports() {
+            publish_attempts=$((publish_attempts + 1))
+            (( publish_attempts >= 3 ))
+        }
+
+        publish_runtime_ports_with_retry "behavior_test" >/dev/null \
+            || fail "startup port publish did not recover after a transient registration delay"
+        [[ "$publish_attempts" -eq 3 ]] \
+            || fail "startup port publish used $publish_attempts attempts instead of stopping after success"
+        grep -Fq 'port_public startup_retry reason=behavior_test attempt=1 max=4' "$LOG_FILE" \
+            || fail "startup port publish retry was not observable"
+        grep -Fq 'port_public startup_ready reason=behavior_test attempt=3' "$LOG_FILE" \
+            || fail "startup port publish success was not observable"
+    )
+    pass "startup port publish retries transient forwarding-registration delays"
+}
+
 test_background_start_reports_lock_failure_without_live_supervisor() {
     (
         reset_runtime_paths
@@ -2759,6 +2782,7 @@ test_runtime_lock_serializes_operations_and_allows_reentry
 test_stop_xray_succeeds_when_engine_is_already_stopped
 test_port_visibility_cache_is_scoped_by_codespace_and_port
 test_lifecycle_port_publish_forces_visibility_cache
+test_startup_port_publish_retries_until_forwarding_is_registered
 test_run_gh_sanitizes_invalid_timeout_env
 test_background_start_reports_lock_failure_without_live_supervisor
 test_stale_temp_sweep_removes_only_old_owned_artifacts

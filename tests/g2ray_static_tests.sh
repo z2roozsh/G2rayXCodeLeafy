@@ -802,6 +802,10 @@ test_probe_and_gh_commands_are_bounded() {
         || fail 'port visibility still bypasses the bounded gh helper'
     grep_fixed 'ensure_codespace_port_public_for_port "$XRAY_PORT"' "$SCRIPT" \
         || fail 'primary XHTTP port visibility wrapper is missing'
+    grep_fixed 'publish_runtime_ports_with_retry()' "$SCRIPT" \
+        || fail 'startup port publication has no bounded retry helper'
+    grep_fixed 'publish_runtime_ports_with_retry "route_settle_start"' "$SCRIPT" \
+        || fail 'headless route settling does not retry port publication after registration delays'
     grep_fixed 'run_gh codespace ports -c "$CODESPACE_NAME"' "$SCRIPT" \
         || fail 'diagnostics port query still bypasses the bounded gh helper'
     pass 'curl probes and gh calls are bounded'
@@ -1919,6 +1923,8 @@ test_docs_and_public_configs_are_consistent() {
         || fail 'README does not include Linux recovery troubleshooting after Worker wake'
     grep_fixed 'gh codespace ports visibility 443:public -c "$CS"' "$README" \
         || fail 'README Linux recovery flow does not include public port repair'
+    grep_fixed 'Startup automation and port forwarding' "$README" \
+        || fail 'README does not explain automatic startup port forwarding and its rebuild requirement'
     grep_fixed 'curl -sS -o /dev/null -w "route=%{http_code} time=%{time_total}s\n" -X OPTIONS "$APP"' "$README" \
         || fail 'README Linux recovery flow does not include an external route probe'
     grep_fixed '12) Server Location' "$README" \
