@@ -507,7 +507,7 @@ function normalizeRegistryEntries(value) {
     const tokenBinding = String(raw.token_binding || "").trim();
     if (!/^[a-z0-9][a-z0-9_-]{0,63}$/i.test(id) ||
         !/^[a-z0-9][a-z0-9-]*$/i.test(name) ||
-        !/^GITHUB_TOKEN_[A-Z0-9_]+$/.test(tokenBinding) ||
+        !/^(?:GITHUB_TOKEN|GITHUB_TOKEN_[A-Z0-9_]+)$/.test(tokenBinding) ||
         ids.has(id) || names.has(name)) continue;
     ids.add(id);
     names.add(name);
@@ -1279,7 +1279,7 @@ async function queueHistorySideEffects(env, event, data, ctx) {
       console.warn("history_side_effect_failed", shortError(error));
     }));
     return {
-      history_recorded: true,
+      history_recorded: false,
       quota_incident_recorded: quotaIncident.recorded,
       quota_incident: quotaIncident.incident,
       deferred: true

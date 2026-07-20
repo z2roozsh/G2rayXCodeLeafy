@@ -183,6 +183,9 @@ G2RAY_SUPERVISOR_STATS_TIMEOUT_SEC="${G2RAY_SUPERVISOR_STATS_TIMEOUT_SEC:-10}"
 G2RAY_SUPERVISOR_VERSION_CHECK_TICKS="${G2RAY_SUPERVISOR_VERSION_CHECK_TICKS:-15}"
 G2RAY_LATENCY_FOCUS_ROUTE_REFRESH_TICKS="${G2RAY_LATENCY_FOCUS_ROUTE_REFRESH_TICKS:-15}"
 G2RAY_LATENCY_FOCUS_EXPORT_REFRESH_TICKS="${G2RAY_LATENCY_FOCUS_EXPORT_REFRESH_TICKS:-15}"
+G2RAY_ACTIVE_ROUTE_REFRESH_TICKS="${G2RAY_ACTIVE_ROUTE_REFRESH_TICKS:-30}"
+G2RAY_ACTIVE_EXPORT_REFRESH_TICKS="${G2RAY_ACTIVE_EXPORT_REFRESH_TICKS:-30}"
+G2RAY_SILENT_START_VERIFY_SEC="${G2RAY_SILENT_START_VERIFY_SEC:-4}"
 G2RAY_INTERACTIVE_ROUTE_REFRESH_TIMEOUT_SEC="${G2RAY_INTERACTIVE_ROUTE_REFRESH_TIMEOUT_SEC:-45}"
 G2RAY_INTERACTIVE_EXPORT_TIMEOUT_SEC="${G2RAY_INTERACTIVE_EXPORT_TIMEOUT_SEC:-45}"
 # Profile resolution order: env var override, then the persisted preference
@@ -210,6 +213,10 @@ XRAY_CONFIGTEST_LOG_MAX_AGE_MIN="${G2RAY_XRAY_CONFIGTEST_LOG_MAX_AGE_MIN:-1440}"
 [[ "$RUNTIME_LOCK_WAIT_ATTEMPTS" =~ ^[0-9]+$ && "$RUNTIME_LOCK_WAIT_ATTEMPTS" -ge 1 ]] || RUNTIME_LOCK_WAIT_ATTEMPTS=900
 [[ "$ROUTE_READY_STABLE_PROBES" =~ ^[0-9]+$ && "$ROUTE_READY_STABLE_PROBES" -ge 1 ]] || ROUTE_READY_STABLE_PROBES=2
 [[ "$ROUTE_READY_STABLE_SLEEP_SEC" =~ ^[0-9]+$ ]] || ROUTE_READY_STABLE_SLEEP_SEC=1
+[[ "$G2RAY_ACTIVE_ROUTE_REFRESH_TICKS" =~ ^[0-9]+$ && "$G2RAY_ACTIVE_ROUTE_REFRESH_TICKS" -ge 5 ]] || G2RAY_ACTIVE_ROUTE_REFRESH_TICKS=30
+[[ "$G2RAY_ACTIVE_EXPORT_REFRESH_TICKS" =~ ^[0-9]+$ && "$G2RAY_ACTIVE_EXPORT_REFRESH_TICKS" -ge 5 ]] || G2RAY_ACTIVE_EXPORT_REFRESH_TICKS=30
+[[ "$G2RAY_SILENT_START_VERIFY_SEC" =~ ^[0-9]+$ && "$G2RAY_SILENT_START_VERIFY_SEC" -ge 1 ]] || G2RAY_SILENT_START_VERIFY_SEC=4
+(( G2RAY_SILENT_START_VERIFY_SEC > 10 )) && G2RAY_SILENT_START_VERIFY_SEC=10
 [[ "$HEADLESS_ROUTE_SETTLE_WAIT_SEC" =~ ^[0-9]+$ && "$HEADLESS_ROUTE_SETTLE_WAIT_SEC" -ge 15 ]] || HEADLESS_ROUTE_SETTLE_WAIT_SEC=180
 (( HEADLESS_ROUTE_SETTLE_WAIT_SEC > 300 )) && HEADLESS_ROUTE_SETTLE_WAIT_SEC=300
 [[ "$HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC" =~ ^[0-9]+$ ]] || HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC=5
@@ -622,10 +629,10 @@ kill_process_tree_hard() {
     kill -KILL "$pid" 2>/dev/null || true
 }
 
-# flock is present in the Codespaces image. Keep a direct-call fallback for
-# minimal shells so the panel still works if the optional utility is absent.
+# flock is present in the Codespaces image. Minimal images use a bounded
+# mkdir lock instead of running shared-state writers concurrently.
 with_file_lock() {
-    local lock_file="${1:-}" timeout_sec="${2:-5}"
+    local lock_file="${1:-}" timeout_sec="${2:-5}" lock_dir owner recheck start now
     shift 2 || return 1
     [[ -n "$lock_file" ]] || return 1
     [[ "$timeout_sec" =~ ^[0-9]+$ ]] || timeout_sec=5
@@ -635,7 +642,30 @@ with_file_lock() {
             "$@"
         ) 9>"$lock_file"
     else
-        "$@"
+        lock_dir="${lock_file}.d"
+        start=$(date +%s 2>/dev/null || printf '0')
+        while ! mkdir "$lock_dir" 2>/dev/null; do
+            owner=$(cat "$lock_dir/pid" 2>/dev/null || true)
+            if [[ -z "$owner" || ! "$owner" =~ ^[0-9]+$ ]] || ! kill -0 "$owner" 2>/dev/null; then
+                recheck=$(cat "$lock_dir/pid" 2>/dev/null || true)
+                if [[ "$recheck" == "$owner" ]]; then
+                    rm -f "$lock_dir/pid" 2>/dev/null || true
+                    rmdir "$lock_dir" 2>/dev/null || true
+                fi
+                continue
+            fi
+            now=$(date +%s 2>/dev/null || printf '0')
+            (( now - start >= timeout_sec )) && return 1
+            sleep 0.1
+        done
+        printf '%s\n' "$$" > "$lock_dir/pid" 2>/dev/null || {
+            rmdir "$lock_dir" 2>/dev/null || true
+            return 1
+        }
+        (
+            trap 'rm -f "$lock_dir/pid" 2>/dev/null || true; rmdir "$lock_dir" 2>/dev/null || true' EXIT
+            "$@"
+        )
     fi
 }
 
@@ -2146,9 +2176,15 @@ EOF
 
 is_port_open() {
     if command -v ss >/dev/null 2>&1; then
-        sudo ss -tnl 2>/dev/null | grep -q ":${XRAY_PORT}[[:space:]]"
+        ss -H -ltn 2>/dev/null | awk -v port="$XRAY_PORT" '
+            { address=$4; if (address ~ (":" port "$") || address ~ (":" port "[[:space:]]*$")) found=1 }
+            END { exit(found ? 0 : 1) }
+        '
     else
-        sudo netstat -tnl 2>/dev/null | grep -q ":${XRAY_PORT}[[:space:]]"
+        netstat -tnl 2>/dev/null | awk -v port="$XRAY_PORT" '
+            { address=$4; if (address ~ (":" port "$") || address ~ (":" port "[[:space:]]*$")) found=1 }
+            END { exit(found ? 0 : 1) }
+        '
     fi
 }
 
@@ -2931,11 +2967,20 @@ self_heal_once() {
     if (( bad_count >= 2 )); then
         if mark_route_repair_attempt_if_allowed; then
             log_event WARN "self_heal route_unusable action=repair port=${XRAY_PORT}"
-            repair_codespace_port_route >/dev/null 2>&1 || true
+            if repair_codespace_port_route >/dev/null 2>&1; then
+                read -r xcode xms _probe_reason < <(xhttp_probe_metrics external)
+                if xhttp_status_usable "$xcode"; then
+                    reset_route_bad_count
+                    log_event INFO "self_heal route_repair_ready xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0}"
+                else
+                    log_event WARN "self_heal route_repair_pending xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} bad_count=${bad_count}"
+                fi
+            else
+                log_event ERROR "self_heal route_repair_failed port=${XRAY_PORT} bad_count=${bad_count}"
+            fi
         else
             log_event WARN "self_heal route_unusable action=repair_cooldown port=${XRAY_PORT}"
         fi
-        reset_route_bad_count
     fi
 }
 
@@ -2976,6 +3021,9 @@ _background_tasks() {
         run_with_deadline "$G2RAY_SUPERVISOR_SELF_HEAL_TIMEOUT_SEC" self_heal_once >/dev/null 2>&1 || true
         save_session_uptime >/dev/null 2>&1 || true
         if active_tunnel_recent; then
+            (( ++health_tick >= 15 )) && { run_with_deadline "$G2RAY_SUPERVISOR_HEALTH_TIMEOUT_SEC" health_probe >/dev/null 2>&1; health_tick=0; }
+            (( ++route_tick >= G2RAY_ACTIVE_ROUTE_REFRESH_TICKS )) && { run_with_deadline "$G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health >/dev/null 2>&1 || true; route_tick=0; }
+            (( ++export_tick >= G2RAY_ACTIVE_EXPORT_REFRESH_TICKS )) && { run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports_if_changed >/dev/null 2>&1 || true; export_tick=0; }
             continue
         fi
         if latency_focus_enabled; then
@@ -4822,12 +4870,42 @@ export_input_hash() {
 
 _refresh_config_exports_impl() {
     [[ -f "$UUID_FILE" ]] || { clear_config_exports "missing_uuid"; return 1; }
-    local link_array=()
+    local link_array=() backup_dir="" artifact name
     mapfile -t link_array < <(generate_ordered_links | awk 'NF' || true)
-    ((${#link_array[@]})) || { clear_config_exports "no_exportable_links"; return 1; }
-    if ! write_config_exports_from_links "${link_array[@]}"; then
-        clear_config_exports "write_failed"
+    if ((${#link_array[@]} == 0)); then
+        if config_export_artifacts_present; then
+            log_event WARN "config_exports retained_previous reason=no_exportable_links"
+        else
+            clear_config_exports "no_exportable_links"
+        fi
         return 1
+    fi
+    backup_dir=$(mktemp -d "$DATA_DIR/config-export-backup.XXXXXX" 2>/dev/null || true)
+    if [[ -n "$backup_dir" ]]; then
+        for artifact in "$MOBILE_CONFIG_FILE" "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE" "$CODESPACE_BUNDLE_FILE"; do
+            [[ -e "$artifact" ]] || continue
+            name=$(basename "$artifact")
+            cp -p "$artifact" "$backup_dir/$name" 2>/dev/null || true
+        done
+    fi
+    if ! write_config_exports_from_links "${link_array[@]}"; then
+        if [[ -n "$backup_dir" ]]; then
+            rm -f "$MOBILE_CONFIG_FILE" "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE" "$CODESPACE_BUNDLE_FILE" 2>/dev/null || true
+            for artifact in "$MOBILE_CONFIG_FILE" "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE" "$CODESPACE_BUNDLE_FILE"; do
+                name=$(basename "$artifact")
+                [[ -e "$backup_dir/$name" ]] && cp -p "$backup_dir/$name" "$artifact" 2>/dev/null || true
+            done
+            rm -f "$backup_dir"/* 2>/dev/null || true
+            rmdir "$backup_dir" 2>/dev/null || true
+            log_event WARN "config_exports restored_previous reason=write_failed"
+        else
+            clear_config_exports "write_failed_no_backup"
+        fi
+        return 1
+    fi
+    if [[ -n "$backup_dir" ]]; then
+        rm -f "$backup_dir"/* 2>/dev/null || true
+        rmdir "$backup_dir" 2>/dev/null || true
     fi
     local new_hash
     new_hash=$(export_input_hash)
@@ -5197,8 +5275,21 @@ show_diagnostics() {
     echo ""; echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
 }
 
+_recover_now_ensure_engine_impl() {
+    RECOVER_ENGINE_RESULT="failed"
+    if xray_listener_ready; then
+        RECOVER_ENGINE_RESULT="running"
+        return 0
+    fi
+    if start_xray >/dev/null 2>&1 && wait_for_port >/dev/null 2>&1 && xray_listener_ready; then
+        RECOVER_ENGINE_RESULT="started"
+        return 0
+    fi
+    return 1
+}
+
 _recover_now_impl() {
-    local no_prompt="${1:-}" failed=0 expose_failed=false route_ready=false engine_started=false engine_ready=false xcode=0 xms=0
+    local no_prompt="${1:-}" failed=0 expose_failed=false route_ready=false engine_started=false engine_ready=false xcode=0 xms=0 RECOVER_ENGINE_RESULT=""
     log_event INFO "recover_now begin no_prompt=${no_prompt:-false}"
     echo -e "\n  ${GREEN}*${NC} ${WHITE}Running Soft Recover Sequence...${NC}\n"
 
@@ -5211,20 +5302,21 @@ _recover_now_impl() {
         || echo -e "${GREEN}${CODESPACE_NAME}${NC}"
 
     echo -ne "  ${DIM}|-${NC} Verify Engine     : "
-    if xray_listener_ready; then
+    RECOVER_ENGINE_RESULT="failed"
+    if with_runtime_lock _recover_now_ensure_engine_impl; then
         engine_ready=true
-        echo -e "${GREEN}Running${NC}"
-    else
-        if start_xray >/dev/null 2>&1 && wait_for_port >/dev/null 2>&1 && xray_listener_ready; then
+        if [[ "$RECOVER_ENGINE_RESULT" == "started" ]]; then
             engine_ready=true
             engine_started=true
             log_event INFO "recover_now engine_started port=${XRAY_PORT}"
             echo -e "${GREEN}Started${NC}"
         else
-            failed=1
-            log_event ERROR "recover_now engine_unavailable port=${XRAY_PORT}"
-            echo -e "${RED}Failed${NC}"
+            echo -e "${GREEN}Running${NC}"
         fi
+    else
+        failed=1
+        log_event ERROR "recover_now engine_unavailable port=${XRAY_PORT}"
+        echo -e "${RED}Failed${NC}"
     fi
 
     if [[ "$engine_ready" != true ]]; then
@@ -5324,7 +5416,7 @@ _recover_now_impl() {
 }
 
 recover_now() {
-    with_runtime_lock _recover_now_impl "$@"
+    _recover_now_impl "$@"
 }
 
 recover_now_json() {
@@ -5919,10 +6011,11 @@ if [[ "${1:-}" == "--silent-start" ]]; then
         write_boot_status "no_config" "silent_start" "No config exists yet; open the panel and generate one." "0" "0"
     elif prepare_headless_runtime "silent_start" >/dev/null 2>&1; then
         start_background_tasks || log_event WARN "headless_start reason=silent_start supervisor_start_deferred"
-        read -r _boot_code _boot_ms _boot_reason < <(xhttp_probe_metrics external)
-        if xhttp_status_usable "${_boot_code:-0}"; then
+        if wait_for_xhttp_route_ready "silent_start_verify" "$G2RAY_SILENT_START_VERIFY_SEC" >/dev/null 2>&1; then
+            read -r _boot_code _boot_ms _boot_reason < <(xhttp_probe_metrics external)
             write_boot_status "ready" "silent_start" "Xray listener and the Codespaces route are usable." "${_boot_code:-0}" "${_boot_ms:-0}"
         else
+            read -r _boot_code _boot_ms _boot_reason < <(xhttp_probe_metrics external)
             write_boot_status "route_settling" "silent_start" "Xray listener is ready; Codespaces route recovery now continues asynchronously in the background." "${_boot_code:-0}" "${_boot_ms:-0}"
             start_headless_route_settling_monitor "silent_start" \
                 || log_event WARN "headless_start reason=silent_start route_settle_start_deferred"

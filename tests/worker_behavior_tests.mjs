@@ -259,7 +259,7 @@ async function testHealthCanSkipRouteProbe() {
 
   const response = await worker.fetch(makeRequest("/api/health?route=false"), baseEnv({ WAKER_KV: kv }), {});
   const body = await responseJson(response);
-  assert.equal(response.status, 200);
+  assert.equal(response.status, 200, JSON.stringify(body));
   assert.equal(body.route_checked, false);
   assert.equal(body.route_ready, null);
   assert.equal(body.next_action_code, "route_check_skipped");
@@ -1682,7 +1682,7 @@ async function testHistorySideEffectsCanDeferWithWaitUntil() {
   );
   const body = await responseJson(response);
   assert.equal(response.status, 200);
-  assert.equal(body.history_recorded, true);
+  assert.equal(body.history_recorded, false);
   assert.equal(body.history_deferred, true);
   assert.equal(waitUntilPromises.length, 1);
   await Promise.all(waitUntilPromises);
@@ -1691,6 +1691,43 @@ async function testHistorySideEffectsCanDeferWithWaitUntil() {
   assert.equal(history.history[0].next_action_code, "retry_vless_config");
   assert.equal(routeCalls >= 2, true);
   console.log("PASS: Worker defers KV history side effects through waitUntil");
+}
+
+async function testRegistryAcceptsPrimaryGithubTokenBinding() {
+  const kv = makeKv();
+  await kv.put("codespace-registry:v1", JSON.stringify({
+    default_codespace_id: "primary",
+    codespaces: [{
+      id: "primary",
+      label: "Primary",
+      name: "primary-space",
+      token_binding: "GITHUB_TOKEN",
+      route_ports: [443]
+    }]
+  }));
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url.includes("api.github.com/user/codespaces/primary-space")) {
+      assert.equal(init.headers?.authorization, "Bearer primary-token");
+      return new Response(JSON.stringify({
+        name: "primary-space",
+        state: "Available",
+        pending_operation: false
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.includes("app.github.dev")) return new Response("", { status: 200 });
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const response = await worker.fetch(
+    makeRequest("/api/health", "secret", { codespace_id: "primary" }),
+    baseEnv({ WAKER_KV: kv, GITHUB_TOKEN: "primary-token" }),
+    {}
+  );
+  const body = await responseJson(response);
+  assert.equal(response.status, 200, JSON.stringify(body));
+  assert.equal(body.codespace, "primary-space");
+  console.log("PASS: Worker registry accepts the primary GITHUB_TOKEN binding");
 }
 
 async function testWorkerDeduplicatesNoisyHealthHistory() {
@@ -2145,6 +2182,7 @@ try {
   await testSimpleDashboardSetupAcceptsRealCodespaceName();
   await testDashboardVariablesSupportMultipleCodespacesWithoutKv();
   await testWorkerRegistrySelectsBoundTokenAndReturnsSafeDirectory();
+  await testRegistryAcceptsPrimaryGithubTokenBinding();
 } finally {
   globalThis.fetch = originalFetch;
 }

@@ -708,6 +708,8 @@ test_runtime_control_paths_are_hardened() {
         || fail 'wait_for_port still succeeds on any listener bound to the port'
     grep_fixed 'prepare_headless_runtime "silent_start"' "$SCRIPT" \
         || fail '--silent-start does not prepare the local engine before asynchronous route settling'
+    grep_fixed 'wait_for_xhttp_route_ready "silent_start_verify" "$G2RAY_SILENT_START_VERIFY_SEC"' "$SCRIPT" \
+        || fail '--silent-start declares ready without stable route verification'
     grep_fixed 'start_headless_route_settling_monitor "silent_start"' "$SCRIPT" \
         || fail '--silent-start does not launch bounded asynchronous route settling'
     grep_fixed 'if [[ "${1:-}" == "--headless-route-settle" ]]; then' "$SCRIPT" \

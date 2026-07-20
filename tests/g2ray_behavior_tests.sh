@@ -1459,7 +1459,7 @@ test_domain_link_export_can_be_disabled_for_blocked_networks() {
     pass "domain link export can be disabled for blocked local networks"
 }
 
-test_disabled_domain_link_clears_stale_exports_when_no_ip_is_available() {
+test_disabled_domain_link_retains_last_exports_when_no_ip_is_available() {
     reset_runtime_paths
     CODESPACE_NAME="behavior-space"
     PORT_DOMAIN="behavior-space-443.app.github.dev"
@@ -1476,9 +1476,11 @@ test_disabled_domain_link_clears_stale_exports_when_no_ip_is_available() {
     if refresh_config_exports >/dev/null 2>&1; then
         fail "refresh_config_exports reported success when domain export was disabled and no IP fallback existed"
     fi
-    [[ ! -e "$MOBILE_CONFIG_FILE" ]] || fail "stale mobile configs were left behind after no-link export refresh"
-    [[ ! -e "$SUBSCRIPTION_FILE" ]] || fail "stale base64 subscription was left behind after no-link export refresh"
-    pass "disabled domain export clears stale config artifacts when no IP fallback is available"
+    [[ -s "$MOBILE_CONFIG_FILE" ]] || fail "last-known mobile configs were deleted after a transient no-link refresh"
+    [[ -s "$SUBSCRIPTION_FILE" ]] || fail "last-known subscription was deleted after a transient no-link refresh"
+    grep -Fq 'config_exports retained_previous reason=no_exportable_links' "$LOG_FILE" \
+        || fail "retained export fallback was not logged"
+    pass "transient no-link refresh retains last-known local config artifacts"
 }
 
 test_ordered_links_reuse_fallback_ips_for_xhttp_and_ws_exports() {
@@ -2740,6 +2742,43 @@ test_self_heal_defers_external_repairs_while_traffic_is_active() {
     pass "self-heal defers disruptive external repair while traffic is active"
 }
 
+test_self_heal_keeps_failure_count_when_route_repair_fails() {
+    (
+        reset_runtime_paths
+        printf '{}\n' > "$CONFIG_FILE"
+        ensure_codespace_port_public() { return 0; }
+        xray_running() { return 0; }
+        xray_listener_ready() { return 0; }
+        xhttp_probe_metrics() { printf '404 25 route_settling_404\n'; }
+        curl_http_code() { printf '404\n'; }
+        increment_route_bad_count() { printf '2\n'; }
+        mark_route_repair_attempt_if_allowed() { return 0; }
+        repair_codespace_port_route() { return 1; }
+        reset_route_bad_count() { printf 'reset\n' >> "$TMP_ROOT/unexpected-route-reset"; }
+        reset_edge_bad_count() { return 0; }
+
+        self_heal_once || fail "self-heal returned failure after a bounded route repair failure"
+        [[ ! -e "$TMP_ROOT/unexpected-route-reset" ]] \
+            || fail "self-heal erased route failure history after repair failed"
+        grep -Fq 'route_repair_failed' "$LOG_FILE" \
+            || fail "failed route repair was not classified in the log"
+    )
+    pass "self-heal preserves route failure history until repair is verified"
+}
+
+test_port_listener_detection_does_not_require_sudo() {
+    (
+        XRAY_PORT=443
+        ss() { printf 'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:*\n'; }
+        is_port_open || fail "listener detection missed a bound IPv4 port"
+        XRAY_PORT=8443
+        if is_port_open; then
+            fail "listener detection matched the wrong port"
+        fi
+    )
+    pass "listener detection works without sudo and matches the exact port"
+}
+
 test_deadline_terminates_descendant_processes() {
     reset_runtime_paths
     local child_file child rc
@@ -2812,6 +2851,8 @@ test_route_health_refresh_does_not_let_unusable_cache_starve_builtins
 test_route_refresh_backoff_preserves_cache_without_probe_storms
 test_stale_route_cache_is_not_exported_after_hard_age
 test_self_heal_defers_external_repairs_while_traffic_is_active
+test_self_heal_keeps_failure_count_when_route_repair_fails
+test_port_listener_detection_does_not_require_sudo
 test_deadline_terminates_descendant_processes
 test_post_start_propagates_silent_start_failure
 test_route_preference_write_failures_return_failure
@@ -2839,7 +2880,7 @@ test_config_exports_report_write_failure
 test_refresh_config_exports_reports_write_failure
 test_config_exports_are_stable_client_artifacts
 test_domain_link_export_can_be_disabled_for_blocked_networks
-test_disabled_domain_link_clears_stale_exports_when_no_ip_is_available
+test_disabled_domain_link_retains_last_exports_when_no_ip_is_available
 test_ordered_links_reuse_fallback_ips_for_xhttp_and_ws_exports
 test_refresh_config_exports_if_changed_skips_unchanged_inputs
 test_refresh_config_exports_updates_input_hash_after_direct_refresh
