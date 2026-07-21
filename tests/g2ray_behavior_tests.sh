@@ -49,6 +49,7 @@ reset_runtime_paths() {
     LATENCY_FOCUS_PREV_PROFILE_FILE="$DATA_DIR/latency_focus_previous_profile.txt"
     PERFORMANCE_PROFILE_FILE="$DATA_DIR/performance_profile.txt"
     DOMAIN_LINK_EXPORT_FILE="$DATA_DIR/export_domain_link.txt"
+    MOBILE_CONFIG_FILE="$TMP_ROOT/configs-to-copy-for-mobile.txt"
     SUBSCRIPTION_FILE="$TMP_ROOT/configs-subscription-base64.txt"
     CONFIG_META_FILE="$TMP_ROOT/configs-meta.json"
     CODESPACE_BUNDLE_FILE="$TMP_ROOT/g2ray-codespace-bundle.json"
@@ -82,6 +83,7 @@ reset_runtime_paths() {
     ROUTE_SETTLE_LOG_FILE="$LOG_DIR/route-settle.log"
     rm -rf "$DATA_DIR" "$LOG_DIR"
     mkdir -p "$DATA_DIR" "$LOG_DIR" "$QR_DIR"
+    rm -f "$MOBILE_CONFIG_FILE" "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE" "$CODESPACE_BUNDLE_FILE" 2>/dev/null || true
     : > "$LOG_FILE"
     : > "$STRUCTURED_LOG_FILE"
     : > "$DIAGNOSTIC_LOG_FILE"
@@ -1282,6 +1284,34 @@ test_generate_config_replaces_stale_no_config_boot_status() {
     pass "generate_config replaces stale no-config boot status"
 }
 
+test_generate_config_refreshes_expired_route_cache_before_exports() {
+    reset_runtime_paths
+    (
+        CODESPACE_NAME="behavior-space"
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        XRAY_PORT=443
+        PERFORMANCE_PROFILE=balanced
+        ROUTE_HEALTH_EXPORT_MAX_AGE_SEC=21600
+        printf '2026-05-30T00:00:00Z\t20.0.0.1\t200\t50\ttrue\tcache\tready\n' > "$ROUTE_HEALTH_FILE"
+        touch -d '7 hours ago' "$ROUTE_HEALTH_FILE"
+        uuidgen() { printf 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee\n'; }
+        start_xray() { return 0; }
+        wait_for_port() { return 0; }
+        ensure_codespace_port_public() { return 0; }
+        xray_validate_config_file() { return 0; }
+        xhttp_probe_metrics() { printf '200 12 ready\n'; }
+        _refresh_route_candidate_health_impl() {
+            printf '2026-07-21T18:02:21Z\t20.0.0.2\t200\t40\ttrue\tdns\tready\n' > "$ROUTE_HEALTH_FILE"
+            return 0
+        }
+
+        generate_config >/dev/null || fail "generate_config failed while refreshing an expired route cache"
+        grep -Fq '@20.0.0.2:443?' "$MOBILE_CONFIG_FILE" \
+            || fail "generate_config exported domain-only links before its expired route cache refresh completed"
+    )
+    pass "generate_config refreshes an expired route cache before exporting links"
+}
+
 test_generate_config_keeps_previous_config_when_candidate_validation_fails() {
     reset_runtime_paths
     (
@@ -1460,6 +1490,7 @@ test_domain_link_export_can_be_disabled_for_blocked_networks() {
 }
 
 test_disabled_domain_link_retains_last_exports_when_no_ip_is_available() {
+    (
     reset_runtime_paths
     CODESPACE_NAME="behavior-space"
     PORT_DOMAIN="behavior-space-443.app.github.dev"
@@ -1468,8 +1499,9 @@ test_disabled_domain_link_retains_last_exports_when_no_ip_is_available() {
     MAX_FALLBACK_LINKS=2
     printf '00000000-0000-4000-8000-000000000001\n' > "$UUID_FILE"
     printf '{}\n' > "$CONFIG_FILE"
-    printf 'vless://stale@behavior-space-443.app.github.dev:443#stale\n' > "$MOBILE_CONFIG_FILE"
-    printf 'dmxlc3M6Ly9zdGFsZQo=' > "$SUBSCRIPTION_FILE"
+    printf 'vless://00000000-0000-4000-8000-000000000001@behavior-space-443.app.github.dev:443#stale\n' > "$MOBILE_CONFIG_FILE"
+    printf 'dmxlc3M6Ly8wMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDFAZXhhbXBsZS5pbnZhbGlkCg==' > "$SUBSCRIPTION_FILE"
+    printf '{}\n' > "$CONFIG_META_FILE"
     printf '0\n' > "$DOMAIN_LINK_EXPORT_FILE"
     usable_fallback_ips() { return 0; }
 
@@ -1480,7 +1512,63 @@ test_disabled_domain_link_retains_last_exports_when_no_ip_is_available() {
     [[ -s "$SUBSCRIPTION_FILE" ]] || fail "last-known subscription was deleted after a transient no-link refresh"
     grep -Fq 'config_exports retained_previous reason=no_exportable_links' "$LOG_FILE" \
         || fail "retained export fallback was not logged"
+    )
     pass "transient no-link refresh retains last-known local config artifacts"
+}
+
+test_no_link_refresh_clears_exports_from_a_previous_uuid() {
+    (
+    reset_runtime_paths
+    CODESPACE_NAME="behavior-space"
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    XRAY_PORT=443
+    GITHUB_USER="tester"
+    printf '11111111-2222-4333-8444-555555555555\n' > "$UUID_FILE"
+    printf '{}\n' > "$CONFIG_FILE"
+    printf 'vless://00000000-0000-4000-8000-000000000001@behavior-space-443.app.github.dev:443#old\n' > "$MOBILE_CONFIG_FILE"
+    printf 'b2xkCg==' > "$SUBSCRIPTION_FILE"
+    printf '{}\n' > "$CONFIG_META_FILE"
+    printf '0\n' > "$DOMAIN_LINK_EXPORT_FILE"
+    usable_fallback_ips() { return 0; }
+
+    if refresh_config_exports >/dev/null 2>&1; then
+        fail "refresh_config_exports reported success when no links were exportable"
+    fi
+    [[ ! -e "$MOBILE_CONFIG_FILE" ]] \
+        || fail "configs from a previous UUID survived after credentials changed"
+    [[ ! -e "$SUBSCRIPTION_FILE" ]] \
+        || fail "subscription from a previous UUID survived after credentials changed"
+    grep -Fq 'config_exports cleared reason=no_exportable_links_uuid_mismatch' "$LOG_FILE" \
+        || fail "old-UUID export cleanup was not classified in the log"
+    )
+    pass "no-link refresh clears exports from a previous UUID"
+}
+
+test_failed_export_does_not_restore_exports_from_a_previous_uuid() {
+    (
+    reset_runtime_paths
+    CODESPACE_NAME="behavior-space"
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    XRAY_PORT=443
+    printf '11111111-2222-4333-8444-555555555555\n' > "$UUID_FILE"
+    printf '{}\n' > "$CONFIG_FILE"
+    printf 'vless://00000000-0000-4000-8000-000000000001@behavior-space-443.app.github.dev:443#old\n' > "$MOBILE_CONFIG_FILE"
+    printf 'b2xkCg==' > "$SUBSCRIPTION_FILE"
+    printf '{}\n' > "$CONFIG_META_FILE"
+    generate_ordered_links() {
+        printf 'vless://11111111-2222-4333-8444-555555555555@behavior-space-443.app.github.dev:443#new\n'
+    }
+    write_config_exports_from_links() { return 1; }
+
+    if refresh_config_exports >/dev/null 2>&1; then
+        fail "refresh_config_exports reported success after a forced write failure"
+    fi
+    [[ ! -e "$MOBILE_CONFIG_FILE" ]] \
+        || fail "failed new export restored unusable configs from a previous UUID"
+    grep -Fq 'config_exports cleared reason=write_failed_no_valid_backup' "$LOG_FILE" \
+        || fail "write failure without a current-UUID backup was not classified"
+    )
+    pass "failed export never restores configs from a previous UUID"
 }
 
 test_ordered_links_reuse_fallback_ips_for_xhttp_and_ws_exports() {
@@ -2872,6 +2960,7 @@ test_usable_fallback_ips_never_runs_live_probe_fallback
 test_xhttp_config_path_is_cached_by_config_content
 test_boot_status_helpers_record_silent_start_result
 test_generate_config_replaces_stale_no_config_boot_status
+test_generate_config_refreshes_expired_route_cache_before_exports
 test_generate_config_keeps_previous_config_when_candidate_validation_fails
 test_generate_config_candidate_file_keeps_json_suffix_for_xray_detection
 test_generate_config_rolls_back_when_valid_candidate_cannot_start
@@ -2881,6 +2970,8 @@ test_refresh_config_exports_reports_write_failure
 test_config_exports_are_stable_client_artifacts
 test_domain_link_export_can_be_disabled_for_blocked_networks
 test_disabled_domain_link_retains_last_exports_when_no_ip_is_available
+test_no_link_refresh_clears_exports_from_a_previous_uuid
+test_failed_export_does_not_restore_exports_from_a_previous_uuid
 test_ordered_links_reuse_fallback_ips_for_xhttp_and_ws_exports
 test_refresh_config_exports_if_changed_skips_unchanged_inputs
 test_refresh_config_exports_updates_input_hash_after_direct_refresh

@@ -1380,6 +1380,10 @@ test_soft_recovery_and_route_memory_are_present() {
 test_route_export_and_reconnect_edges_are_hardened() {
     grep_fixed 'effective_export_route_ips()' "$SCRIPT" \
         || fail 'fallback exports do not read the effective cached route selection'
+    grep_fixed 'ensure_route_cache_for_export()' "$SCRIPT" \
+        || fail 'config export has no synchronous stale-cache refresh helper'
+    grep_fixed 'config_export_artifacts_match_current_uuid()' "$SCRIPT" \
+        || fail 'config export cannot reject artifacts from a previous UUID'
     grep_fixed 'request_route_candidate_health_refresh' "$SCRIPT" \
         || fail 'fallback exports do not request a bounded background route refresh'
     grep_fixed 'fallback_route_filter no_cached_usable_routes action=domain_only_refresh_requested' "$SCRIPT" \
@@ -1391,6 +1395,22 @@ test_route_export_and_reconnect_edges_are_hardened() {
         END { exit saw ? 0 : 1 }
     ' "$SCRIPT" \
         || fail 'new config generation does not refresh exported config files'
+    awk '
+        /generate_config\(\)/ { in_fn=1; next }
+        in_fn && /ensure_route_cache_for_export .*"generate_config"/ { saw_cache=1; next }
+        in_fn && /refresh_config_exports >\/dev\/null 2>&1 \|\| true/ {
+            if (saw_cache) ordered=1
+            exit
+        }
+        END { exit ordered ? 0 : 1 }
+    ' "$SCRIPT" \
+        || fail 'new config generation can export before refreshing an expired route cache'
+    grep_fixed 'if ! latency_focus_enabled || ! route_health_cache_fresh; then' "$SCRIPT" \
+        || fail 'latency focus can still skip the first route refresh when cache is stale'
+    grep_fixed 'no_exportable_links_uuid_mismatch' "$SCRIPT" \
+        || fail 'empty exports do not clear artifacts from a previous UUID'
+    grep_fixed 'write_failed_no_valid_backup' "$SCRIPT" \
+        || fail 'failed exports can restore artifacts from a previous UUID'
     grep_fixed 'FORCE_RECONNECT_ROUTE_WAIT_SEC' "$SCRIPT" \
         || fail 'force reconnect has no dedicated route-settling wait budget'
     grep_fixed 'XRAY_PORT=443' "$SCRIPT" \

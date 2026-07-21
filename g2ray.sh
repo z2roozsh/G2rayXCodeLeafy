@@ -2992,9 +2992,15 @@ _background_tasks() {
         force_public_runtime_ports "supervisor_start" >/dev/null 2>&1 || true
         run_with_deadline "$G2RAY_SUPERVISOR_STATS_TIMEOUT_SEC" save_xray_stats >/dev/null 2>&1 || true
         run_with_deadline "$G2RAY_SUPERVISOR_SELF_HEAL_TIMEOUT_SEC" self_heal_once >/dev/null 2>&1 || true
-        if ! latency_focus_enabled; then
+        if ! latency_focus_enabled || ! route_health_cache_fresh; then
             run_with_deadline "$G2RAY_SUPERVISOR_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health >/dev/null 2>&1 || true
-            run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports_if_changed >/dev/null 2>&1 || true
+            if route_health_cache_exportable || ! config_export_artifacts_match_current_uuid; then
+                run_with_deadline "$G2RAY_SUPERVISOR_EXPORT_TIMEOUT_SEC" refresh_config_exports_if_changed >/dev/null 2>&1 || true
+            else
+                log_event WARN "config_exports retained_previous reason=startup_route_cache_unavailable"
+            fi
+        fi
+        if ! latency_focus_enabled; then
             run_with_deadline "$G2RAY_SUPERVISOR_HEALTH_TIMEOUT_SEC" health_probe >/dev/null 2>&1 || true
         fi
     fi
@@ -3616,8 +3622,10 @@ JSONEOF
             echo -e "  ${YELLOW}⚠ Could not set optional WebSocket port ${WS_PORT} public. Check the PORTS tab.${NC}"
         fi
     fi
-    refresh_config_exports >/dev/null 2>&1 || true
     local _boot_code _boot_ms _boot_reason
+    read -r _boot_code _boot_ms _boot_reason < <(xhttp_probe_metrics external)
+    ensure_route_cache_for_export "${_boot_code:-0}" "generate_config" >/dev/null 2>&1 || true
+    refresh_config_exports >/dev/null 2>&1 || true
     read -r _boot_code _boot_ms _boot_reason < <(xhttp_probe_metrics external)
     if xhttp_status_usable "${_boot_code:-0}"; then
         write_boot_status "ready" "generate_config" "Config generated and the Codespaces route is usable." "${_boot_code:-0}" "${_boot_ms:-0}"
@@ -4241,6 +4249,48 @@ route_health_cache_fresh() {
     (( age <= ROUTE_HEALTH_TTL_SEC ))
 }
 
+route_health_cache_exportable() {
+    local age
+    [[ -s "$ROUTE_HEALTH_FILE" ]] || return 1
+    awk -F '\t' '$5 == "true" { found=1; exit } END { exit found ? 0 : 1 }' "$ROUTE_HEALTH_FILE" 2>/dev/null || return 1
+    age=$(file_age_sec "$ROUTE_HEALTH_FILE")
+    [[ "$ROUTE_HEALTH_EXPORT_MAX_AGE_SEC" =~ ^[0-9]+$ ]] || ROUTE_HEALTH_EXPORT_MAX_AGE_SEC=21600
+    (( age <= ROUTE_HEALTH_EXPORT_MAX_AGE_SEC ))
+}
+
+_refresh_route_candidate_health_for_export_impl() {
+    route_health_cache_exportable && return 0
+    _refresh_route_candidate_health_impl 1 || return 1
+    route_health_cache_exportable
+}
+
+refresh_route_candidate_health_for_export() {
+    with_file_lock "$ROUTE_STATE_LOCK_FILE" 45 _refresh_route_candidate_health_for_export_impl
+}
+
+ensure_route_cache_for_export() {
+    local route_code="${1:-}" reason="${2:-export}" route_ms route_reason
+    route_health_cache_exportable && return 0
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    if [[ -z "$route_code" ]]; then
+        read -r route_code route_ms route_reason < <(xhttp_probe_metrics external)
+    fi
+    if ! xhttp_status_usable "${route_code:-0}"; then
+        log_event WARN "route_candidate_monitor synchronous_refresh_skipped reason=${reason} xhttp_probe=${route_code:-0} action=background_refresh"
+        request_route_candidate_health_refresh
+        return 1
+    fi
+    log_event INFO "route_candidate_monitor synchronous_refresh reason=${reason}"
+    if run_with_deadline "$G2RAY_INTERACTIVE_ROUTE_REFRESH_TIMEOUT_SEC" refresh_route_candidate_health_for_export >/dev/null 2>&1 \
+        && route_health_cache_exportable; then
+        log_event INFO "route_candidate_monitor synchronous_refresh_ready reason=${reason}"
+        return 0
+    fi
+    log_event WARN "route_candidate_monitor synchronous_refresh_unavailable reason=${reason} action=background_refresh"
+    request_route_candidate_health_refresh
+    return 1
+}
+
 cached_usable_fallback_ips() {
     [[ -s "$ROUTE_HEALTH_FILE" ]] || return 1
     local cache_age last_good pinned stats_input
@@ -4844,6 +4894,20 @@ config_export_artifacts_present() {
     return 0
 }
 
+config_export_artifacts_match_current_uuid() {
+    local current_uuid
+    config_export_artifacts_present || return 1
+    current_uuid=$(awk 'NF {print; exit}' "$UUID_FILE" 2>/dev/null || true)
+    [[ -n "$current_uuid" ]] || return 1
+    awk -v prefix="vless://${current_uuid}@" '
+        NF {
+            found=1
+            if (index($0, prefix) != 1) invalid=1
+        }
+        END { exit(found && !invalid ? 0 : 1) }
+    ' "$MOBILE_CONFIG_FILE" 2>/dev/null
+}
+
 export_input_hash() {
     local input selected_routes uuid_fingerprint
     selected_routes=$(effective_export_route_ips | tr '\n' ',' 2>/dev/null || true)
@@ -4873,14 +4937,18 @@ _refresh_config_exports_impl() {
     local link_array=() backup_dir="" artifact name
     mapfile -t link_array < <(generate_ordered_links | awk 'NF' || true)
     if ((${#link_array[@]} == 0)); then
-        if config_export_artifacts_present; then
+        if config_export_artifacts_match_current_uuid; then
             log_event WARN "config_exports retained_previous reason=no_exportable_links"
+        elif config_export_artifacts_present; then
+            clear_config_exports "no_exportable_links_uuid_mismatch"
         else
             clear_config_exports "no_exportable_links"
         fi
         return 1
     fi
-    backup_dir=$(mktemp -d "$DATA_DIR/config-export-backup.XXXXXX" 2>/dev/null || true)
+    if config_export_artifacts_match_current_uuid; then
+        backup_dir=$(mktemp -d "$DATA_DIR/config-export-backup.XXXXXX" 2>/dev/null || true)
+    fi
     if [[ -n "$backup_dir" ]]; then
         for artifact in "$MOBILE_CONFIG_FILE" "$SUBSCRIPTION_FILE" "$CONFIG_META_FILE" "$CODESPACE_BUNDLE_FILE"; do
             [[ -e "$artifact" ]] || continue
@@ -4899,7 +4967,7 @@ _refresh_config_exports_impl() {
             rmdir "$backup_dir" 2>/dev/null || true
             log_event WARN "config_exports restored_previous reason=write_failed"
         else
-            clear_config_exports "write_failed_no_backup"
+            clear_config_exports "write_failed_no_valid_backup"
         fi
         return 1
     fi
@@ -6144,6 +6212,7 @@ while true; do
     case $_choice in
         1)
             check_port_visibility || continue
+            ensure_route_cache_for_export "" "view_configs" >/dev/null 2>&1 || true
             if domain_link_export_enabled; then
                 _VLESS_DOMAIN=$(generate_domain_link) || _VLESS_DOMAIN=""
             else
