@@ -1284,6 +1284,42 @@ test_generate_config_replaces_stale_no_config_boot_status() {
     pass "generate_config replaces stale no-config boot status"
 }
 
+test_generated_and_upgraded_configs_do_not_block_page_assets_as_ads() {
+    reset_runtime_paths
+    (
+        CODESPACE_NAME="behavior-space"
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        XRAY_PORT=443
+        PERFORMANCE_PROFILE=balanced
+        uuidgen() { printf '11111111-2222-4333-8444-555555555555\n'; }
+        start_xray() { return 0; }
+        wait_for_port() { return 0; }
+        ensure_codespace_port_public() { return 0; }
+        refresh_config_exports() { return 0; }
+        xray_validate_config_file() { return 0; }
+        xhttp_probe_metrics() { printf '200 12 ready\n'; }
+
+        generate_config >/dev/null || fail "generate_config failed"
+        if jq -e '.routing.rules[]? | select((.domain // []) | index("geosite:category-ads-all"))' \
+            "$CONFIG_FILE" >/dev/null; then
+            fail "generated config can break page completeness by blocking the broad ad category"
+        fi
+
+        jq '.routing.rules += [{
+            "type": "field",
+            "domain": ["geosite:category-ads-all"],
+            "outboundTag": "block"
+        }]' "$CONFIG_FILE" > "$CONFIG_FILE.legacy"
+        mv "$CONFIG_FILE.legacy" "$CONFIG_FILE"
+        upgrade_config_dns
+        if jq -e '.routing.rules[]? | select((.domain // []) | index("geosite:category-ads-all"))' \
+            "$CONFIG_FILE" >/dev/null; then
+            fail "existing config migration retained the broad ad-category block"
+        fi
+    )
+    pass "generated and upgraded configs keep ordinary page assets reachable"
+}
+
 test_generate_config_refreshes_expired_route_cache_before_exports() {
     reset_runtime_paths
     (
@@ -2197,13 +2233,13 @@ test_performance_profile_settings_are_available() {
     ! grep -Fq 'maxConcurrentUploads=' <<< "$balanced" || fail "balanced profile still claims obsolete XHTTP concurrency tuning"
     ! grep -Fq 'maxUploadSize=' <<< "$balanced" || fail "balanced profile still claims obsolete XHTTP upload tuning"
     grep -Fq 'sniffQuic=false' <<< "$balanced" || fail "balanced profile should disable QUIC sniffing"
-    grep -Fq 'connIdle=600' <<< "$low_latency" || fail "low_latency profile should keep idle sessions available"
+    grep -Fq 'connIdle=900' <<< "$low_latency" || fail "low_latency profile should retain app sessions across long foreground/background switches"
     grep -Fq 'sniffQuic=false' <<< "$low_latency" || fail "low_latency profile should disable QUIC sniffing"
     grep -Fq 'sniffQuic=false' <<< "$streaming" || fail "streaming profile should disable QUIC sniffing"
     grep -Fq 'sniffQuic=false' <<< "$low_overhead" || fail "low_overhead profile should disable QUIC sniffing"
     local mobile; mobile="$(performance_profile_settings unstable_mobile)"
-    grep -Fq 'connIdle=600' <<< "$mobile" || fail "unstable_mobile profile should keep idle sessions available"
-    grep -Fq 'connIdle=600' <<< "$balanced" || fail "balanced profile should keep idle sessions available"
+    grep -Fq 'connIdle=900' <<< "$mobile" || fail "unstable_mobile profile should retain app sessions across long foreground/background switches"
+    grep -Fq 'connIdle=900' <<< "$balanced" || fail "balanced profile should retain app sessions across long foreground/background switches"
     grep -Fq 'name=max_throughput' <<< "$max_throughput" || fail "max_throughput profile is not selectable"
     ! grep -Fq 'maxConcurrentUploads=' <<< "$max_throughput" || fail "max_throughput profile still claims obsolete XHTTP concurrency tuning"
     grep -Fq 'bufferSize=1024' <<< "$max_throughput" || fail "max_throughput profile does not use the bounded throughput buffer"
@@ -2960,6 +2996,7 @@ test_usable_fallback_ips_never_runs_live_probe_fallback
 test_xhttp_config_path_is_cached_by_config_content
 test_boot_status_helpers_record_silent_start_result
 test_generate_config_replaces_stale_no_config_boot_status
+test_generated_and_upgraded_configs_do_not_block_page_assets_as_ads
 test_generate_config_refreshes_expired_route_cache_before_exports
 test_generate_config_keeps_previous_config_when_candidate_validation_fails
 test_generate_config_candidate_file_keeps_json_suffix_for_xray_detection

@@ -266,6 +266,17 @@ json_escape() {
     printf '%s' "$value"
 }
 
+json_escape_into() {
+    local -n output_ref="$1"
+    local value="${2:-}"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\t'/\\t}
+    value=${value//$'\r'/}
+    value=${value//$'\n'/}
+    output_ref="$value"
+}
+
 low_overhead_enabled() {
     [[ -s "$LOW_OVERHEAD_DISABLED_FILE" ]] && return 1
     [[ -s "$LOW_OVERHEAD_FILE" ]] && return 0
@@ -670,13 +681,17 @@ with_file_lock() {
 }
 
 log_structured_event() {
-    local ts="$1" level="$2" msg="$3" event
+    local ts="$1" level="$2" msg="$3" event escaped_ts escaped_level escaped_event escaped_msg
     event="${msg%%[[:space:]]*}"
     event="${event//[^A-Za-z0-9_.:-]/}"
     [[ -n "$event" ]] || event="event"
     rotate_log_file_throttled "$STRUCTURED_LOG_FILE" "$STRUCTURED_LOG_ROTATE_STAMP_FILE"
+    json_escape_into escaped_ts "$ts"
+    json_escape_into escaped_level "$level"
+    json_escape_into escaped_event "$event"
+    json_escape_into escaped_msg "$msg"
     printf '{"ts":"%s","level":"%s","event":"%s","message":"%s"}\n' \
-        "$(json_escape "$ts")" "$(json_escape "$level")" "$(json_escape "$event")" "$(json_escape "$msg")" \
+        "$escaped_ts" "$escaped_level" "$escaped_event" "$escaped_msg" \
         >> "$STRUCTURED_LOG_FILE" 2>/dev/null || true
 }
 
@@ -2774,7 +2789,9 @@ upgrade_config_dns() {
       }
       | (.routing.domainStrategy) = "AsIs"
       | (.routing.rules) = (
-          (.routing.rules // []) as $rules
+          ((.routing.rules // [])
+            | map(select(((.domain // []) | index("geosite:category-ads-all")) == null))
+          ) as $rules
           | if any($rules[]?; .type == "field" and .network == "udp" and (.port|tostring) == "443" and .outboundTag == "block")
             then $rules
             else ([{ "type": "field", "network": "udp", "port": "443", "outboundTag": "block" }] + $rules)
@@ -3384,13 +3401,13 @@ performance_profile_settings() {
     local profile="${1:-$PERFORMANCE_PROFILE}"
     case "$profile" in
         low_latency|latency)
-            printf 'name=low_latency\nhandshake=3\nconnIdle=600\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
+            printf 'name=low_latency\nhandshake=3\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
             ;;
         streaming|video)
             printf 'name=streaming\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=8\nbufferSize=768\nsniffQuic=false\nloglevel=warning\n'
             ;;
         unstable_mobile|mobile)
-            printf 'name=unstable_mobile\nhandshake=4\nconnIdle=600\nuplinkOnly=4\ndownlinkOnly=10\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
+            printf 'name=unstable_mobile\nhandshake=4\nconnIdle=900\nuplinkOnly=4\ndownlinkOnly=10\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
             ;;
         low_overhead|minimal)
             printf 'name=low_overhead\nhandshake=3\nconnIdle=600\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=256\nsniffQuic=false\nloglevel=error\n'
@@ -3399,7 +3416,7 @@ performance_profile_settings() {
             printf 'name=max_throughput\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=8\nbufferSize=1024\nsniffQuic=false\nloglevel=warning\n'
             ;;
         *)
-            printf 'name=balanced\nhandshake=3\nconnIdle=600\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
+            printf 'name=balanced\nhandshake=3\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
             ;;
     esac
 }
@@ -3554,8 +3571,7 @@ JSONEOF
       { "inboundTag": ["api"],                                   "outboundTag": "api",    "type": "field" },
       { "type": "field", "network": "udp", "port": "443",        "outboundTag": "block"  },
       { "type": "field", "ip":       ["geoip:private"],          "outboundTag": "block"  },
-      { "type": "field", "protocol": ["bittorrent"],             "outboundTag": "block"  },
-      { "type": "field", "domain":   ["geosite:category-ads-all"], "outboundTag": "block" }
+      { "type": "field", "protocol": ["bittorrent"],             "outboundTag": "block"  }
     ]
   }
 }
