@@ -2798,6 +2798,8 @@ upgrade_config_dns() {
             end
         )
       | (.inbounds[]? | select(.sniffing? and .sniffing.destOverride?) | .sniffing.destOverride) |= (map(select(. != "quic")))
+      | (.policy.levels["0"].handshake) |=
+          (if . == null or . < 4 then 4 else . end)
     ' "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
         if cmp -s "$CONFIG_FILE" "$tmp"; then
             rm -f "$tmp" 2>/dev/null || true
@@ -3399,24 +3401,26 @@ check_port_visibility() {
 
 performance_profile_settings() {
     local profile="${1:-$PERFORMANCE_PROFILE}"
+    # Xray's default handshake allowance is four seconds. Going below it does
+    # not accelerate successful requests and rejects lossy mobile handshakes.
     case "$profile" in
         low_latency|latency)
-            printf 'name=low_latency\nhandshake=3\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
+            printf 'name=low_latency\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
             ;;
         streaming|video)
             printf 'name=streaming\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=8\nbufferSize=768\nsniffQuic=false\nloglevel=warning\n'
             ;;
         unstable_mobile|mobile)
-            printf 'name=unstable_mobile\nhandshake=4\nconnIdle=900\nuplinkOnly=4\ndownlinkOnly=10\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
+            printf 'name=unstable_mobile\nhandshake=6\nconnIdle=900\nuplinkOnly=4\ndownlinkOnly=10\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
             ;;
         low_overhead|minimal)
-            printf 'name=low_overhead\nhandshake=3\nconnIdle=600\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=256\nsniffQuic=false\nloglevel=error\n'
+            printf 'name=low_overhead\nhandshake=4\nconnIdle=600\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=256\nsniffQuic=false\nloglevel=error\n'
             ;;
         max_throughput|throughput|max|high_throughput)
             printf 'name=max_throughput\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=8\nbufferSize=1024\nsniffQuic=false\nloglevel=warning\n'
             ;;
         *)
-            printf 'name=balanced\nhandshake=3\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
+            printf 'name=balanced\nhandshake=4\nconnIdle=900\nuplinkOnly=2\ndownlinkOnly=5\nbufferSize=512\nsniffQuic=false\nloglevel=warning\n'
             ;;
     esac
 }
@@ -3480,7 +3484,7 @@ generate_config() {
         esac
     done < <(performance_profile_settings "$(effective_performance_profile)")
     profile_name="${profile_name:-balanced}"
-    handshake="${handshake:-3}"
+    handshake="${handshake:-4}"
     conn_idle="${conn_idle:-600}"
     uplink_only="${uplink_only:-2}"
     downlink_only="${downlink_only:-5}"

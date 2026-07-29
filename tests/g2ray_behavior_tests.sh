@@ -1320,6 +1320,31 @@ test_generated_and_upgraded_configs_do_not_block_page_assets_as_ads() {
     pass "generated and upgraded configs keep ordinary page assets reachable"
 }
 
+test_existing_config_upgrade_preserves_uuid_and_safe_handshake_floor() {
+    reset_runtime_paths
+    cat > "$CONFIG_FILE" <<'JSON'
+{
+  "dns": {"servers": ["localhost"]},
+  "policy": {"levels": {"0": {"handshake": 3, "connIdle": 900}}},
+  "inbounds": [{
+    "protocol": "vless",
+    "settings": {"clients": [{"id": "11111111-2222-4333-8444-555555555555"}]},
+    "sniffing": {"enabled": true, "destOverride": ["http", "tls"]}
+  }],
+  "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+  "routing": {"domainStrategy": "AsIs", "rules": []}
+}
+JSON
+
+    upgrade_config_dns
+
+    [[ "$(jq -r '.policy.levels["0"].handshake' "$CONFIG_FILE")" == "4" ]] \
+        || fail "existing config migration did not restore the safe handshake floor"
+    [[ "$(jq -r '.inbounds[0].settings.clients[0].id' "$CONFIG_FILE")" == "11111111-2222-4333-8444-555555555555" ]] \
+        || fail "existing config migration changed the active UUID"
+    pass "existing config upgrade preserves UUID and restores safe handshake floor"
+}
+
 test_generate_config_refreshes_expired_route_cache_before_exports() {
     reset_runtime_paths
     (
@@ -2233,11 +2258,15 @@ test_performance_profile_settings_are_available() {
     ! grep -Fq 'maxConcurrentUploads=' <<< "$balanced" || fail "balanced profile still claims obsolete XHTTP concurrency tuning"
     ! grep -Fq 'maxUploadSize=' <<< "$balanced" || fail "balanced profile still claims obsolete XHTTP upload tuning"
     grep -Fq 'sniffQuic=false' <<< "$balanced" || fail "balanced profile should disable QUIC sniffing"
+    grep -Fq 'handshake=4' <<< "$balanced" || fail "balanced profile should retain Xray's safe handshake allowance"
     grep -Fq 'connIdle=900' <<< "$low_latency" || fail "low_latency profile should retain app sessions across long foreground/background switches"
+    grep -Fq 'handshake=4' <<< "$low_latency" || fail "low_latency profile should not reject lossy mobile handshakes early"
     grep -Fq 'sniffQuic=false' <<< "$low_latency" || fail "low_latency profile should disable QUIC sniffing"
     grep -Fq 'sniffQuic=false' <<< "$streaming" || fail "streaming profile should disable QUIC sniffing"
     grep -Fq 'sniffQuic=false' <<< "$low_overhead" || fail "low_overhead profile should disable QUIC sniffing"
     local mobile; mobile="$(performance_profile_settings unstable_mobile)"
+    grep -Fq 'handshake=6' <<< "$mobile" || fail "unstable_mobile profile should tolerate delayed mobile handshakes"
+    grep -Fq 'handshake=4' <<< "$low_overhead" || fail "low_overhead profile should not trade reliability for a shorter handshake window"
     grep -Fq 'connIdle=900' <<< "$mobile" || fail "unstable_mobile profile should retain app sessions across long foreground/background switches"
     grep -Fq 'connIdle=900' <<< "$balanced" || fail "balanced profile should retain app sessions across long foreground/background switches"
     grep -Fq 'name=max_throughput' <<< "$max_throughput" || fail "max_throughput profile is not selectable"
@@ -2997,6 +3026,7 @@ test_xhttp_config_path_is_cached_by_config_content
 test_boot_status_helpers_record_silent_start_result
 test_generate_config_replaces_stale_no_config_boot_status
 test_generated_and_upgraded_configs_do_not_block_page_assets_as_ads
+test_existing_config_upgrade_preserves_uuid_and_safe_handshake_floor
 test_generate_config_refreshes_expired_route_cache_before_exports
 test_generate_config_keeps_previous_config_when_candidate_validation_fails
 test_generate_config_candidate_file_keeps_json_suffix_for_xray_detection
