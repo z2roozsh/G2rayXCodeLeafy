@@ -10,6 +10,9 @@
 /g2ray-codespace-bundle.json
 /g2ray-codespace-bundle.json.*
 /g2ray-support-*.tar.gz
+/*.rar
+/*.zip
+/*.7z
 /g2ray.sh.*
 /.env
 /.env.*
