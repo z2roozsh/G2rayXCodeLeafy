@@ -62,8 +62,8 @@ test_process_management_uses_pid_file() {
         || fail 'stop_xray does not stop every owned Xray PID'
     grep_fixed 'if ! stop_xray; then' "$SCRIPT" \
         || fail 'start_xray does not abort when the old owned listener cannot be stopped'
-    grep_fixed '> "$XRAY_PID_FILE"' "$SCRIPT" \
-        || fail 'start_xray does not store the launched Xray PID'
+    grep_fixed '_atomic_write "$XRAY_PID_FILE" "$pid"' "$SCRIPT" \
+        || fail 'start_xray does not atomically store the launched Xray PID'
     if grep_fixed 'pkill -x "xray"' "$SCRIPT" || grep_fixed 'pkill -9 -x "xray"' "$SCRIPT"; then
         fail 'script still kills every process named xray'
     fi
@@ -762,6 +762,8 @@ test_interactive_attach_readies_runtime_before_background_watchdog() {
         in_main && /start_background_tasks/ && !bg_line { bg_line=NR }
         END { exit !(ready_line && bg_line && ready_line < bg_line) }
     ' "$SCRIPT" || fail 'interactive attach can start the background self-heal watchdog before runtime readiness, causing competing Xray starts'
+    grep_fixed 'start_background_tasks || log_event WARN "background supervisor_start_deferred reason=interactive_attach"' "$SCRIPT" \
+        || fail 'interactive attach can exit the panel when background supervisor startup is transiently deferred'
     pass 'interactive attach readies runtime before background watchdog'
 }
 
@@ -1389,14 +1391,14 @@ test_route_export_and_reconnect_edges_are_hardened() {
     grep_fixed 'fallback_route_filter no_cached_usable_routes action=domain_only_refresh_requested' "$SCRIPT" \
         || fail 'fallback exports do not explain the domain-only case when no route cache exists'
     awk '
-        /generate_config\(\)/ { in_fn=1 }
+        /_generate_config_impl\(\)/ { in_fn=1 }
         in_fn && index($0, "refresh_config_exports >/dev/null 2>&1 || true") { saw=1 }
         in_fn && /^generate_link_for_address\(\)/ { exit }
         END { exit saw ? 0 : 1 }
     ' "$SCRIPT" \
         || fail 'new config generation does not refresh exported config files'
     awk '
-        /generate_config\(\)/ { in_fn=1; next }
+        /_generate_config_impl\(\)/ { in_fn=1; next }
         in_fn && /ensure_route_cache_for_export .*"generate_config"/ { saw_cache=1; next }
         in_fn && /refresh_config_exports >\/dev\/null 2>&1 \|\| true/ {
             if (saw_cache) ordered=1
@@ -1411,6 +1413,8 @@ test_route_export_and_reconnect_edges_are_hardened() {
         || fail 'empty exports do not clear artifacts from a previous UUID'
     grep_fixed 'write_failed_no_valid_backup' "$SCRIPT" \
         || fail 'failed exports can restore artifacts from a previous UUID'
+    grep_fixed 'with_file_lock "$EXPORT_LOCK_FILE" 45 write_config_exports_from_links "${_CONFIG_LINKS[@]}"' "$SCRIPT" \
+        || fail 'view-configs can race the supervisor while writing client export artifacts'
     grep_fixed 'FORCE_RECONNECT_ROUTE_WAIT_SEC' "$SCRIPT" \
         || fail 'force reconnect has no dedicated route-settling wait budget'
     grep_fixed 'XRAY_PORT=443' "$SCRIPT" \
@@ -1658,8 +1662,8 @@ test_background_supervisor_ownership_is_strict() {
         || fail 'background supervisor heartbeat does not carry ownership data'
     grep_fixed 'background_supervisor_heartbeat_matches()' "$SCRIPT" \
         || fail 'fresh heartbeat cannot prove supervisor ownership when proc env is unavailable'
-    grep_fixed 'printf '\''%s %s %s\n'\'' "${BASHPID:-$$}" "${G2RAY_BG_TASK_TOKEN:-}" "$now"' "$SCRIPT" \
-        || fail 'heartbeat does not persist pid token and timestamp together'
+    grep_fixed '_atomic_write "$BG_TASKS_HEARTBEAT_FILE" "${BASHPID:-$$} ${G2RAY_BG_TASK_TOKEN:-} ${now}"' "$SCRIPT" \
+        || fail 'heartbeat does not atomically persist pid token and timestamp together'
     awk '
         /background_supervisor_status\(\)/ { in_fn=1 }
         in_fn && /background_supervisor_heartbeat_timestamp/ { saw_timestamp=1 }
@@ -1682,8 +1686,8 @@ test_exports_filter_unusable_fallback_routes() {
         || fail 'fallback exports do not consume measured usable route health'
     grep_fixed 'generate_ip_links_from_list "$(usable_fallback_ips || true)"' "$SCRIPT" \
         || fail 'generate_ip_links does not use the filtered fallback route list'
-    grep_fixed 'ip_links=$(generate_ip_links_from_list "$fallback_ips" || true)' "$SCRIPT" \
-        || fail 'ordered exports do not reuse a shared filtered fallback route list'
+    grep_fixed 'ip_links=$(generate_ip_links_from_list "$fallback_ips" "$uuid" || true)' "$SCRIPT" \
+        || fail 'ordered exports do not reuse a shared filtered fallback route list and active UUID'
     grep_fixed 'address=$(usable_fallback_ips | head -1 || true)' "$SCRIPT" \
         || fail 'recommended IP link does not prefer a usable fallback route'
     if awk '

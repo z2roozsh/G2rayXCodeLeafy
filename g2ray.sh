@@ -107,6 +107,9 @@ SESSION_BYTES_FILE="$DATA_DIR/session_bytes.json"
 ACTIVE_TRAFFIC_STAMP_FILE="$DATA_DIR/active_traffic_last"
 TOTAL_UPTIME_FILE="$DATA_DIR/total_uptime_sec.txt"
 SESSION_START_FILE="$DATA_DIR/session_start.txt"
+# In-process lifecycle evidence used by transactional config rollback. This is
+# deliberately not persisted: it describes only the current start attempt.
+START_XRAY_LAST_PHASE="idle"
 LOG_DIR="${G2RAY_LOG_DIR:-$BASE_DIR/logs}"
 ROUTE_SETTLE_LOG_FILE="$LOG_DIR/route-settle.log"
 LOG_FILE="$LOG_DIR/g2ray.log"
@@ -733,10 +736,12 @@ sweep_stale_temp_files() {
 }
 
 write_boot_status() {
-    local status="${1:-unknown}" reason="${2:-unknown}" message="${3:-}" code="${4:-0}" ms="${5:-0}" ts
+    local status="${1:-unknown}" reason="${2:-unknown}" message="${3:-}" code="${4:-0}" ms="${5:-0}" ts payload
     ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
     mkdir -p "$DATA_DIR" 2>/dev/null || true
-    cat > "$BOOT_STATUS_FILE" <<JSON
+    [[ "$code" =~ ^[0-9]+$ ]] || code=0
+    [[ "$ms" =~ ^[0-9]+$ ]] || ms=0
+    payload=$(cat <<JSON
 {
   "ts": "$(json_escape "$ts")",
   "status": "$(json_escape "$status")",
@@ -746,7 +751,11 @@ write_boot_status() {
   "route_latency_ms": ${ms:-0}
 }
 JSON
-    chmod 600 "$BOOT_STATUS_FILE" 2>/dev/null || true
+    ) || return 1
+    if ! _atomic_write "$BOOT_STATUS_FILE" "$payload"; then
+        log_event ERROR "boot_status write_failed status=${status} reason=${reason}"
+        return 1
+    fi
     log_event INFO "boot_status status=${status} reason=${reason} route_http=${code:-0} route_ms=${ms:-0}"
 }
 
@@ -1719,6 +1728,62 @@ one_line() {
     printf '%s' "${1:-}" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
+config_vless_uuid() {
+    local uuid=""
+    [[ -s "$CONFIG_FILE" ]] || return 1
+    if command -v jq >/dev/null 2>&1; then
+        uuid=$(jq -r '
+            [.inbounds[]?
+             | select(.protocol == "vless")
+             | .settings.clients[]?.id // empty]
+            | map(select(type == "string" and length > 0))
+            | first // ""
+        ' "$CONFIG_FILE" 2>/dev/null | head -1 || true)
+    fi
+    uuid=$(one_line "$uuid")
+    [[ -n "$uuid" ]] || return 1
+    printf '%s\n' "$uuid"
+}
+
+# The validated Xray config is the runtime source of truth. uuid.txt is a
+# persistence cache used while generating a replacement config; preferring it
+# over config.json can export links for a UUID the live engine does not accept
+# after an interrupted multi-file update.
+active_vless_uuid() {
+    local uuid=""
+    if [[ -e "$CONFIG_FILE" ]]; then
+        # Once a config exists, never pair it with a UUID from a different
+        # transaction. A malformed/empty config must stop exports instead of
+        # silently reviving a stale uuid.txt value.
+        uuid=$(config_vless_uuid 2>/dev/null || true)
+        [[ -n "$uuid" ]] || return 1
+    else
+        uuid=$(awk 'NF {print; exit}' "$UUID_FILE" 2>/dev/null || true)
+        uuid=$(one_line "$uuid")
+    fi
+    [[ -n "$uuid" ]] || return 1
+    printf '%s\n' "$uuid"
+}
+
+restore_uuid_cache_value() {
+    local uuid="${1:-}" reason="${2:-unknown}"
+    if [[ -z "$uuid" ]]; then
+        rm -f "$UUID_FILE" 2>/dev/null || {
+            log_event ERROR "uuid_cache clear_failed reason=${reason}"
+            return 1
+        }
+        return 0
+    fi
+    if _atomic_write "$UUID_FILE" "$uuid"; then
+        return 0
+    fi
+    # A missing cache is safer than a stale UUID because links can be rebuilt
+    # from config.json, while a stale cache could point clients at the wrong ID.
+    rm -f "$UUID_FILE" 2>/dev/null || true
+    log_event ERROR "uuid_cache restore_failed reason=${reason} action=remove_stale_cache"
+    return 1
+}
+
 generate_wake_secret() {
     if command -v openssl >/dev/null 2>&1; then
         openssl rand -hex 32 2>/dev/null && return 0
@@ -2441,7 +2506,8 @@ run_headless_route_settle() {
     sleep "$HEADLESS_ROUTE_SETTLE_INITIAL_DELAY_SEC"
     if ! xray_listener_ready; then
         read -r xcode xms probe_reason < <(xhttp_probe_metrics external)
-        write_boot_status "needs_attention" "$reason" "Xray listener was unavailable while background route settling started." "${xcode:-0}" "${xms:-0}"
+        write_boot_status "needs_attention" "$reason" "Xray listener was unavailable while background route settling started." "${xcode:-0}" "${xms:-0}" \
+            || log_event WARN "boot_status nonfatal_write_failed reason=${reason}"
         log_event ERROR "route_settle reason=${reason} listener_unavailable xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0}"
         return 1
     fi
@@ -2451,13 +2517,15 @@ run_headless_route_settle() {
         read -r xcode xms probe_reason < <(xhttp_probe_metrics external)
         reset_route_bad_count
         reset_edge_bad_count
-        write_boot_status "ready" "$reason" "Xray listener was ready and asynchronous Codespaces route settling succeeded." "${xcode:-0}" "${xms:-0}"
+        write_boot_status "ready" "$reason" "Xray listener was ready and asynchronous Codespaces route settling succeeded." "${xcode:-0}" "${xms:-0}" \
+            || log_event WARN "boot_status nonfatal_write_failed reason=${reason}"
         log_event INFO "route_settle reason=${reason} ready xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0}"
         return 0
     fi
 
     read -r xcode xms probe_reason < <(xhttp_probe_metrics external)
-    write_boot_status "route_settling" "$reason" "Xray listener is ready, but GitHub's route is still settling after bounded background repair." "${xcode:-0}" "${xms:-0}"
+    write_boot_status "route_settling" "$reason" "Xray listener is ready, but GitHub's route is still settling after bounded background repair." "${xcode:-0}" "${xms:-0}" \
+        || log_event WARN "boot_status nonfatal_write_failed reason=${reason}"
     log_event WARN "route_settle reason=${reason} timeout xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} route_reason=${probe_reason:-unknown}"
     return 1
 }
@@ -2615,30 +2683,40 @@ reset_monthly_quota_if_needed() {
     current=$(current_quota_cycle)
     stored=$(cat "$QUOTA_CYCLE_FILE" 2>/dev/null || true)
     if [[ -z "$stored" ]]; then
-        printf '%s\n' "$current" > "$QUOTA_CYCLE_FILE"
-        chmod 600 "$QUOTA_CYCLE_FILE" 2>/dev/null || true
+        _atomic_write "$QUOTA_CYCLE_FILE" "$current" || return 1
         return 0
     fi
     [[ "$stored" == "$current" ]] && return 0
     now=$(date +%s)
-    printf '0\n' > "$TOTAL_UPTIME_FILE"
-    printf '%s\n' "$now" > "$SESSION_START_FILE"
-    printf '%s\n' "$current" > "$QUOTA_CYCLE_FILE"
-    chmod 600 "$QUOTA_CYCLE_FILE" "$TOTAL_UPTIME_FILE" "$SESSION_START_FILE" 2>/dev/null || true
+    [[ "$now" =~ ^[0-9]+$ ]] || return 1
+    # Commit the cycle marker last so an interrupted reset is retried safely.
+    _atomic_write "$TOTAL_UPTIME_FILE" "0" || return 1
+    _atomic_write "$SESSION_START_FILE" "$now" || return 1
+    _atomic_write "$QUOTA_CYCLE_FILE" "$current" || return 1
     log_event INFO "quota_cycle_reset old=${stored} new=${current}"
 }
 
 save_session_uptime() {
-    local ss now elapsed prev
-    reset_monthly_quota_if_needed
-    ss=$(cat "$SESSION_START_FILE" 2>/dev/null || date +%s)
+    local ss now elapsed prev total
+    reset_monthly_quota_if_needed || return 1
     now=$(date +%s)
+    [[ "$now" =~ ^[0-9]+$ ]] || return 1
+    ss=$(cat "$SESSION_START_FILE" 2>/dev/null || true)
+    if [[ ! "$ss" =~ ^[0-9]+$ ]]; then
+        log_event WARN "uptime_state invalid_session_start action=reset"
+        ss="$now"
+    fi
     elapsed=$(( now - ss ))
     (( elapsed < 0    )) && elapsed=0
     (( elapsed > 3600 )) && elapsed=3600
-    prev=$(cat "$TOTAL_UPTIME_FILE" 2>/dev/null || echo 0)
-    printf '%s\n' $(( prev + elapsed )) > "$TOTAL_UPTIME_FILE"
-    printf '%s\n' "$now"               > "$SESSION_START_FILE"
+    prev=$(cat "$TOTAL_UPTIME_FILE" 2>/dev/null || true)
+    if [[ ! "$prev" =~ ^[0-9]+$ ]]; then
+        log_event WARN "uptime_state invalid_total action=reset"
+        prev=0
+    fi
+    total=$(( prev + elapsed ))
+    _atomic_write "$TOTAL_UPTIME_FILE" "$total" || return 1
+    _atomic_write "$SESSION_START_FILE" "$now" || return 1
 }
 
 # Atomically claim a mkdir-based lock directory, then confirm we still own it.
@@ -2775,7 +2853,10 @@ upgrade_config_dns() {
     fi
 
     local tmp
-    tmp=$(mktemp "${CONFIG_FILE}.dns.XXXXXX") || return 0
+    tmp=$(mktemp "${CONFIG_FILE}.dns.XXXXXX") || {
+        log_event WARN "config_dns temp_create_failed"
+        return 1
+    }
     if jq '
       .dns = {
         "servers": ["localhost", "168.63.129.16", "1.1.1.1", "1.0.0.1", "8.8.8.8"],
@@ -2804,12 +2885,17 @@ upgrade_config_dns() {
         if cmp -s "$CONFIG_FILE" "$tmp"; then
             rm -f "$tmp" 2>/dev/null || true
         else
-            mv -f "$tmp" "$CONFIG_FILE"
+            if ! mv -f "$tmp" "$CONFIG_FILE"; then
+                rm -f "$tmp" 2>/dev/null || true
+                log_event ERROR "config_dns commit_failed"
+                return 1
+            fi
             log_event INFO "config_dns refreshed"
         fi
     else
         rm -f "$tmp" 2>/dev/null || true
         log_event WARN "config_dns refresh_failed"
+        return 1
     fi
 }
 
@@ -2850,33 +2936,84 @@ xray_validate_config() {
     xray_validate_config_file "$CONFIG_FILE"
 }
 
+restore_prestart_config_backup() {
+    local backup="${1:-}" reason="${2:-unknown}"
+    [[ -f "$backup" ]] || {
+        log_event ERROR "start_xray config_restore_missing reason=${reason} backup=${backup:-missing}"
+        return 1
+    }
+    if cmp -s "$backup" "$CONFIG_FILE"; then
+        rm -f "$backup" 2>/dev/null || true
+        return 0
+    fi
+    if mv -f "$backup" "$CONFIG_FILE"; then
+        chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+        log_event WARN "start_xray config_restored reason=${reason}"
+        return 0
+    fi
+    log_event ERROR "start_xray config_restore_failed reason=${reason} backup=${backup}"
+    return 1
+}
+
 _start_xray_impl() {
+    START_XRAY_LAST_PHASE="preflight"
     if [[ ! -f "$CONFIG_FILE" ]]; then
         log_event WARN "start_xray missing_config path=${CONFIG_FILE}"
         echo -e "  ${RED}✖ No config found. Generate one first (Option 2).${NC}"
         return 1
     fi
-    local launch_cmd pid
+    local launch_cmd pid config_backup="" _grace
     log_event INFO "start_xray requested port=${XRAY_PORT} config=${CONFIG_FILE}"
     launch_cmd=$(printf 'ulimit -n "${G2RAY_XRAY_FD_LIMIT:-65536}" 2>/dev/null || true; nohup %q run -c %q </dev/null >%q 2>&1 & printf "%%s\n" "$!"' \
         "$XRAY_BIN" "$CONFIG_FILE" "$LOG_DIR/xray.log")
+    config_backup=$(mktemp "${CONFIG_FILE}.prestart.XXXXXX") || {
+        log_event ERROR "start_xray config_backup_create_failed"
+        return 1
+    }
+    if ! cp -- "$CONFIG_FILE" "$config_backup"; then
+        rm -f "$config_backup" 2>/dev/null || true
+        log_event ERROR "start_xray config_backup_failed"
+        return 1
+    fi
     upgrade_config_dns >/dev/null 2>&1 || true
     if ! xray_validate_config; then
+        restore_prestart_config_backup "$config_backup" "migration_validation_failed" || true
         return 1
     fi
     if ! stop_xray; then
+        START_XRAY_LAST_PHASE="previous_stop_failed"
+        restore_prestart_config_backup "$config_backup" "previous_engine_stop_failed" || true
         log_event ERROR "start_xray stop_previous_failed"
         echo -e "  ${RED}✖ Could not stop previous Xray process.${NC}"
         return 1
     fi
-    reset_session_bytes_baseline
+    START_XRAY_LAST_PHASE="previous_stopped"
+    rm -f "$config_backup" 2>/dev/null || true
+    reset_session_bytes_baseline || log_event WARN "start_xray session_baseline_write_failed"
     pid=$(sudo bash -c "$launch_cmd" 2>/dev/null || true)
     if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+        START_XRAY_LAST_PHASE="launch_failed"
         log_event ERROR "start_xray launch_failed"
         echo -e "  ${RED}✖ Failed to start Xray.${NC}"
         return 1
     fi
-    printf '%s\n' "$pid" > "$XRAY_PID_FILE"
+    START_XRAY_LAST_PHASE="process_launched"
+    if ! _atomic_write "$XRAY_PID_FILE" "$pid"; then
+        log_event ERROR "start_xray pid_write_failed pid=${pid} action=terminate_launch"
+        sudo kill "$pid" >/dev/null 2>&1 || true
+        for _grace in 1 2 3 4 5 6 7 8 9 10; do
+            sudo kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        if sudo kill -0 "$pid" 2>/dev/null; then
+            sudo kill -9 "$pid" >/dev/null 2>&1 || true
+        fi
+        rm -f "$XRAY_PID_FILE" 2>/dev/null || true
+        START_XRAY_LAST_PHASE="launch_cleaned"
+        echo -e "  ${RED}✖ Xray launched but its ownership state could not be saved; the launch was stopped safely.${NC}"
+        return 1
+    fi
+    START_XRAY_LAST_PHASE="running"
     log_event INFO "xray launched pid=${pid} port=${XRAY_PORT}"
 }
 
@@ -3006,7 +3143,8 @@ self_heal_once() {
 _background_tasks() {
     set +e
     local tick=0 health_tick=0 export_tick=0 route_tick=0 version_tick=0
-    write_background_supervisor_heartbeat
+    write_background_supervisor_heartbeat \
+        || log_event ERROR "background heartbeat_write_failed phase=startup"
     if [[ -f "$CONFIG_FILE" ]]; then
         force_public_runtime_ports "supervisor_start" >/dev/null 2>&1 || true
         run_with_deadline "$G2RAY_SUPERVISOR_STATS_TIMEOUT_SEC" save_xray_stats >/dev/null 2>&1 || true
@@ -3030,7 +3168,8 @@ _background_tasks() {
             exit 0
         fi
         (( ++version_tick >= G2RAY_SUPERVISOR_VERSION_CHECK_TICKS )) && { version_tick=0; supervisor_reexec_if_stale || true; }
-        write_background_supervisor_heartbeat
+        write_background_supervisor_heartbeat \
+            || log_event ERROR "background heartbeat_write_failed phase=loop"
         rotate_log_file "$LOG_FILE"
         rotate_log_file "$LOG_DIR/xray-error.log"
         rotate_log_file "$ROUTE_SETTLE_LOG_FILE"
@@ -3102,7 +3241,7 @@ release_bg_tasks_lock() {
 }
 
 start_background_tasks() {
-    local token bg_pid
+    local token bg_pid version
     if ! acquire_bg_tasks_lock; then
         bg_pid=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
         if bg_tasks_running "$bg_pid" || background_supervisor_heartbeat_running "$bg_pid"; then
@@ -3126,11 +3265,28 @@ start_background_tasks() {
         fi
     fi
     token=$(uuidgen 2>/dev/null || printf '%s-%s-%s' "$$" "$RANDOM" "$(date +%s)")
-    printf '%s\n' "$token" > "$BG_TASKS_TOKEN_FILE"
+    version=$(background_supervisor_version)
+    if [[ -z "$token" ]] || ! _atomic_write "$BG_TASKS_TOKEN_FILE" "$token"; then
+        log_event ERROR "background supervisor_start_failed reason=token_write"
+        release_bg_tasks_lock
+        return 1
+    fi
+    if [[ -z "$version" ]] || ! _atomic_write "$BG_TASKS_VERSION_FILE" "$version"; then
+        rm -f "$BG_TASKS_TOKEN_FILE" "$BG_TASKS_VERSION_FILE" 2>/dev/null || true
+        log_event ERROR "background supervisor_start_failed reason=version_write"
+        release_bg_tasks_lock
+        return 1
+    fi
     G2RAY_BG_TASK_TOKEN="$token" nohup bash "$SCRIPT_PATH" --background-supervisor </dev/null >/dev/null 2>&1 &
     bg_pid=$!
-    printf '%s\n' "$bg_pid" > "$BG_TASKS_PID"
-    background_supervisor_version > "$BG_TASKS_VERSION_FILE" 2>/dev/null || true
+    if ! _atomic_write "$BG_TASKS_PID" "$bg_pid"; then
+        kill "$bg_pid" >/dev/null 2>&1 || true
+        wait "$bg_pid" 2>/dev/null || true
+        rm -f "$BG_TASKS_PID" "$BG_TASKS_VERSION_FILE" "$BG_TASKS_TOKEN_FILE" "$BG_TASKS_HEARTBEAT_FILE" 2>/dev/null || true
+        log_event ERROR "background supervisor_start_failed reason=pid_write"
+        release_bg_tasks_lock
+        return 1
+    fi
     log_event INFO "background supervisor_started pid=${bg_pid}"
     release_bg_tasks_lock
     disown 2>/dev/null || true
@@ -3154,12 +3310,17 @@ background_supervisor_version_matches() {
 }
 
 supervisor_reexec_if_stale() {
+    local version
     background_supervisor_version_matches && return 0
     if ! bash -n "$SCRIPT_PATH" >/dev/null 2>&1; then
         log_event ERROR "background supervisor_stale_code syntax_failed action=stay"
         return 1
     fi
-    background_supervisor_version > "$BG_TASKS_VERSION_FILE" 2>/dev/null || true
+    version=$(background_supervisor_version)
+    if [[ -z "$version" ]] || ! _atomic_write "$BG_TASKS_VERSION_FILE" "$version"; then
+        log_event ERROR "background supervisor_stale_code version_write_failed action=stay"
+        return 1
+    fi
     log_event WARN "background supervisor_stale_code action=reexec"
     exec bash "$SCRIPT_PATH" --background-supervisor
 }
@@ -3206,7 +3367,8 @@ background_supervisor_token_current() {
 write_background_supervisor_heartbeat() {
     local now
     now=$(date +%s)
-    printf '%s %s %s\n' "${BASHPID:-$$}" "${G2RAY_BG_TASK_TOKEN:-}" "$now" > "$BG_TASKS_HEARTBEAT_FILE" 2>/dev/null || true
+    [[ "$now" =~ ^[0-9]+$ ]] || return 1
+    _atomic_write "$BG_TASKS_HEARTBEAT_FILE" "${BASHPID:-$$} ${G2RAY_BG_TASK_TOKEN:-} ${now}"
 }
 
 background_supervisor_heartbeat_timestamp() {
@@ -3331,13 +3493,26 @@ format_bytes() {
 
 estimate_quota() {
     local prev ss now elapsed total rem h_used m_used h_left m_left dtime quota_seconds quota_hours
-    reset_monthly_quota_if_needed
+    reset_monthly_quota_if_needed \
+        || log_event WARN "quota_state cycle_reset_failed action=continue_with_sanitized_state"
     quota_seconds="${G2RAY_QUOTA_SECONDS:-216000}"
     [[ "$quota_seconds" =~ ^[0-9]+$ && "$quota_seconds" -gt 0 ]] || quota_seconds=216000
     quota_hours=$(( quota_seconds / 3600 ))
-    prev=$(cat "$TOTAL_UPTIME_FILE" 2>/dev/null || echo 0)
-    ss=$(cat "$SESSION_START_FILE" 2>/dev/null || date +%s)
-    now=$(date +%s); elapsed=$(( now - ss ))
+    now=$(date +%s)
+    [[ "$now" =~ ^[0-9]+$ ]] || now=0
+    prev=$(cat "$TOTAL_UPTIME_FILE" 2>/dev/null || true)
+    if [[ ! "$prev" =~ ^[0-9]+$ ]]; then
+        log_event WARN "quota_state invalid_total action=repair"
+        prev=0
+        _atomic_write "$TOTAL_UPTIME_FILE" "$prev" >/dev/null 2>&1 || true
+    fi
+    ss=$(cat "$SESSION_START_FILE" 2>/dev/null || true)
+    if [[ ! "$ss" =~ ^[0-9]+$ ]]; then
+        log_event WARN "quota_state invalid_session_start action=repair"
+        ss="$now"
+        _atomic_write "$SESSION_START_FILE" "$ss" >/dev/null 2>&1 || true
+    fi
+    elapsed=$(( now - ss ))
     (( elapsed < 0    )) && elapsed=0
     (( elapsed > 3600 )) && elapsed=3600
     total=$(( prev + elapsed ))
@@ -3442,12 +3617,16 @@ set_performance_profile() {
     log_event INFO "performance_profile preference set profile=${profile}"
 }
 
-generate_config() {
+_generate_config_impl() {
     # Keep the existing UUID when only re-applying a profile, so switching
     # profiles does not invalidate already-imported client links.
-    local uuid old_uuid="" had_old_uuid=false candidate_config="" previous_config="" had_previous_config=false
-    if [[ "${G2RAY_PRESERVE_UUID:-0}" == "1" && -s "$UUID_FILE" ]]; then
-        uuid=$(cat "$UUID_FILE" 2>/dev/null || true)
+    local uuid old_uuid="" candidate_config="" previous_config="" had_previous_config=false had_running_engine=false
+    if declare -F xray_running >/dev/null 2>&1 && xray_running; then
+        had_running_engine=true
+    fi
+    old_uuid=$(active_vless_uuid 2>/dev/null || true)
+    if [[ "${G2RAY_PRESERVE_UUID:-0}" == "1" && -n "$old_uuid" ]]; then
+        uuid="$old_uuid"
     else
         uuid=$(generate_uuid) || {
             echo -e "  ${RED}Could not generate a UUID for the config.${NC}"
@@ -3458,10 +3637,6 @@ generate_config() {
         echo -e "  ${RED}Could not generate a UUID for the config.${NC}"
         return 1
     }
-    if [[ -s "$UUID_FILE" ]]; then
-        old_uuid=$(cat "$UUID_FILE" 2>/dev/null || true)
-        had_old_uuid=true
-    fi
     if [[ -s "$CONFIG_FILE" ]]; then
         previous_config=$(mktemp "${CONFIG_FILE}.previous.XXXXXX.json") || return 1
         cp "$CONFIG_FILE" "$previous_config" || {
@@ -3591,16 +3766,17 @@ JSONEOF
         return 1
     fi
     if ! mv -f "$candidate_config" "$CONFIG_FILE"; then
-        if [[ "$had_old_uuid" == true ]]; then
-            _atomic_write "$UUID_FILE" "$old_uuid" >/dev/null 2>&1 || true
+        if [[ "$had_previous_config" == true ]]; then
+            restore_uuid_cache_value "$old_uuid" "candidate_config_commit_failed" >/dev/null 2>&1 || true
         else
-            rm -f "$UUID_FILE" 2>/dev/null || true
+            restore_uuid_cache_value "" "candidate_config_commit_failed_no_previous_config" >/dev/null 2>&1 || true
         fi
         rm -f "$candidate_config" "$previous_config" 2>/dev/null || true
         return 1
     fi
     chmod 600 "$UUID_FILE" "$CONFIG_FILE" 2>/dev/null || true
-    local engine_started=false
+    local engine_started=false start_phase="unknown"
+    START_XRAY_LAST_PHASE="unknown"
     if start_xray && wait_for_port >/dev/null 2>&1; then
         engine_started=true
         log_event INFO "generate_config engine_started port=${XRAY_PORT}"
@@ -3609,22 +3785,88 @@ JSONEOF
         log_event WARN "generate_config engine_maybe_not_bound port=${XRAY_PORT}"
         echo -e "  ${YELLOW}⚠ Engine may not have bound to port ${XRAY_PORT}.${NC}"
     fi
+    start_phase="${START_XRAY_LAST_PHASE:-unknown}"
     if [[ "$engine_started" != true ]]; then
+        local rollback_config="failed" rollback_identity_ok=true rollback_engine="not_available"
+        local must_stop_new_engine=true old_engine_preserved=false rollback_uuid=""
         log_event ERROR "generate_config engine_start_failed port=${XRAY_PORT} action=rollback"
+
+        case "$start_phase" in
+            preflight|previous_stop_failed)
+                # The replacement never launched and the previous process was
+                # never stopped, so restoring its files must not kill it when
+                # it was confirmed alive at transaction start.
+                must_stop_new_engine=false
+                [[ "$had_running_engine" == true ]] && old_engine_preserved=true
+                ;;
+            previous_stopped|launch_failed|launch_cleaned)
+                # The previous process is gone and no replacement remains.
+                must_stop_new_engine=false
+                ;;
+            running|process_launched|unknown|*)
+                must_stop_new_engine=true
+                ;;
+        esac
+
+        # A successful launch followed by a failed readiness probe can leave the
+        # new UUID running in memory. Stop only when the start attempt reached a
+        # launch phase; otherwise the old engine is the process still serving.
+        if [[ "$must_stop_new_engine" == true ]] && ! stop_xray >/dev/null 2>&1; then
+            log_event ERROR "generate_config rollback_stop_failed action=keep_new_files"
+            rm -f "$previous_config" 2>/dev/null || true
+            echo -e "  ${RED}Could not stop the failed new engine; its matching config was kept for safe recovery.${NC}"
+            return 1
+        fi
+
         if [[ "$had_previous_config" == true && -s "$previous_config" ]]; then
-            cp "$previous_config" "$CONFIG_FILE" 2>/dev/null || true
-            chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+            if mv -f "$previous_config" "$CONFIG_FILE" 2>/dev/null; then
+                chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+                rollback_config="restored"
+            else
+                log_event ERROR "generate_config rollback_config_restore_failed"
+            fi
         else
-            rm -f "$CONFIG_FILE" 2>/dev/null || true
+            if rm -f "$CONFIG_FILE" 2>/dev/null; then
+                rollback_config="removed"
+            else
+                log_event ERROR "generate_config rollback_config_remove_failed"
+            fi
         fi
-        if [[ "$had_old_uuid" == true ]]; then
-            _atomic_write "$UUID_FILE" "$old_uuid" >/dev/null 2>&1 || true
-            chmod 600 "$UUID_FILE" 2>/dev/null || true
+        if [[ "$rollback_config" != "failed" ]]; then
+            [[ "$rollback_config" == "restored" ]] && rollback_uuid="$old_uuid"
+            restore_uuid_cache_value "$rollback_uuid" "engine_start_rollback" >/dev/null 2>&1 \
+                || rollback_identity_ok=false
         else
-            rm -f "$UUID_FILE" 2>/dev/null || true
+            # Config restoration failed, so keep the new UUID cache paired with
+            # the still-committed new config and retain the backup for recovery.
+            log_event ERROR "generate_config rollback_incomplete action=keep_new_identity backup=${previous_config:-missing}"
         fi
-        rm -f "$previous_config" 2>/dev/null || true
-        echo -e "  ${YELLOW}Engine may not have bound to port ${XRAY_PORT}; previous config was restored.${NC}"
+
+        if [[ "$rollback_config" == "restored" && "$old_engine_preserved" == true ]]; then
+            rollback_engine="restored"
+            log_event INFO "generate_config rollback_engine_preserved port=${XRAY_PORT} start_phase=${start_phase}"
+        elif [[ "$rollback_config" == "restored" ]]; then
+            if start_xray >/dev/null 2>&1 && wait_for_port >/dev/null 2>&1; then
+                rollback_engine="restored"
+                log_event INFO "generate_config rollback_engine_restored port=${XRAY_PORT}"
+            else
+                rollback_engine="restart_failed"
+                log_event ERROR "generate_config rollback_engine_restart_failed port=${XRAY_PORT}"
+            fi
+        elif [[ "$rollback_config" == "failed" ]]; then
+            rollback_engine="files_failed"
+        fi
+        [[ "$rollback_config" == "failed" ]] || rm -f "$previous_config" 2>/dev/null || true
+
+        if [[ "$rollback_engine" == "restored" && "$rollback_identity_ok" == true ]]; then
+            echo -e "  ${YELLOW}New config failed readiness; the previous config and engine were restored.${NC}"
+        elif [[ "$rollback_engine" == "restored" ]]; then
+            echo -e "  ${YELLOW}Previous engine was restored; its UUID cache will be rebuilt from config.json.${NC}"
+        elif [[ "$rollback_engine" == "not_available" ]]; then
+            echo -e "  ${YELLOW}New config failed readiness and was removed; no previous config existed.${NC}"
+        else
+            echo -e "  ${RED}New config failed and automatic rollback needs attention. Check engine logs.${NC}"
+        fi
         return 1
     fi
     rm -f "$previous_config" 2>/dev/null || true
@@ -3648,12 +3890,19 @@ JSONEOF
     refresh_config_exports >/dev/null 2>&1 || true
     read -r _boot_code _boot_ms _boot_reason < <(xhttp_probe_metrics external)
     if xhttp_status_usable "${_boot_code:-0}"; then
-        write_boot_status "ready" "generate_config" "Config generated and the Codespaces route is usable." "${_boot_code:-0}" "${_boot_ms:-0}"
+        write_boot_status "ready" "generate_config" "Config generated and the Codespaces route is usable." "${_boot_code:-0}" "${_boot_ms:-0}" \
+            || log_event WARN "boot_status nonfatal_write_failed reason=generate_config"
     elif [[ "${_boot_code:-0}" == "404" ]]; then
-        write_boot_status "route_settling" "generate_config" "Config generated, but GitHub's app route is still settling. Wait, check health, or run Recover Now." "${_boot_code:-0}" "${_boot_ms:-0}"
+        write_boot_status "route_settling" "generate_config" "Config generated, but GitHub's app route is still settling. Wait, check health, or run Recover Now." "${_boot_code:-0}" "${_boot_ms:-0}" \
+            || log_event WARN "boot_status nonfatal_write_failed reason=generate_config"
     else
-        write_boot_status "needs_attention" "generate_config" "Config generated, but the external route is not usable yet." "${_boot_code:-0}" "${_boot_ms:-0}"
+        write_boot_status "needs_attention" "generate_config" "Config generated, but the external route is not usable yet." "${_boot_code:-0}" "${_boot_ms:-0}" \
+            || log_event WARN "boot_status nonfatal_write_failed reason=generate_config"
     fi
+}
+
+generate_config() {
+    with_runtime_lock _generate_config_impl "$@"
 }
 
 generate_config_with_feedback() {
@@ -3715,8 +3964,8 @@ xhttp_extra_json_valid() {
 }
 
 generate_link_for_address() {
-    local address="$1" label_suffix="${2:-}" uuid path encoded_path xhttp_mode extra_param=""
-    uuid=$(cat "$UUID_FILE" 2>/dev/null) || { printf ''; return 1; }
+    local address="$1" label_suffix="${2:-}" uuid="${3:-}" path encoded_path xhttp_mode extra_param=""
+    [[ -n "$uuid" ]] || uuid=$(active_vless_uuid 2>/dev/null) || { printf ''; return 1; }
     [[ -z "$uuid" ]] && { printf ''; return 1; }
     path=$(xhttp_config_path)
     [[ "$path" == /* ]] || path="/${path}"
@@ -3770,8 +4019,8 @@ ws_link_alpn_label() {
 
 generate_ws_link_for_address() {
     ws_fallback_enabled || return 1
-    local address="$1" label_suffix="${2:-}" alpn_mode="${3:-h2}" uuid path encoded_path alpn_param
-    uuid=$(cat "$UUID_FILE" 2>/dev/null) || { printf ''; return 1; }
+    local address="$1" label_suffix="${2:-}" alpn_mode="${3:-h2}" uuid="${4:-}" path encoded_path alpn_param
+    [[ -n "$uuid" ]] || uuid=$(active_vless_uuid 2>/dev/null) || { printf ''; return 1; }
     [[ -z "$uuid" ]] && { printf ''; return 1; }
     path=$(ws_path_value)
     encoded_path=$(url_encode_query_value "$path")
@@ -3781,20 +4030,20 @@ generate_ws_link_for_address() {
 }
 
 generate_ws_link_variants_for_address() {
-    local address="$1" base_label_suffix="${2:-}" mode suffix printed=false
+    local address="$1" base_label_suffix="${2:-}" uuid="${3:-}" mode suffix printed=false
     for mode in h2 h1 blank; do
         suffix=$(ws_alpn_label_suffix "$mode")
         [[ "$printed" == true ]] && printf '\n'
-        generate_ws_link_for_address "$address" "${base_label_suffix}-${suffix}" "$mode"
+        generate_ws_link_for_address "$address" "${base_label_suffix}-${suffix}" "$mode" "$uuid"
         printed=true
     done
 }
 
 generate_ws_front_link() {
     ws_fallback_enabled || return 1
-    local alpn_mode="${1:-h2}" front_domain uuid path encoded_path alpn_param
+    local alpn_mode="${1:-h2}" uuid="${2:-}" front_domain path encoded_path alpn_param
     front_domain=$(ws_front_domain_value) || return 1
-    uuid=$(cat "$UUID_FILE" 2>/dev/null) || { printf ''; return 1; }
+    [[ -n "$uuid" ]] || uuid=$(active_vless_uuid 2>/dev/null) || { printf ''; return 1; }
     [[ -z "$uuid" ]] && { printf ''; return 1; }
     path=$(ws_path_value)
     encoded_path=$(url_encode_query_value "$path")
@@ -3804,28 +4053,28 @@ generate_ws_front_link() {
 }
 
 generate_ws_front_link_variants() {
-    local mode printed=false
+    local uuid="${1:-}" mode printed=false
     for mode in h2 h1 blank; do
         [[ "$printed" == true ]] && printf '\n'
-        generate_ws_front_link "$mode"
+        generate_ws_front_link "$mode" "$uuid"
         printed=true
     done
 }
 
 generate_domain_link() {
-    generate_link_for_address "$PORT_DOMAIN"
+    generate_link_for_address "$PORT_DOMAIN" "" "${1:-}"
 }
 
 generate_ws_domain_link() {
-    local mode="${1:-h2}"
-    generate_ws_link_for_address "$WS_PORT_DOMAIN" "-ws-domain-$(ws_alpn_label_suffix "$mode")" "$mode"
+    local mode="${1:-h2}" uuid="${2:-}"
+    generate_ws_link_for_address "$WS_PORT_DOMAIN" "-ws-domain-$(ws_alpn_label_suffix "$mode")" "$mode" "$uuid"
 }
 
 generate_ws_domain_link_variants() {
-    local mode printed=false
+    local uuid="${1:-}" mode printed=false
     for mode in h2 h1 blank; do
         [[ "$printed" == true ]] && printf '\n'
-        generate_ws_domain_link "$mode"
+        generate_ws_domain_link "$mode" "$uuid"
         printed=true
     done
 }
@@ -4773,13 +5022,14 @@ generate_ip_links() {
 
 generate_ip_links_from_list() {
     local fallback_ips="${1:-}"
-    local address index=1 printed=false max_links
+    local uuid="${2:-}" address index=1 printed=false max_links
+    [[ -n "$uuid" ]] || uuid=$(active_vless_uuid 2>/dev/null) || return 1
     max_links=$(safe_max_fallback_links)
     while IFS= read -r address; do
         [[ -n "$address" ]] || continue
         (( index > max_links )) && break
         [[ "$printed" == true ]] && printf '\n'
-        generate_link_for_address "$address" "-ip${index}"
+        generate_link_for_address "$address" "-ip${index}" "$uuid"
         printed=true
         index=$(( index + 1 ))
     done <<< "$fallback_ips"
@@ -4792,9 +5042,10 @@ generate_ws_links() {
 generate_ws_links_from_list() {
     ws_fallback_enabled || return 0
     local fallback_ips="${1:-}"
-    local address index=1 printed=false max_links front_links
+    local uuid="${2:-}" address index=1 printed=false max_links front_links
+    [[ -n "$uuid" ]] || uuid=$(active_vless_uuid 2>/dev/null) || return 1
     max_links=$(safe_ws_fallback_links)
-    front_links=$(generate_ws_front_link_variants 2>/dev/null || true)
+    front_links=$(generate_ws_front_link_variants "$uuid" 2>/dev/null || true)
     if [[ -n "$front_links" ]]; then
         printf '%s' "$front_links"
         printed=true
@@ -4803,41 +5054,47 @@ generate_ws_links_from_list() {
         [[ -n "$address" ]] || continue
         (( index > max_links )) && break
         [[ "$printed" == true ]] && printf '\n'
-        generate_ws_link_variants_for_address "$address" "-ws-ip${index}"
+        generate_ws_link_variants_for_address "$address" "-ws-ip${index}" "$uuid"
         printed=true
         index=$(( index + 1 ))
     done <<< "$fallback_ips"
     if domain_link_export_enabled; then
         [[ "$printed" == true ]] && printf '\n'
-        generate_ws_domain_link_variants || true
+        generate_ws_domain_link_variants "$uuid" || true
     fi
 }
 
 generate_ordered_links() {
-    local domain_link ip_links ws_links fallback_ips
+    local domain_link ip_links ws_links fallback_ips uuid
+    uuid=$(active_vless_uuid 2>/dev/null) || return 1
     fallback_ips=$(usable_fallback_ips || true)
-    ip_links=$(generate_ip_links_from_list "$fallback_ips" || true)
+    ip_links=$(generate_ip_links_from_list "$fallback_ips" "$uuid" || true)
     printf '%s\n' "$ip_links" | awk 'NF'
     if domain_link_export_enabled; then
-        domain_link=$(generate_domain_link || true)
+        domain_link=$(generate_domain_link "$uuid" || true)
         if [[ -n "$domain_link" ]] && ! printf '%s\n' "$ip_links" | grep -Fxq "$domain_link"; then
             printf '%s\n' "$domain_link"
         fi
     fi
-    ws_links=$(generate_ws_links_from_list "$fallback_ips" || true)
+    ws_links=$(generate_ws_links_from_list "$fallback_ips" "$uuid" || true)
     printf '%s\n' "$ws_links" | awk 'NF'
 }
 
 write_config_metadata() {
-    local count="$1" hash="$2" generated max_links
+    local count="$1" hash="$2" generated max_links payload xray_port ws_port
     max_links=$(safe_max_fallback_links)
     generated=$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S%z')
-    cat > "$CONFIG_META_FILE" <<JSON
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    xray_port="$XRAY_PORT"
+    ws_port="$WS_PORT"
+    [[ "$xray_port" =~ ^[0-9]+$ ]] || xray_port=443
+    [[ "$ws_port" =~ ^[0-9]+$ ]] || ws_port=8443
+    payload=$(cat <<JSON
 {
   "generated_at": "$(json_escape "$generated")",
   "codespace": "$(json_escape "$CODESPACE_NAME")",
   "domain": "$(json_escape "$PORT_DOMAIN")",
-  "port": ${XRAY_PORT},
+  "port": ${xray_port},
   "config_count": ${count:-0},
   "max_fallback_links": ${max_links},
   "hash": "$(json_escape "$hash")",
@@ -4848,16 +5105,16 @@ write_config_metadata() {
   "performance_profile": "$(json_escape "$(effective_performance_profile)")",
   "saved_performance_profile": "$(json_escape "$PERFORMANCE_PROFILE")",
   "ws_fallback": $(ws_fallback_enabled && printf true || printf false),
-  "ws_port": ${WS_PORT},
+  "ws_port": ${ws_port},
   "ws_domain": "$(json_escape "$WS_PORT_DOMAIN")",
   "ws_front_domain": "$(json_escape "$(ws_front_domain_value 2>/dev/null || true)")",
   "low_overhead": $(low_overhead_enabled && printf true || printf false),
   "latency_focus": $(latency_focus_enabled && printf true || printf false),
   "domain_link_exported": $(domain_link_export_enabled && printf true || printf false)
 }
-
 JSON
-    chmod 600 "$CONFIG_META_FILE" 2>/dev/null || true
+    ) || return 1
+    _atomic_write "$CONFIG_META_FILE" "$payload"
 }
 
 write_codespace_import_bundle() {
@@ -4896,7 +5153,7 @@ write_config_exports_from_links() {
     write_codespace_import_bundle "$links" || return 1
     count=$(printf '%s\n' "$links" | awk 'NF {c++} END {print c+0}')
     hash=$(fingerprint_secret "$links")
-    write_config_metadata "$count" "$hash"
+    write_config_metadata "$count" "$hash" || return 1
     log_event INFO "config_exports refreshed count=${count} hash=${hash}"
 }
 
@@ -4917,7 +5174,7 @@ config_export_artifacts_present() {
 config_export_artifacts_match_current_uuid() {
     local current_uuid
     config_export_artifacts_present || return 1
-    current_uuid=$(awk 'NF {print; exit}' "$UUID_FILE" 2>/dev/null || true)
+    current_uuid=$(active_vless_uuid 2>/dev/null || true)
     [[ -n "$current_uuid" ]] || return 1
     awk -v prefix="vless://${current_uuid}@" '
         NF {
@@ -4931,7 +5188,7 @@ config_export_artifacts_match_current_uuid() {
 export_input_hash() {
     local input selected_routes uuid_fingerprint
     selected_routes=$(effective_export_route_ips | tr '\n' ',' 2>/dev/null || true)
-    uuid_fingerprint=$(fingerprint_secret "$(cat "$UUID_FILE" 2>/dev/null || true)")
+    uuid_fingerprint=$(fingerprint_secret "$(active_vless_uuid 2>/dev/null || true)")
     input=$(
         printf 'codespace=%s\n' "$CODESPACE_NAME"
         printf 'port_domain=%s\n' "$PORT_DOMAIN"
@@ -4941,7 +5198,7 @@ export_input_hash() {
         printf 'ws_port=%s\n' "$WS_PORT"
         printf 'max_links=%s\n' "$(safe_max_fallback_links)"
         printf 'ws_max_links=%s\n' "$(safe_ws_fallback_links)"
-        printf 'xhttp_mode=%s\n' "$(xhttp_mode_value)"
+        printf 'xhttp_mode=%s\n' "$(xhttp_config_mode)"
         printf 'domain_export=%s\n' "$(domain_link_export_enabled && printf true || printf false)"
         printf 'ws_enabled=%s\n' "$(ws_fallback_enabled && printf true || printf false)"
         printf 'ws_front=%s\n' "$(ws_front_domain_value 2>/dev/null || true)"
@@ -4953,7 +5210,7 @@ export_input_hash() {
 }
 
 _refresh_config_exports_impl() {
-    [[ -f "$UUID_FILE" ]] || { clear_config_exports "missing_uuid"; return 1; }
+    active_vless_uuid >/dev/null 2>&1 || { clear_config_exports "missing_uuid"; return 1; }
     local link_array=() backup_dir="" artifact name
     mapfile -t link_array < <(generate_ordered_links | awk 'NF' || true)
     if ((${#link_array[@]} == 0)); then
@@ -5006,7 +5263,7 @@ refresh_config_exports() {
 }
 
 _refresh_config_exports_if_changed_impl() {
-    [[ -f "$UUID_FILE" ]] || { clear_config_exports "missing_uuid"; return 1; }
+    active_vless_uuid >/dev/null 2>&1 || { clear_config_exports "missing_uuid"; return 1; }
     local new_hash old_hash
     new_hash=$(export_input_hash)
     old_hash=$(cat "$EXPORT_INPUT_HASH_FILE" 2>/dev/null || true)
@@ -6096,21 +6353,25 @@ fi
 
 if [[ "${1:-}" == "--silent-start" ]]; then
     if [[ ! -f "$CONFIG_FILE" ]]; then
-        write_boot_status "no_config" "silent_start" "No config exists yet; open the panel and generate one." "0" "0"
+        write_boot_status "no_config" "silent_start" "No config exists yet; open the panel and generate one." "0" "0" \
+            || log_event WARN "boot_status nonfatal_write_failed reason=silent_start"
     elif prepare_headless_runtime "silent_start" >/dev/null 2>&1; then
         start_background_tasks || log_event WARN "headless_start reason=silent_start supervisor_start_deferred"
         if wait_for_xhttp_route_ready "silent_start_verify" "$G2RAY_SILENT_START_VERIFY_SEC" >/dev/null 2>&1; then
             read -r _boot_code _boot_ms _boot_reason < <(xhttp_probe_metrics external)
-            write_boot_status "ready" "silent_start" "Xray listener and the Codespaces route are usable." "${_boot_code:-0}" "${_boot_ms:-0}"
+            write_boot_status "ready" "silent_start" "Xray listener and the Codespaces route are usable." "${_boot_code:-0}" "${_boot_ms:-0}" \
+                || log_event WARN "boot_status nonfatal_write_failed reason=silent_start"
         else
             read -r _boot_code _boot_ms _boot_reason < <(xhttp_probe_metrics external)
-            write_boot_status "route_settling" "silent_start" "Xray listener is ready; Codespaces route recovery now continues asynchronously in the background." "${_boot_code:-0}" "${_boot_ms:-0}"
+            write_boot_status "route_settling" "silent_start" "Xray listener is ready; Codespaces route recovery now continues asynchronously in the background." "${_boot_code:-0}" "${_boot_ms:-0}" \
+                || log_event WARN "boot_status nonfatal_write_failed reason=silent_start"
             start_headless_route_settling_monitor "silent_start" \
                 || log_event WARN "headless_start reason=silent_start route_settle_start_deferred"
         fi
     else
         read -r _boot_code _boot_ms _boot_reason < <(xhttp_probe_metrics external)
-        write_boot_status "needs_attention" "silent_start" "Xray listener could not start; background route settling was not started." "${_boot_code:-0}" "${_boot_ms:-0}"
+        write_boot_status "needs_attention" "silent_start" "Xray listener could not start; background route settling was not started." "${_boot_code:-0}" "${_boot_ms:-0}" \
+            || log_event WARN "boot_status nonfatal_write_failed reason=silent_start"
         start_background_tasks || log_event WARN "headless_start reason=silent_start supervisor_start_deferred"
         exit 1
     fi
@@ -6130,7 +6391,7 @@ trap 'exit 143' TERM
 
 check_for_updates "$@"
 ensure_runtime_ready "interactive_attach" >/dev/null 2>&1 || true
-start_background_tasks
+start_background_tasks || log_event WARN "background supervisor_start_deferred reason=interactive_attach"
 enable_anti_sleep
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
@@ -6277,7 +6538,8 @@ while true; do
             fi
             _VLESS_PRIMARY="${_CONFIG_LINKS[0]:-}"
             [[ -z "$_VLESS_PRIMARY" ]] && { echo -e "  ${RED}✖ Error generating link.${NC}"; sleep 2; continue; }
-            write_config_exports_from_links "${_CONFIG_LINKS[@]}" >/dev/null 2>&1 || true
+            with_file_lock "$EXPORT_LOCK_FILE" 45 write_config_exports_from_links "${_CONFIG_LINKS[@]}" >/dev/null 2>&1 \
+                || log_event WARN "config_exports view_write_failed"
             refresh_screen
             echo -e "  ${RED}● Configs & QR Codes${NC}"
             echo -e "  ${DIM}Raw links are printed without color codes and saved locally to:${NC}"

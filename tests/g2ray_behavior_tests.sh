@@ -64,6 +64,7 @@ reset_runtime_paths() {
     SESSION_BYTES_FILE="$DATA_DIR/session_bytes.json"
     TOTAL_UPTIME_FILE="$DATA_DIR/total_uptime_seconds"
     SESSION_START_FILE="$DATA_DIR/session_start_epoch"
+    QUOTA_CYCLE_FILE="$DATA_DIR/quota_cycle.txt"
     LOG_FILE="$LOG_DIR/g2ray.log"
     STRUCTURED_LOG_FILE="$LOG_DIR/g2ray-events.jsonl"
     DIAGNOSTIC_LOG_FILE="$LOG_DIR/g2ray-diagnostics.log"
@@ -105,6 +106,15 @@ reset_runtime_paths() {
     unset G2RAY_LOW_OVERHEAD G2RAY_LATENCY_FOCUS G2RAY_PERFORMANCE_PROFILE G2RAY_EXPORT_DOMAIN_LINK G2RAY_XHTTP_EXTRA_JSON G2RAY_XHTTP_MODE G2RAY_ENABLE_WS_FALLBACK G2RAY_WS_PORT G2RAY_WS_MAX_FALLBACK_LINKS G2RAY_BENCH_MOCK G2RAY_BENCH_ISOLATED G2RAY_PORT_FORWARDING_DOMAIN GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN
 }
 
+write_test_vless_config() {
+    local uuid="${1:-}"
+    [[ -n "$uuid" ]] || uuid=$(awk 'NF {print; exit}' "$UUID_FILE" 2>/dev/null || true)
+    [[ -n "$uuid" ]] || uuid="11111111-2222-4333-8444-555555555555"
+    cat > "$CONFIG_FILE" <<JSON
+{"inbounds":[{"tag":"vless-in","protocol":"vless","settings":{"clients":[{"id":"${uuid}"}]},"streamSettings":{"network":"xhttp","xhttpSettings":{"path":"/","mode":"packet-up"}}}]}
+JSON
+}
+
 export CODESPACE_NAME="behavior-space"
 export XRAY_PORT="443"
 export G2RAY_SOURCE_ONLY=1
@@ -112,6 +122,7 @@ export G2RAY_DATA_DIR="$TMP_ROOT/bootstrap-data"
 export G2RAY_LOG_DIR="$TMP_ROOT/bootstrap-logs"
 source "$SCRIPT"
 ORIGINAL_RUN_GH="$(declare -f run_gh)"
+ORIGINAL_XRAY_RUNNING="$(declare -f xray_running)"
 reset_runtime_paths
 
 test_port_visibility_is_throttled() {
@@ -409,6 +420,48 @@ test_background_start_reports_lock_failure_without_live_supervisor() {
     pass "background startup reports lock-busy failure when no live supervisor is confirmed"
 }
 
+test_background_start_cleans_up_when_pid_state_cannot_be_committed() {
+    (
+        reset_runtime_paths
+        local fixture="$TMP_ROOT/background-supervisor-fixture.sh" rc=0 bg_pid=""
+        printf '#!/usr/bin/env bash\nexec sleep 30\n' > "$fixture"
+        SCRIPT_PATH="$fixture"
+        _atomic_write() {
+            local file="$1" content="$2"
+            [[ "$file" != "$BG_TASKS_PID" ]] || return 1
+            printf '%s\n' "$content" > "$file"
+        }
+
+        set +e
+        start_background_tasks >/dev/null 2>&1
+        rc=$?
+        set -e
+        bg_pid=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
+        if [[ "$bg_pid" =~ ^[0-9]+$ ]] && kill -0 "$bg_pid" 2>/dev/null; then
+            kill "$bg_pid" 2>/dev/null || true
+            wait "$bg_pid" 2>/dev/null || true
+        fi
+
+        [[ "$rc" -ne 0 ]] || fail "background startup reported success after its PID state write failed"
+        [[ ! -e "$BG_TASKS_PID" && ! -e "$BG_TASKS_TOKEN_FILE" && ! -e "$BG_TASKS_VERSION_FILE" ]] \
+            || fail "background startup left partial ownership state after its PID write failed"
+        [[ ! -d "$BG_TASKS_LOCK_DIR" ]] \
+            || fail "background startup left its startup lock held after state commit failure"
+    )
+    pass "background startup cleans up after ownership state commit failure"
+}
+
+test_background_heartbeat_reports_atomic_write_failure() {
+    (
+        reset_runtime_paths
+        _atomic_write() { return 1; }
+        if write_background_supervisor_heartbeat; then
+            fail "background heartbeat masked its state write failure"
+        fi
+    )
+    pass "background heartbeat reports atomic state write failures"
+}
+
 test_stale_temp_sweep_removes_only_old_owned_artifacts() {
     reset_runtime_paths
     local old_probe="$DATA_DIR/route_probe.ABC123"
@@ -641,6 +694,7 @@ JSON
     [[ -s "$ACTIVE_TRAFFIC_STAMP_FILE" ]] || fail "active traffic stamp was not written"
     active_tunnel_recent || fail "active_tunnel_recent did not recognize fresh traffic"
     unset -f sudo xray_running
+    eval "$ORIGINAL_XRAY_RUNNING"
     pass "active traffic is marked when Xray counters increase"
 }
 
@@ -694,7 +748,7 @@ test_xhttp_external_probe_uses_strict_tls_by_default() {
     reset_runtime_paths
     PORT_DOMAIN="behavior-space-443.app.github.dev"
     XRAY_PORT=443
-    printf '{}\n' > "$CONFIG_FILE"
+    write_test_vless_config
     local args_file="$TMP_ROOT/curl-strict-tls-args.txt"
     curl() {
         printf '%s\n' "$*" > "$args_file"
@@ -865,7 +919,7 @@ test_route_health_refresh_preserves_cache_when_all_candidates_are_cooled_down() 
 
 test_route_health_refresh_preserves_cache_when_all_probes_are_unusable() {
     reset_runtime_paths
-    printf '{}\n' > "$CONFIG_FILE"
+    write_test_vless_config
     PORT_DOMAIN="behavior-space-443.app.github.dev"
     ROUTE_MONITOR_MAX_CANDIDATES=2
     ROUTE_PROBE_CONCURRENCY=2
@@ -892,7 +946,7 @@ test_route_health_refresh_preserves_cache_when_all_probes_are_unusable() {
 
 test_route_health_refresh_mixes_provider_candidates_before_stale_cache_cap() {
     reset_runtime_paths
-    printf '{}\n' > "$CONFIG_FILE"
+    write_test_vless_config
     PORT_DOMAIN="behavior-space-443.app.github.dev"
     ROUTE_MONITOR_MAX_CANDIDATES=3
     ROUTE_PROBE_CONCURRENCY=1
@@ -921,7 +975,7 @@ test_route_health_refresh_mixes_provider_candidates_before_stale_cache_cap() {
 
 test_route_health_refresh_does_not_let_unusable_cache_starve_builtins() {
     reset_runtime_paths
-    printf '{}\n' > "$CONFIG_FILE"
+    write_test_vless_config
     PORT_DOMAIN="behavior-space-443.app.github.dev"
     DEFAULT_FALLBACK_IPS="20.0.0.9"
     G2RAY_EXTRA_FALLBACK_IPS=""
@@ -1260,6 +1314,15 @@ test_boot_status_helpers_record_silent_start_result() {
     pass "boot status helpers persist readable startup state"
 }
 
+test_boot_status_reports_state_write_failure() {
+    reset_runtime_paths
+    BOOT_STATUS_FILE="$TMP_ROOT/missing-boot-parent/boot_status.json"
+    if write_boot_status "ready" "test" "message" "200" "1" >/dev/null 2>&1; then
+        fail "boot status helper masked its state write failure"
+    fi
+    pass "boot status helper reports state write failures"
+}
+
 test_generate_config_replaces_stale_no_config_boot_status() {
     reset_runtime_paths
     (
@@ -1282,6 +1345,30 @@ test_generate_config_replaces_stale_no_config_boot_status() {
         ! boot_status_summary | grep -Fq 'no_config' || fail "diagnostics would still show stale no_config boot status"
     )
     pass "generate_config replaces stale no-config boot status"
+}
+
+test_generate_config_keeps_success_when_boot_status_write_fails() {
+    reset_runtime_paths
+    (
+        CODESPACE_NAME="behavior-space"
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        XRAY_PORT=443
+        PERFORMANCE_PROFILE=balanced
+        uuidgen() { printf '11111111-2222-3333-4444-555555555555\n'; }
+        start_xray() { return 0; }
+        wait_for_port() { return 0; }
+        ensure_codespace_port_public() { return 0; }
+        refresh_config_exports() { return 0; }
+        xray_validate_config_file() { return 0; }
+        xhttp_probe_metrics() { printf '200 12 ready\n'; }
+        write_boot_status() { return 1; }
+
+        generate_config >/dev/null 2>&1 \
+            || fail "generate_config reported failure after its engine started because diagnostic boot state could not be written"
+        [[ -s "$CONFIG_FILE" && -s "$UUID_FILE" ]] \
+            || fail "generate_config lost committed runtime state after nonfatal boot-status failure"
+    )
+    pass "generate_config treats boot-status persistence as nonfatal after a successful start"
 }
 
 test_generated_and_upgraded_configs_do_not_block_page_assets_as_ads() {
@@ -1343,6 +1430,135 @@ JSON
     [[ "$(jq -r '.inbounds[0].settings.clients[0].id' "$CONFIG_FILE")" == "11111111-2222-4333-8444-555555555555" ]] \
         || fail "existing config migration changed the active UUID"
     pass "existing config upgrade preserves UUID and restores safe handshake floor"
+}
+
+test_start_xray_restores_config_when_migrated_config_is_invalid() {
+    reset_runtime_paths
+    (
+        cat > "$CONFIG_FILE" <<'JSON'
+{
+  "dns": {"servers": ["localhost"]},
+  "policy": {"levels": {"0": {"handshake": 3}}},
+  "inbounds": [{"sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}}],
+  "routing": {"domainStrategy": "IPIfNonMatch", "rules": []}
+}
+JSON
+        cp "$CONFIG_FILE" "$CONFIG_FILE.before"
+        local stop_calls=0
+        xray_validate_config() { return 1; }
+        stop_xray() {
+            stop_calls=$((stop_calls + 1))
+            return 0
+        }
+
+        if start_xray >/dev/null 2>&1; then
+            fail "start_xray accepted a migrated config that failed validation"
+        fi
+        cmp -s "$CONFIG_FILE.before" "$CONFIG_FILE" \
+            || fail "start_xray left the invalid migrated config on disk"
+        [[ "$stop_calls" -eq 0 ]] \
+            || fail "start_xray stopped the existing engine before validating its migrated config"
+    )
+    pass "start_xray restores the previous config when migration validation fails"
+}
+
+test_start_xray_restores_config_when_previous_engine_cannot_stop() {
+    reset_runtime_paths
+    (
+        cat > "$CONFIG_FILE" <<'JSON'
+{
+  "dns": {"servers": ["localhost"]},
+  "policy": {"levels": {"0": {"handshake": 3}}},
+  "inbounds": [{"sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}}],
+  "routing": {"domainStrategy": "IPIfNonMatch", "rules": []}
+}
+JSON
+        cp "$CONFIG_FILE" "$CONFIG_FILE.before"
+        xray_validate_config() { return 0; }
+        stop_xray() { return 1; }
+
+        if start_xray >/dev/null 2>&1; then
+            fail "start_xray reported success when the previous engine could not stop"
+        fi
+        cmp -s "$CONFIG_FILE.before" "$CONFIG_FILE" \
+            || fail "start_xray left migrated disk state under the still-running previous engine"
+    )
+    pass "start_xray restores disk state when the previous engine cannot stop"
+}
+
+test_start_xray_cleans_up_when_pid_state_cannot_be_committed() {
+    reset_runtime_paths
+    (
+        write_test_vless_config
+        local sudo_calls="$TMP_ROOT/start-xray-sudo-calls.txt" rc=0
+        : > "$sudo_calls"
+        xray_validate_config() { return 0; }
+        upgrade_config_dns() { return 0; }
+        stop_xray() { return 0; }
+        _atomic_write() {
+            local file="$1" content="$2"
+            [[ "$file" != "$XRAY_PID_FILE" ]] || return 1
+            printf '%s\n' "$content" > "$file"
+        }
+        sudo() {
+            printf '%s\n' "$*" >> "$sudo_calls"
+            if [[ "${1:-}" == "bash" ]]; then
+                printf '424242\n'
+                return 0
+            fi
+            if [[ "${1:-}" == "kill" && "${2:-}" == "-0" ]]; then
+                return 1
+            fi
+            return 0
+        }
+
+        set +e
+        start_xray >/dev/null 2>&1
+        rc=$?
+        set -e
+
+        [[ "$rc" -ne 0 ]] || fail "start_xray reported success after its PID state write failed"
+        [[ ! -e "$XRAY_PID_FILE" ]] || fail "start_xray left a partial PID file after state commit failure"
+        grep -Fq 'kill 424242' "$sudo_calls" \
+            || fail "start_xray left its newly launched process running after PID state commit failure"
+    )
+    pass "start_xray cleans up a launch whose PID state cannot be committed"
+}
+
+test_session_uptime_recovers_from_corrupt_state() {
+    reset_runtime_paths
+    printf 'not-an-epoch\n' > "$SESSION_START_FILE"
+    printf 'not-a-total\n' > "$TOTAL_UPTIME_FILE"
+    local rc=0 total session
+    set +e
+    (save_session_uptime)
+    rc=$?
+    set -e
+    [[ "$rc" -eq 0 ]] || fail "save_session_uptime crashed on corrupt persisted state"
+    total=$(cat "$TOTAL_UPTIME_FILE" 2>/dev/null || true)
+    session=$(cat "$SESSION_START_FILE" 2>/dev/null || true)
+    [[ "$total" =~ ^[0-9]+$ && "$session" =~ ^[0-9]+$ ]] \
+        || fail "save_session_uptime did not repair corrupt persisted state"
+    pass "session uptime safely repairs corrupt persisted state"
+}
+
+test_quota_display_recovers_from_corrupt_state() {
+    reset_runtime_paths
+    printf 'not-an-epoch\n' > "$SESSION_START_FILE"
+    printf 'not-a-total\n' > "$TOTAL_UPTIME_FILE"
+    local output rc=0 total session
+    set +e
+    output=$(estimate_quota 2>&1)
+    rc=$?
+    set -e
+    [[ "$rc" -eq 0 ]] || fail "estimate_quota crashed on corrupt persisted state"
+    grep -Fq 'Total Used' <<< "$output" \
+        || fail "estimate_quota did not render after repairing corrupt state"
+    total=$(cat "$TOTAL_UPTIME_FILE" 2>/dev/null || true)
+    session=$(cat "$SESSION_START_FILE" 2>/dev/null || true)
+    [[ "$total" =~ ^[0-9]+$ && "$session" =~ ^[0-9]+$ ]] \
+        || fail "estimate_quota did not repair corrupt persisted state"
+    pass "quota display safely repairs corrupt persisted state"
 }
 
 test_generate_config_refreshes_expired_route_cache_before_exports() {
@@ -1429,8 +1645,11 @@ test_generate_config_rolls_back_when_valid_candidate_cannot_start() {
         PORT_DOMAIN="behavior-space-443.app.github.dev"
         XRAY_PORT=443
         PERFORMANCE_PROFILE=balanced
-        printf 'old-uuid\n' > "$UUID_FILE"
-        printf '{"old":true}\n' > "$CONFIG_FILE"
+        local old_uuid="11111111-2222-4333-8444-555555555555"
+        printf '%s\n' "$old_uuid" > "$UUID_FILE"
+        cat > "$CONFIG_FILE" <<JSON
+{"old":true,"inbounds":[{"protocol":"vless","settings":{"clients":[{"id":"${old_uuid}"}]}}]}
+JSON
         uuidgen() { printf '33333333-4444-4555-8666-777777777777\n'; }
         xray_validate_config_file() { return 0; }
         start_xray() { return 1; }
@@ -1441,7 +1660,7 @@ test_generate_config_rolls_back_when_valid_candidate_cannot_start() {
             fail "generate_config succeeded despite failed engine start"
         fi
         grep -Fq '"old":true' "$CONFIG_FILE" || fail "failed start did not restore previous config"
-        grep -Fxq 'old-uuid' "$UUID_FILE" || fail "failed start did not restore previous UUID"
+        grep -Fxq "$old_uuid" "$UUID_FILE" || fail "failed start did not restore previous UUID"
     )
     pass "generate_config rolls back when a valid candidate cannot start"
 }
@@ -1487,6 +1706,18 @@ test_config_exports_report_write_failure() {
     [[ ! -e "$SUBSCRIPTION_FILE" ]] \
         || fail "config export writer continued to write subscription after mobile export failure"
     pass "config exports report write failures instead of masking them"
+}
+
+test_config_exports_report_metadata_write_failure() {
+    reset_runtime_paths
+    CONFIG_META_FILE="$TMP_ROOT/missing-meta-parent/configs-meta.json"
+
+    if write_config_exports_from_links "vless://example-one" >/dev/null 2>&1; then
+        fail "config export writer masked metadata write failure"
+    fi
+    [[ ! -e "$CONFIG_META_FILE" ]] \
+        || fail "config export writer unexpectedly created metadata in a missing parent"
+    pass "config exports report metadata write failures"
 }
 
 test_refresh_config_exports_reports_write_failure() {
@@ -1559,7 +1790,7 @@ test_disabled_domain_link_retains_last_exports_when_no_ip_is_available() {
     GITHUB_USER="tester"
     MAX_FALLBACK_LINKS=2
     printf '00000000-0000-4000-8000-000000000001\n' > "$UUID_FILE"
-    printf '{}\n' > "$CONFIG_FILE"
+    write_test_vless_config
     printf 'vless://00000000-0000-4000-8000-000000000001@behavior-space-443.app.github.dev:443#stale\n' > "$MOBILE_CONFIG_FILE"
     printf 'dmxlc3M6Ly8wMDAwMDAwMC0wMDAwLTQwMDAtODAwMC0wMDAwMDAwMDAwMDFAZXhhbXBsZS5pbnZhbGlkCg==' > "$SUBSCRIPTION_FILE"
     printf '{}\n' > "$CONFIG_META_FILE"
@@ -1585,7 +1816,7 @@ test_no_link_refresh_clears_exports_from_a_previous_uuid() {
     XRAY_PORT=443
     GITHUB_USER="tester"
     printf '11111111-2222-4333-8444-555555555555\n' > "$UUID_FILE"
-    printf '{}\n' > "$CONFIG_FILE"
+    write_test_vless_config
     printf 'vless://00000000-0000-4000-8000-000000000001@behavior-space-443.app.github.dev:443#old\n' > "$MOBILE_CONFIG_FILE"
     printf 'b2xkCg==' > "$SUBSCRIPTION_FILE"
     printf '{}\n' > "$CONFIG_META_FILE"
@@ -1612,7 +1843,7 @@ test_failed_export_does_not_restore_exports_from_a_previous_uuid() {
     PORT_DOMAIN="behavior-space-443.app.github.dev"
     XRAY_PORT=443
     printf '11111111-2222-4333-8444-555555555555\n' > "$UUID_FILE"
-    printf '{}\n' > "$CONFIG_FILE"
+    write_test_vless_config
     printf 'vless://00000000-0000-4000-8000-000000000001@behavior-space-443.app.github.dev:443#old\n' > "$MOBILE_CONFIG_FILE"
     printf 'b2xkCg==' > "$SUBSCRIPTION_FILE"
     printf '{}\n' > "$CONFIG_META_FILE"
@@ -1633,25 +1864,34 @@ test_failed_export_does_not_restore_exports_from_a_previous_uuid() {
 }
 
 test_ordered_links_reuse_fallback_ips_for_xhttp_and_ws_exports() {
-    reset_runtime_paths
-    PORT_DOMAIN="behavior-space-443.app.github.dev"
-    WS_PORT_DOMAIN="behavior-space-8443.app.github.dev"
-    GITHUB_USER="tester"
-    printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
-    printf 'enabled\n' > "$WS_FALLBACK_FILE"
-    local calls_file="$TMP_ROOT/usable-fallback-calls.txt"
-    : > "$calls_file"
-    usable_fallback_ips() {
-        printf 'call\n' >> "$calls_file"
-        printf '20.0.0.1\n20.0.0.2\n'
-    }
+    (
+        reset_runtime_paths
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        WS_PORT_DOMAIN="behavior-space-8443.app.github.dev"
+        GITHUB_USER="tester"
+        printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
+        printf 'enabled\n' > "$WS_FALLBACK_FILE"
+        local calls_file="$TMP_ROOT/usable-fallback-calls.txt" uuid_calls_file="$TMP_ROOT/active-uuid-calls.txt"
+        : > "$calls_file"
+        : > "$uuid_calls_file"
+        usable_fallback_ips() {
+            printf 'call\n' >> "$calls_file"
+            printf '20.0.0.1\n20.0.0.2\n'
+        }
+        active_vless_uuid() {
+            printf 'call\n' >> "$uuid_calls_file"
+            printf '11111111-2222-3333-4444-555555555555\n'
+        }
 
-    local links calls
-    links="$(generate_ordered_links)"
-    calls=$(wc -l < "$calls_file" | tr -d ' ')
-    [[ "$calls" -eq 1 ]] || fail "usable_fallback_ips was called $calls times for one ordered export"
-    [[ "$links" == *"@20.0.0.1:443"* && "$links" == *"-ws-ip1"* ]] \
-        || fail "ordered links did not include both XHTTP and WS fallback links from the shared list"
+        local links calls uuid_calls
+        links="$(generate_ordered_links)"
+        calls=$(wc -l < "$calls_file" | tr -d ' ')
+        uuid_calls=$(wc -l < "$uuid_calls_file" | tr -d ' ')
+        [[ "$calls" -eq 1 ]] || fail "usable_fallback_ips was called $calls times for one ordered export"
+        [[ "$uuid_calls" -eq 1 ]] || fail "active UUID was parsed $uuid_calls times for one ordered export"
+        [[ "$links" == *"@20.0.0.1:443"* && "$links" == *"-ws-ip1"* ]] \
+            || fail "ordered links did not include both XHTTP and WS fallback links from the shared list"
+    )
     pass "ordered exports reuse one fallback route list for XHTTP and WS"
 }
 
@@ -1665,7 +1905,7 @@ test_refresh_config_exports_if_changed_skips_unchanged_inputs() {
     WS_PORT_DOMAIN="behavior-space-8443.app.github.dev"
     GITHUB_USER="tester"
     printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
-    printf '{}\n' > "$CONFIG_FILE"
+    write_test_vless_config
     printf '2026-01-01T00:00:00Z\t20.0.0.1\t200\t10\ttrue\tcache\tready\n' > "$ROUTE_HEALTH_FILE"
     local calls_file="$TMP_ROOT/export-calls.txt"
     : > "$calls_file"
@@ -1692,7 +1932,7 @@ test_refresh_config_exports_updates_input_hash_after_direct_refresh() {
     PORT_DOMAIN="behavior-space-443.app.github.dev"
     GITHUB_USER="tester"
     printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
-    printf '{}\n' > "$CONFIG_FILE"
+    write_test_vless_config
     printf 'old-hash\n' > "$EXPORT_INPUT_HASH_FILE"
     generate_ordered_links() {
         printf 'vless://example@20.0.0.1:443?encryption=none#one\n'
@@ -1737,14 +1977,16 @@ test_generated_links_follow_configured_xhttp_path() {
     CONFIG_META_FILE="$BASE_DIR/configs-meta.json"
     PORT_DOMAIN="behavior-space-443.app.github.dev"
     GITHUB_USER="tester"
-    jq() { printf '/custom\n'; }
-    printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
+    printf '11111111-2222-4333-8444-555555555555\n' > "$UUID_FILE"
     cat > "$CONFIG_FILE" <<'JSON'
 {
   "inbounds": [
     {
       "tag": "vless-in",
+      "protocol": "vless",
+      "settings": {"clients": [{"id": "11111111-2222-4333-8444-555555555555"}]},
       "streamSettings": {
+        "network": "xhttp",
         "xhttpSettings": {
           "path": "/custom"
         }
@@ -1756,7 +1998,6 @@ JSON
 
     local link
     link="$(generate_link_for_address "20.0.0.1" "-ip1")"
-    unset -f jq
     [[ "$link" == *"path=%2Fcustom"* ]] \
         || fail "generated VLESS link did not use configured XHTTP path: $link"
     write_config_exports_from_links "$link" >/dev/null
@@ -1804,9 +2045,9 @@ test_generated_links_use_active_config_mode_over_env_override() {
     PORT_DOMAIN="behavior-space-443.app.github.dev"
     GITHUB_USER="tester"
     CODESPACES_EDGE_PORT=443
-    printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
+    printf '11111111-2222-4333-8444-555555555555\n' > "$UUID_FILE"
     cat > "$CONFIG_FILE" <<'JSON'
-{"inbounds":[{"tag":"vless-in","streamSettings":{"xhttpSettings":{"path":"/","mode":"stream-one"}}}]}
+{"inbounds":[{"tag":"vless-in","protocol":"vless","settings":{"clients":[{"id":"11111111-2222-4333-8444-555555555555"}]},"streamSettings":{"network":"xhttp","xhttpSettings":{"path":"/","mode":"stream-one"}}}]}
 JSON
     printf 'packet-up\n' > "$XHTTP_MODE_FILE"
     G2RAY_XHTTP_MODE="stream-up"
@@ -1823,7 +2064,7 @@ test_custom_xhttp_extra_json_is_validated() {
     PORT_DOMAIN="behavior-space-443.app.github.dev"
     GITHUB_USER="tester"
     printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
-    printf '{}\n' > "$CONFIG_FILE"
+    write_test_vless_config
 
     local link
     link="$(generate_link_for_address "20.0.0.1" "-ip1")"
@@ -1851,7 +2092,7 @@ test_websocket_fallback_is_advanced_opt_in() {
     WS_PORT_DOMAIN="behavior-space-8443.app.github.dev"
     GITHUB_USER="tester"
     printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
-    printf '{}\n' > "$CONFIG_FILE"
+    write_test_vless_config
 
     if ws_fallback_enabled; then
         fail "WebSocket fallback is enabled by default"
@@ -1881,7 +2122,7 @@ test_websocket_fallback_exports_separate_alpn_variants() {
     G2RAY_EXPORT_DOMAIN_LINK=0
     WS_MAX_FALLBACK_LINKS=1
     printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
-    printf '{}\n' > "$CONFIG_FILE"
+    write_test_vless_config
     local original_usable_fallback_ips
     original_usable_fallback_ips="$(declare -f usable_fallback_ips)"
     usable_fallback_ips() { printf '20.0.0.5\n'; }
@@ -1920,7 +2161,7 @@ test_websocket_fallback_persists_from_panel_state() {
     WS_PORT_DOMAIN="behavior-space-8443.app.github.dev"
     GITHUB_USER="tester"
     printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
-    printf '{}\n' > "$CONFIG_FILE"
+    write_test_vless_config
 
     enable_ws_fallback_mode
     unset G2RAY_ENABLE_WS_FALLBACK
@@ -1949,7 +2190,7 @@ test_websocket_front_domain_generates_cloudflare_link() {
     WS_PORT_DOMAIN="behavior-space-8443.app.github.dev"
     GITHUB_USER="tester"
     printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
-    printf '{}\n' > "$CONFIG_FILE"
+    write_test_vless_config
     local original_usable_fallback_ips
     original_usable_fallback_ips="$(declare -f usable_fallback_ips)"
     usable_fallback_ips() { printf '20.0.0.5\n'; }
@@ -2033,13 +2274,30 @@ test_config_metadata_sanitizes_invalid_max_fallback_links() {
 test_bench_json_reports_deterministic_budgets() {
     reset_runtime_paths
     local output bench_file bench_root command_output
+    local contract_config_ms=6000 contract_route_ms=5000 contract_export_ms=30000
+    local contract_doctor_ms=12000 contract_recover_ms=12000 contract_log_ms=16000
+    [[ "$(bench_budget_ms config_path_cache)" == "2500" ]] \
+        || fail "default config_path_cache benchmark budget changed"
+    [[ "$(bench_budget_ms route_ordering)" == "1500" ]] \
+        || fail "default route_ordering benchmark budget changed"
+    [[ "$(bench_budget_ms export_generation)" == "10000" ]] \
+        || fail "default export_generation benchmark budget changed"
+    [[ "$(bench_budget_ms doctor_json)" == "6000" ]] \
+        || fail "default doctor_json benchmark budget changed"
     [[ "$(bench_budget_ms recover_json_contract)" == "6000" ]] \
-        || fail "default recover_json_contract benchmark budget is not the portable 6000ms value"
+        || fail "default recover_json_contract benchmark budget changed"
+    [[ "$(bench_budget_ms log_event_cost)" == "8000" ]] \
+        || fail "default log_event_cost benchmark budget changed"
+    [[ "$(G2RAY_BENCH_BUDGET_CONFIG_PATH_MS=not-a-number bench_budget_ms config_path_cache)" == "2500" ]] \
+        || fail "invalid benchmark budget did not fall back to the default"
     if ! output="$(
         G2RAY_BENCH_MOCK=1 \
-        G2RAY_BENCH_BUDGET_EXPORT_MS=10000 \
-        G2RAY_BENCH_BUDGET_DOCTOR_MS=6000 \
-        G2RAY_BENCH_BUDGET_RECOVER_JSON_MS=6000 \
+        G2RAY_BENCH_BUDGET_CONFIG_PATH_MS="$contract_config_ms" \
+        G2RAY_BENCH_BUDGET_ROUTE_ORDERING_MS="$contract_route_ms" \
+        G2RAY_BENCH_BUDGET_EXPORT_MS="$contract_export_ms" \
+        G2RAY_BENCH_BUDGET_DOCTOR_MS="$contract_doctor_ms" \
+        G2RAY_BENCH_BUDGET_RECOVER_JSON_MS="$contract_recover_ms" \
+        G2RAY_BENCH_BUDGET_LOG_EVENT_MS="$contract_log_ms" \
         bench_json --mock
     )"; then
         printf '%s\n' "$output"
@@ -2070,9 +2328,12 @@ PY
     if ! (
         cd "$bench_root" && \
         env -u G2RAY_SOURCE_ONLY \
-            G2RAY_BENCH_BUDGET_EXPORT_MS=10000 \
-            G2RAY_BENCH_BUDGET_DOCTOR_MS=6000 \
-            G2RAY_BENCH_BUDGET_RECOVER_JSON_MS=6000 \
+            G2RAY_BENCH_BUDGET_CONFIG_PATH_MS="$contract_config_ms" \
+            G2RAY_BENCH_BUDGET_ROUTE_ORDERING_MS="$contract_route_ms" \
+            G2RAY_BENCH_BUDGET_EXPORT_MS="$contract_export_ms" \
+            G2RAY_BENCH_BUDGET_DOCTOR_MS="$contract_doctor_ms" \
+            G2RAY_BENCH_BUDGET_RECOVER_JSON_MS="$contract_recover_ms" \
+            G2RAY_BENCH_BUDGET_LOG_EVENT_MS="$contract_log_ms" \
             bash ./g2ray.sh bench --json --mock > "$command_output"
     ); then
         cat "$command_output" 2>/dev/null || true
@@ -2086,26 +2347,6 @@ with open(sys.argv[1], encoding="utf-8") as handle:
     data = json.load(handle)
 assert data["ok"] is True
 assert data["budgets_ok"] is True
-PY
-    if ! output="$(
-        G2RAY_BENCH_BUDGET_CONFIG_PATH_MS=not-a-number \
-        G2RAY_BENCH_BUDGET_EXPORT_MS=10000 \
-        G2RAY_BENCH_BUDGET_DOCTOR_MS=6000 \
-        G2RAY_BENCH_BUDGET_RECOVER_JSON_MS=6000 \
-        G2RAY_BENCH_MOCK=1 \
-        bench_json --mock
-    )"; then
-        printf '%s\n' "$output"
-        fail "bench_json failed while sanitizing invalid budget environment values"
-    fi
-    printf '%s\n' "$output" > "$bench_file"
-    python - "$bench_file" <<'PY' || fail "bench_json did not sanitize invalid budget environment values"
-import json, sys
-with open(sys.argv[1], encoding="utf-8") as handle:
-    data = json.load(handle)
-case = next(item for item in data["cases"] if item["name"] == "config_path_cache")
-assert case["budget_ms"] == 2500, case
-assert data["ok"] is True
 PY
     pass "bench --json reports deterministic performance budgets"
 }
@@ -2179,7 +2420,7 @@ test_panel_modes_apply_real_performance_profiles() {
     reset_runtime_paths
     local calls_file="$TMP_ROOT/profile-reapply-calls.txt"
     : > "$calls_file"
-    printf '{}\n' > "$CONFIG_FILE"
+    write_test_vless_config
     generate_config() {
         printf 'profile=%s effective=%s preserve=%s\n' \
             "$PERFORMANCE_PROFILE" "$(effective_performance_profile)" "${G2RAY_PRESERVE_UUID:-0}" >> "$calls_file"
@@ -2216,7 +2457,7 @@ test_switching_performance_modes_reapplies_once() {
     reset_runtime_paths
     local calls_file="$TMP_ROOT/profile-single-reapply-calls.txt"
     : > "$calls_file"
-    printf '{}\n' > "$CONFIG_FILE"
+    write_test_vless_config
     generate_config() {
         printf 'profile=%s effective=%s preserve=%s\n' \
             "$PERFORMANCE_PROFILE" "$(effective_performance_profile)" "${G2RAY_PRESERVE_UUID:-0}" >> "$calls_file"
@@ -2831,7 +3072,7 @@ test_support_bundle_marks_unreadable_optional_logs() {
 
 test_route_refresh_backoff_preserves_cache_without_probe_storms() {
     reset_runtime_paths
-    printf '{}\n' > "$CONFIG_FILE"
+    write_test_vless_config
     PORT_DOMAIN="behavior-space-443.app.github.dev"
     ROUTE_MONITOR_MAX_CANDIDATES=1
     ROUTE_PROBE_CONCURRENCY=1
@@ -2861,7 +3102,7 @@ test_route_refresh_backoff_preserves_cache_without_probe_storms() {
 
 test_stale_route_cache_is_not_exported_after_hard_age() {
     reset_runtime_paths
-    printf '{}\n' > "$CONFIG_FILE"
+    write_test_vless_config
     printf '2026-05-30T00:00:00Z\t20.0.0.1\t200\t50\ttrue\tdns\tready\n' > "$ROUTE_HEALTH_FILE"
     touch -d '7 hours ago' "$ROUTE_HEALTH_FILE"
     ROUTE_HEALTH_EXPORT_MAX_AGE_SEC=21600
@@ -2876,7 +3117,7 @@ test_stale_route_cache_is_not_exported_after_hard_age() {
 test_self_heal_defers_external_repairs_while_traffic_is_active() {
     (
         reset_runtime_paths
-        printf '{}\n' > "$CONFIG_FILE"
+        write_test_vless_config
         date +%s > "$ACTIVE_TRAFFIC_STAMP_FILE"
         ensure_codespace_port_public() { return 0; }
         xray_running() { return 0; }
@@ -2898,7 +3139,7 @@ test_self_heal_defers_external_repairs_while_traffic_is_active() {
 test_self_heal_keeps_failure_count_when_route_repair_fails() {
     (
         reset_runtime_paths
-        printf '{}\n' > "$CONFIG_FILE"
+        write_test_vless_config
         ensure_codespace_port_public() { return 0; }
         xray_running() { return 0; }
         xray_listener_ready() { return 0; }
@@ -2965,6 +3206,277 @@ test_post_start_propagates_silent_start_failure() {
     pass "post-start propagates silent-start failures"
 }
 
+test_generate_config_respects_runtime_lock_for_entire_transaction() {
+    reset_runtime_paths
+    (
+        CODESPACE_NAME="behavior-space"
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        XRAY_PORT=443
+        PERFORMANCE_PROFILE=balanced
+        RUNTIME_LOCK_WAIT_ATTEMPTS=1
+        local owner_pid rc=0
+        sleep 10 &
+        owner_pid=$!
+        mkdir -p "$RUNTIME_LOCK_DIR"
+        printf '%s\n' "$owner_pid" > "$RUNTIME_LOCK_DIR/pid"
+        uuidgen() { printf '77777777-8888-4999-8aaa-bbbbbbbbbbbb\n'; }
+        xray_validate_config_file() { return 0; }
+        start_xray() { return 0; }
+        wait_for_port() { return 0; }
+        ensure_codespace_port_public() { return 0; }
+        ensure_optional_ws_port_public() { return 0; }
+        ensure_route_cache_for_export() { return 0; }
+        refresh_config_exports() { return 0; }
+        xhttp_probe_metrics() { printf '200 12 ready\n'; }
+
+        set +e
+        generate_config >/dev/null 2>&1
+        rc=$?
+        set -e
+        kill "$owner_pid" 2>/dev/null || true
+        wait "$owner_pid" 2>/dev/null || true
+
+        [[ "$rc" -ne 0 ]] || fail "generate_config ignored a live runtime transaction lock"
+        [[ ! -e "$CONFIG_FILE" && ! -e "$UUID_FILE" ]] \
+            || fail "generate_config changed config state while another runtime transaction held the lock"
+    )
+    pass "generate_config holds the runtime lock for its entire transaction"
+}
+
+test_generate_config_failed_start_restores_previous_running_engine() {
+    reset_runtime_paths
+    (
+        CODESPACE_NAME="behavior-space"
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        XRAY_PORT=443
+        PERFORMANCE_PROFILE=balanced
+        local old_uuid="11111111-2222-4333-8444-555555555555"
+        printf '%s\n' "$old_uuid" > "$UUID_FILE"
+        cat > "$CONFIG_FILE" <<JSON
+{"old":true,"inbounds":[{"protocol":"vless","settings":{"clients":[{"id":"${old_uuid}"}]}}]}
+JSON
+        local engine_state="old" start_calls=0 stop_calls=0 wait_calls=0 rc=0
+        uuidgen() { printf '99999999-aaaa-4bbb-8ccc-dddddddddddd\n'; }
+        xray_validate_config_file() { return 0; }
+        start_xray() {
+            start_calls=$((start_calls + 1))
+            if (( start_calls == 1 )); then
+                engine_state="new"
+            elif grep -Fq '"old":true' "$CONFIG_FILE" && grep -Fxq "$old_uuid" "$UUID_FILE"; then
+                engine_state="old"
+            else
+                engine_state="wrong-config"
+            fi
+            return 0
+        }
+        wait_for_port() {
+            wait_calls=$((wait_calls + 1))
+            [[ "$engine_state" == "old" ]]
+        }
+        stop_xray() {
+            stop_calls=$((stop_calls + 1))
+            engine_state="stopped"
+            return 0
+        }
+        refresh_config_exports() { fail "failed config generation must not refresh exports"; }
+
+        set +e
+        generate_config >/dev/null 2>&1
+        rc=$?
+        set -e
+
+        [[ "$rc" -ne 0 ]] || fail "generate_config reported success after the new engine failed readiness"
+        grep -Fq '"old":true' "$CONFIG_FILE" || fail "failed start did not restore the previous config"
+        grep -Fxq "$old_uuid" "$UUID_FILE" || fail "failed start did not restore the previous UUID"
+        [[ "$stop_calls" -ge 1 ]] || fail "failed new engine was left running during rollback"
+        [[ "$start_calls" -eq 2 && "$wait_calls" -eq 2 && "$engine_state" == "old" ]] \
+            || fail "previous engine was not restarted after rollback (starts=$start_calls waits=$wait_calls state=$engine_state)"
+    )
+    pass "failed config start restores the previous running engine"
+}
+
+test_generate_config_preserves_old_engine_when_replacement_never_launches() {
+    reset_runtime_paths
+    (
+        CODESPACE_NAME="behavior-space"
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        XRAY_PORT=443
+        PERFORMANCE_PROFILE=balanced
+        local old_uuid="11111111-2222-4333-8444-555555555555"
+        printf '%s\n' "$old_uuid" > "$UUID_FILE"
+        cat > "$CONFIG_FILE" <<JSON
+{"old":true,"inbounds":[{"protocol":"vless","settings":{"clients":[{"id":"${old_uuid}"}]}}]}
+JSON
+        local start_calls=0 stop_calls=0 rc=0
+        uuidgen() { printf '99999999-aaaa-4bbb-8ccc-dddddddddddd\n'; }
+        xray_validate_config_file() { return 0; }
+        xray_running() { return 0; }
+        start_xray() {
+            start_calls=$((start_calls + 1))
+            START_XRAY_LAST_PHASE="previous_stop_failed"
+            return 1
+        }
+        wait_for_port() { fail "wait_for_port ran after start_xray failed before launch"; }
+        stop_xray() {
+            stop_calls=$((stop_calls + 1))
+            return 1
+        }
+
+        set +e
+        generate_config >/dev/null 2>&1
+        rc=$?
+        set -e
+
+        [[ "$rc" -ne 0 ]] || fail "failed replacement config unexpectedly reported success"
+        grep -Fq '"old":true' "$CONFIG_FILE" \
+            || fail "pre-launch failure did not restore the old engine's config"
+        grep -Fxq "$old_uuid" "$UUID_FILE" \
+            || fail "pre-launch failure did not restore the old engine's UUID"
+        [[ "$start_calls" -eq 1 ]] \
+            || fail "rollback tried to launch another engine even though the old engine was preserved"
+        [[ "$stop_calls" -eq 0 ]] \
+            || fail "rollback tried to stop the preserved old engine after the replacement never launched"
+    )
+    pass "pre-launch config failure preserves the still-running previous engine"
+}
+
+test_generate_config_rollback_keeps_runtime_available_when_uuid_cache_restore_fails() {
+    reset_runtime_paths
+    (
+        CODESPACE_NAME="behavior-space"
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        XRAY_PORT=443
+        PERFORMANCE_PROFILE=balanced
+        local old_uuid="11111111-2222-4333-8444-555555555555"
+        cat > "$CONFIG_FILE" <<JSON
+{
+  "inbounds": [{
+    "tag": "vless-in",
+    "protocol": "vless",
+    "settings": {"clients": [{"id": "${old_uuid}"}]},
+    "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/", "mode": "packet-up"}}
+  }]
+}
+JSON
+        printf '%s\n' "$old_uuid" > "$UUID_FILE"
+        local uuid_writes=0 start_calls=0 wait_calls=0 rc=0
+        uuidgen() { printf '99999999-aaaa-4bbb-8ccc-dddddddddddd\n'; }
+        xray_validate_config_file() { return 0; }
+        _atomic_write() {
+            local file="$1" content="$2" tmp
+            if [[ "$file" == "$UUID_FILE" ]]; then
+                uuid_writes=$((uuid_writes + 1))
+                (( uuid_writes == 1 )) || return 1
+            fi
+            tmp="${file}.test-write"
+            printf '%s\n' "$content" > "$tmp" && mv -f "$tmp" "$file"
+        }
+        start_xray() {
+            start_calls=$((start_calls + 1))
+            return 0
+        }
+        wait_for_port() {
+            wait_calls=$((wait_calls + 1))
+            (( wait_calls >= 2 ))
+        }
+        stop_xray() { return 0; }
+
+        set +e
+        generate_config >/dev/null 2>&1
+        rc=$?
+        set -e
+
+        [[ "$rc" -ne 0 ]] || fail "failed replacement config unexpectedly reported success"
+        [[ "$(config_vless_uuid)" == "$old_uuid" ]] \
+            || fail "rollback did not restore the previous config identity"
+        [[ ! -e "$UUID_FILE" ]] \
+            || fail "rollback kept a stale UUID cache after restoring that cache failed"
+        [[ "$(active_vless_uuid)" == "$old_uuid" ]] \
+            || fail "active UUID did not fall back to the restored config"
+        [[ "$start_calls" -eq 2 && "$wait_calls" -eq 2 ]] \
+            || fail "UUID cache failure prevented the previous engine from restarting"
+    )
+    pass "config rollback preserves runtime availability when UUID cache repair fails"
+}
+
+test_links_and_export_hash_use_active_config_uuid() {
+    reset_runtime_paths
+    (
+        local active_uuid="11111111-2222-4333-8444-555555555555"
+        local stale_uuid="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        CODESPACE_NAME="behavior-space"
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        CODESPACES_EDGE_PORT=443
+        printf '%s\n' "$stale_uuid" > "$UUID_FILE"
+        cat > "$CONFIG_FILE" <<JSON
+{
+  "inbounds": [{
+    "tag": "vless-in",
+    "protocol": "vless",
+    "settings": {"clients": [{"id": "${active_uuid}"}]},
+    "streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/", "mode": "packet-up"}}
+  }]
+}
+JSON
+        effective_export_route_ips() { printf '20.0.0.1\n'; }
+        local link before after
+        link=$(generate_link_for_address "20.0.0.1")
+        [[ "$link" == "vless://${active_uuid}@"* ]] \
+            || fail "generated link used stale uuid.txt instead of the active Xray config UUID"
+        before=$(export_input_hash)
+        jq --arg uuid "22222222-3333-4444-8555-666666666666" \
+            '(.inbounds[0].settings.clients[0].id) = $uuid' "$CONFIG_FILE" > "$CONFIG_FILE.next"
+        mv -f "$CONFIG_FILE.next" "$CONFIG_FILE"
+        after=$(export_input_hash)
+        [[ "$before" != "$after" ]] \
+            || fail "export cache hash ignored a UUID change in the active Xray config"
+    )
+    pass "links and export cache identity follow the active Xray config"
+}
+
+test_active_uuid_rejects_invalid_existing_config() {
+    reset_runtime_paths
+    (
+        local stale_uuid="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        printf '%s\n' "$stale_uuid" > "$UUID_FILE"
+        : > "$CONFIG_FILE"
+        if active_vless_uuid >/dev/null 2>&1; then
+            fail "active UUID fell back to stale uuid.txt while config.json was invalid"
+        fi
+        if generate_link_for_address "20.0.0.1" >/dev/null 2>&1; then
+            fail "link generation used stale uuid.txt while config.json was invalid"
+        fi
+    )
+    pass "invalid active config cannot export a stale UUID"
+}
+
+test_export_hash_tracks_active_config_xhttp_mode() {
+    reset_runtime_paths
+    (
+        printf '11111111-2222-4333-8444-555555555555\n' > "$UUID_FILE"
+        cat > "$CONFIG_FILE" <<'JSON'
+{
+  "inbounds": [{
+    "tag": "vless-in",
+    "protocol": "vless",
+    "settings": {"clients": [{"id": "11111111-2222-4333-8444-555555555555"}]},
+    "streamSettings": {"xhttpSettings": {"mode": "packet-up", "path": "/"}}
+  }]
+}
+JSON
+        G2RAY_XHTTP_MODE="packet-up"
+        effective_export_route_ips() { printf '20.0.0.1\n'; }
+        local before after
+        before=$(export_input_hash)
+        jq '(.inbounds[0].streamSettings.xhttpSettings.mode) = "stream-up"' "$CONFIG_FILE" > "$CONFIG_FILE.next"
+        mv "$CONFIG_FILE.next" "$CONFIG_FILE"
+        after=$(export_input_hash)
+        [[ "$before" != "$after" ]] \
+            || fail "export hash ignored the XHTTP mode loaded by the active config"
+    )
+    pass "export hash tracks the active config XHTTP mode"
+}
+
 test_port_visibility_is_throttled
 test_codespace_detection_uses_shared_environment_in_headless_ssh
 test_codespace_detection_uses_local_metadata_when_gh_is_unauthenticated
@@ -2977,6 +3489,8 @@ test_lifecycle_port_publish_forces_visibility_cache
 test_startup_port_publish_retries_until_forwarding_is_registered
 test_run_gh_sanitizes_invalid_timeout_env
 test_background_start_reports_lock_failure_without_live_supervisor
+test_background_start_cleans_up_when_pid_state_cannot_be_committed
+test_background_heartbeat_reports_atomic_write_failure
 test_stale_temp_sweep_removes_only_old_owned_artifacts
 test_logs_reset_when_script_code_changes
 test_cached_route_order_uses_reliability_then_average_latency
@@ -3008,6 +3522,13 @@ test_self_heal_keeps_failure_count_when_route_repair_fails
 test_port_listener_detection_does_not_require_sudo
 test_deadline_terminates_descendant_processes
 test_post_start_propagates_silent_start_failure
+test_generate_config_respects_runtime_lock_for_entire_transaction
+test_generate_config_failed_start_restores_previous_running_engine
+test_generate_config_preserves_old_engine_when_replacement_never_launches
+test_generate_config_rollback_keeps_runtime_available_when_uuid_cache_restore_fails
+test_links_and_export_hash_use_active_config_uuid
+test_active_uuid_rejects_invalid_existing_config
+test_export_hash_tracks_active_config_xhttp_mode
 test_route_preference_write_failures_return_failure
 test_pinned_route_is_a_durable_candidate_source
 test_cached_route_health_is_a_durable_candidate_source
@@ -3024,15 +3545,23 @@ test_usable_fallback_ips_keeps_cached_routes_without_opt_in
 test_usable_fallback_ips_never_runs_live_probe_fallback
 test_xhttp_config_path_is_cached_by_config_content
 test_boot_status_helpers_record_silent_start_result
+test_boot_status_reports_state_write_failure
 test_generate_config_replaces_stale_no_config_boot_status
+test_generate_config_keeps_success_when_boot_status_write_fails
 test_generated_and_upgraded_configs_do_not_block_page_assets_as_ads
 test_existing_config_upgrade_preserves_uuid_and_safe_handshake_floor
+test_start_xray_restores_config_when_migrated_config_is_invalid
+test_start_xray_restores_config_when_previous_engine_cannot_stop
+test_start_xray_cleans_up_when_pid_state_cannot_be_committed
+test_session_uptime_recovers_from_corrupt_state
+test_quota_display_recovers_from_corrupt_state
 test_generate_config_refreshes_expired_route_cache_before_exports
 test_generate_config_keeps_previous_config_when_candidate_validation_fails
 test_generate_config_candidate_file_keeps_json_suffix_for_xray_detection
 test_generate_config_rolls_back_when_valid_candidate_cannot_start
 test_config_exports_write_local_only_metadata
 test_config_exports_report_write_failure
+test_config_exports_report_metadata_write_failure
 test_refresh_config_exports_reports_write_failure
 test_config_exports_are_stable_client_artifacts
 test_domain_link_export_can_be_disabled_for_blocked_networks
