@@ -1414,8 +1414,10 @@ test_existing_config_upgrade_preserves_uuid_and_safe_handshake_floor() {
   "dns": {"servers": ["localhost"]},
   "policy": {"levels": {"0": {"handshake": 3, "connIdle": 900}}},
   "inbounds": [{
+    "tag": "vless-ws",
     "protocol": "vless",
     "settings": {"clients": [{"id": "11111111-2222-4333-8444-555555555555"}]},
+    "streamSettings": {"network": "ws", "wsSettings": {"path": "/ws"}},
     "sniffing": {"enabled": true, "destOverride": ["http", "tls"]}
   }],
   "outbounds": [{"tag": "direct", "protocol": "freedom"}],
@@ -1429,7 +1431,9 @@ JSON
         || fail "existing config migration did not restore the safe handshake floor"
     [[ "$(jq -r '.inbounds[0].settings.clients[0].id' "$CONFIG_FILE")" == "11111111-2222-4333-8444-555555555555" ]] \
         || fail "existing config migration changed the active UUID"
-    pass "existing config upgrade preserves UUID and restores safe handshake floor"
+    [[ "$(jq -r '.inbounds[0].streamSettings.wsSettings.heartbeatPeriod' "$CONFIG_FILE")" == "30" ]] \
+        || fail "existing config migration did not add the WebSocket idle heartbeat"
+    pass "existing config upgrade preserves UUID and restores safe handshake and WebSocket idle settings"
 }
 
 test_start_xray_restores_config_when_migrated_config_is_invalid() {
@@ -2280,6 +2284,8 @@ test_websocket_fallback_adds_config_and_public_port() {
         grep -Fq '"tag": "vless-ws"' "$CONFIG_FILE" || fail "WS fallback did not add vless-ws inbound"
         grep -Fq '"network": "ws"' "$CONFIG_FILE" || fail "WS fallback inbound is not WebSocket"
         grep -Fq '"path": "/ws"' "$CONFIG_FILE" || fail "WS fallback inbound does not use /ws path"
+        [[ "$(jq -r '.inbounds[] | select(.tag == "vless-ws") | .streamSettings.wsSettings.heartbeatPeriod' "$CONFIG_FILE")" == "30" ]] \
+            || fail "WS fallback inbound does not keep idle WebSocket sessions alive"
         grep -Fq '443:public' "$ports_file" || fail "primary XHTTP port was not made public"
         grep -Fq '8443:public' "$ports_file" || fail "WS fallback port was not made public"
     )

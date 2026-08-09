@@ -553,12 +553,16 @@ test_websocket_fallback_is_advanced_opt_in() {
         || fail 'script does not distinguish saved WS preference from generated config state'
     grep_fixed 'WS_PORT="${G2RAY_WS_PORT:-8443}"' "$SCRIPT" \
         || fail 'WebSocket fallback does not have a stable default port'
+    grep_fixed 'WS_HEARTBEAT_PERIOD_SEC=30' "$SCRIPT" \
+        || fail 'WebSocket fallback does not define a bounded idle heartbeat'
+    grep_fixed '.streamSettings.wsSettings.heartbeatPeriod) = $ws_heartbeat' "$SCRIPT" \
+        || fail 'existing WebSocket configs do not receive the idle heartbeat during safe migration'
     grep_fixed 'ws_fallback_enabled()' "$SCRIPT" \
         || fail 'script does not centralize WebSocket fallback enablement'
     grep_fixed '"network": "ws"' "$SCRIPT" \
         || fail 'generated config cannot add a WebSocket inbound'
-    grep_fixed '"wsSettings": { "path": "$(json_escape "$ws_path")" }' "$SCRIPT" \
-        || fail 'WebSocket fallback path is not explicit in generated config'
+    grep_fixed '"wsSettings": { "path": "$(json_escape "$ws_path")", "heartbeatPeriod": ${WS_HEARTBEAT_PERIOD_SEC} }' "$SCRIPT" \
+        || fail 'WebSocket fallback path and idle heartbeat are not explicit in generated config'
     grep_fixed 'generate_ws_link_for_address()' "$SCRIPT" \
         || fail 'script cannot generate WebSocket fallback links'
     grep_fixed 'generate_ws_front_link()' "$SCRIPT" \

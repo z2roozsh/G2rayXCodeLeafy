@@ -135,6 +135,9 @@ WS_PORT="${G2RAY_WS_PORT:-8443}"
 if [[ "$WS_PORT" == "$XRAY_PORT" ]]; then
     [[ "$XRAY_PORT" == "8443" ]] && WS_PORT=8444 || WS_PORT=8443
 fi
+# Keep the advanced WebSocket fallback alive through idle HTTP intermediaries.
+# XHTTP remains the primary transport; this only affects an enabled WS inbound.
+WS_HEARTBEAT_PERIOD_SEC=30
 CODESPACES_EDGE_PORT="${G2RAY_CODESPACES_EDGE_PORT:-443}"
 PORT_FORWARDING_DOMAIN="${G2RAY_PORT_FORWARDING_DOMAIN:-${GITHUB_CODESPACES_PORT_FORWARDING_DOMAIN:-app.github.dev}}"
 PORT_FORWARDING_DOMAIN="${PORT_FORWARDING_DOMAIN#https://}"
@@ -2857,7 +2860,7 @@ upgrade_config_dns() {
         log_event WARN "config_dns temp_create_failed"
         return 1
     }
-    if jq '
+    if jq --argjson ws_heartbeat "$WS_HEARTBEAT_PERIOD_SEC" '
       .dns = {
         "servers": ["localhost", "168.63.129.16", "1.1.1.1", "1.0.0.1", "8.8.8.8"],
         "queryStrategy": "UseIPv4",
@@ -2879,6 +2882,7 @@ upgrade_config_dns() {
             end
         )
       | (.inbounds[]? | select(.sniffing? and .sniffing.destOverride?) | .sniffing.destOverride) |= (map(select(. != "quic")))
+      | (.inbounds[]? | select(.tag == "vless-ws" and .streamSettings.wsSettings?) | .streamSettings.wsSettings.heartbeatPeriod) = $ws_heartbeat
       | (.policy.levels["0"].handshake) |=
           (if . == null or . < 4 then 4 else . end)
     ' "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
@@ -3691,7 +3695,7 @@ _generate_config_impl() {
       },
       "streamSettings": {
         "network": "ws", "security": "none",
-        "wsSettings": { "path": "$(json_escape "$ws_path")" },
+        "wsSettings": { "path": "$(json_escape "$ws_path")", "heartbeatPeriod": ${WS_HEARTBEAT_PERIOD_SEC} },
         "sockopt": { "tcpKeepAliveInterval": ${TCP_KEEPALIVE_INTERVAL_SEC}, "tcpKeepAliveIdle": ${TCP_KEEPALIVE_IDLE_SEC} }
       },
       "sniffing": { "enabled": true, "destOverride": ${sniff_dest}, "routeOnly": false }
