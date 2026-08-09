@@ -5163,7 +5163,7 @@ clear_config_exports() {
     log_event WARN "config_exports cleared reason=${reason}"
 }
 
-config_export_artifacts_present() {
+config_link_artifacts_present() {
     [[ -s "$MOBILE_CONFIG_FILE" && -s "$CONFIG_META_FILE" ]] || return 1
     if command -v base64 >/dev/null 2>&1; then
         [[ -s "$SUBSCRIPTION_FILE" ]] || return 1
@@ -5171,9 +5171,14 @@ config_export_artifacts_present() {
     return 0
 }
 
+config_export_artifacts_present() {
+    config_link_artifacts_present || return 1
+    [[ -s "$CODESPACE_BUNDLE_FILE" ]]
+}
+
 config_export_artifacts_match_current_uuid() {
     local current_uuid
-    config_export_artifacts_present || return 1
+    config_link_artifacts_present || return 1
     current_uuid=$(active_vless_uuid 2>/dev/null || true)
     [[ -n "$current_uuid" ]] || return 1
     awk -v prefix="vless://${current_uuid}@" '
@@ -5216,7 +5221,7 @@ _refresh_config_exports_impl() {
     if ((${#link_array[@]} == 0)); then
         if config_export_artifacts_match_current_uuid; then
             log_event WARN "config_exports retained_previous reason=no_exportable_links"
-        elif config_export_artifacts_present; then
+        elif config_link_artifacts_present; then
             clear_config_exports "no_exportable_links_uuid_mismatch"
         else
             clear_config_exports "no_exportable_links"

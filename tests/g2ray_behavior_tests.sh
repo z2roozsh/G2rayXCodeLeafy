@@ -1923,6 +1923,38 @@ test_refresh_config_exports_if_changed_skips_unchanged_inputs() {
     pass "unchanged export inputs skip regeneration"
 }
 
+test_refresh_config_exports_if_changed_repairs_missing_codespace_bundle() {
+    reset_runtime_paths
+    BASE_DIR="$TMP_ROOT"
+    MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
+    SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
+    CONFIG_META_FILE="$BASE_DIR/configs-meta.json"
+    CODESPACE_BUNDLE_FILE="$BASE_DIR/g2ray-codespace-bundle.json"
+    PORT_DOMAIN="behavior-space-443.app.github.dev"
+    WS_PORT_DOMAIN="behavior-space-8443.app.github.dev"
+    CODESPACE_NAME="behavior-space"
+    GITHUB_USER="tester"
+    printf '11111111-2222-3333-4444-555555555555\n' > "$UUID_FILE"
+    write_test_vless_config
+    printf '2026-01-01T00:00:00Z\t20.0.0.1\t200\t10\ttrue\tcache\tready\n' > "$ROUTE_HEALTH_FILE"
+    local calls_file="$TMP_ROOT/export-repair-calls.txt"
+    : > "$calls_file"
+    generate_ordered_links() {
+        printf 'call\n' >> "$calls_file"
+        printf 'vless://example@20.0.0.1:443?encryption=none#one\n'
+    }
+
+    refresh_config_exports_if_changed >/dev/null || fail "initial export refresh failed"
+    rm -f "$CODESPACE_BUNDLE_FILE"
+    refresh_config_exports_if_changed >/dev/null || fail "missing Codespace bundle was not repaired"
+
+    local calls
+    calls=$(wc -l < "$calls_file" | tr -d ' ')
+    [[ "$calls" -eq 2 ]] || fail "missing Codespace bundle did not trigger one export rebuild"
+    [[ -s "$CODESPACE_BUNDLE_FILE" ]] || fail "Codespace bundle remained missing after export repair"
+    pass "unchanged export inputs repair a missing Codespace bundle"
+}
+
 test_refresh_config_exports_updates_input_hash_after_direct_refresh() {
     reset_runtime_paths
     BASE_DIR="$TMP_ROOT"
@@ -3570,6 +3602,7 @@ test_no_link_refresh_clears_exports_from_a_previous_uuid
 test_failed_export_does_not_restore_exports_from_a_previous_uuid
 test_ordered_links_reuse_fallback_ips_for_xhttp_and_ws_exports
 test_refresh_config_exports_if_changed_skips_unchanged_inputs
+test_refresh_config_exports_if_changed_repairs_missing_codespace_bundle
 test_refresh_config_exports_updates_input_hash_after_direct_refresh
 test_force_reconnect_skips_restart_when_identity_unknown
 test_generated_links_follow_configured_xhttp_path

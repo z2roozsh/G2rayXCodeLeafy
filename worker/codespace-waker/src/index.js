@@ -1817,6 +1817,11 @@ async function githubFetchWithRetry(input, init = {}, timeoutMs = FETCH_TIMEOUT_
     try {
       const response = await fetchWithTimeout(input, init, timeoutMs);
       if (attempt < attempts && shouldRetryGithubResponse(response)) {
+        try {
+          await response.body?.cancel();
+        } catch {
+          // The response is being discarded either way; retry remains useful.
+        }
         await sleep(githubRetryDelayMs(env, attempt));
         continue;
       }

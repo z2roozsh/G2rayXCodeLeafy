@@ -410,12 +410,17 @@ async function testGithubHttp429Classification() {
 
 async function testGithubStartRetriesTransientServerFailure() {
   let startCalls = 0;
+  let cancelledResponseBodies = 0;
   globalThis.fetch = async (input) => {
     const url = String(input);
     if (url.includes("/start")) {
       startCalls += 1;
       if (startCalls === 1) {
-        return new Response(JSON.stringify({ message: "temporary unavailable" }), {
+        return new Response(new ReadableStream({
+          cancel() {
+            cancelledResponseBodies += 1;
+          }
+        }), {
           status: 503,
           headers: { "content-type": "application/json" }
         });
@@ -450,6 +455,7 @@ async function testGithubStartRetriesTransientServerFailure() {
   const body = await responseJson(response);
   assert.equal(response.status, 200);
   assert.equal(startCalls, 2);
+  assert.equal(cancelledResponseBodies, 1);
   assert.equal(body.route_ready, true);
   assert.equal(body.next_action_code, "retry_vless_config");
   console.log("PASS: Worker retries transient GitHub start server failures once");
