@@ -278,6 +278,10 @@ bash ./g2ray.sh profile max_throughput
 bash ./g2ray.sh bench --json --mock
 ```
 
+Linux and Codespaces use the strict benchmark budgets shown in the JSON. Windows
+Git Bash automatically scales only those timing budgets to account for its much
+higher process-start cost; functional assertions and Linux CI remain unchanged.
+
 `profile <name>` saves the performance profile to `data/performance_profile.txt` and, if a config already exists, re-applies it to the running config **keeping the same UUID**, so you do not have to re-import client links. Run `profile` (or `profile status`) with no name to print the effective profile, saved base profile, active panel modes, and available names. This is the reliable way to switch profiles in a Codespace, because it does not depend on exporting `G2RAY_PERFORMANCE_PROFILE` in the same shell the panel happens to launch from.
 
 `bench` now runs in an isolated throwaway runtime directory by default; pass `bench --live` only if you intentionally want the budget checks to run against your real `data/`/`logs/` (which reasserts port visibility and rewrites exports). `bench --json --mock` remains the explicit isolated form CI uses.

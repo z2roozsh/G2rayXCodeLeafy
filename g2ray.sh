@@ -6074,17 +6074,30 @@ bench_budget_value() {
     [[ "$value" =~ ^[0-9]+$ ]] && printf '%s' "$value" || printf '%s' "$fallback"
 }
 
-bench_budget_ms() {
-    local name="$1"
-    case "$name" in
-        config_path_cache) bench_budget_value "${G2RAY_BENCH_BUDGET_CONFIG_PATH_MS:-2500}" 2500 ;;
-        route_ordering) bench_budget_value "${G2RAY_BENCH_BUDGET_ROUTE_ORDERING_MS:-1500}" 1500 ;;
-        export_generation) bench_budget_value "${G2RAY_BENCH_BUDGET_EXPORT_MS:-10000}" 10000 ;;
-        doctor_json) bench_budget_value "${G2RAY_BENCH_BUDGET_DOCTOR_MS:-6000}" 6000 ;;
-        recover_json_contract) bench_budget_value "${G2RAY_BENCH_BUDGET_RECOVER_JSON_MS:-6000}" 6000 ;;
-        log_event_cost) bench_budget_value "${G2RAY_BENCH_BUDGET_LOG_EVENT_MS:-8000}" 8000 ;;
-        *) bench_budget_value "${G2RAY_BENCH_BUDGET_DEFAULT_MS:-1000}" 1000 ;;
+bench_platform_multiplier() {
+    case "${OSTYPE:-}" in
+        msys*|cygwin*|win32*)
+            [[ "${G2RAY_BENCH_WINDOWS_MULTIPLIER:-4}" =~ ^[1-9][0-9]*$ ]] \
+                && printf '%s' "${G2RAY_BENCH_WINDOWS_MULTIPLIER:-4}" \
+                || printf '4'
+            ;;
+        *) printf '1' ;;
     esac
+}
+
+bench_budget_ms() {
+    local name="$1" base multiplier
+    case "$name" in
+        config_path_cache) base=$(bench_budget_value "${G2RAY_BENCH_BUDGET_CONFIG_PATH_MS:-2500}" 2500) ;;
+        route_ordering) base=$(bench_budget_value "${G2RAY_BENCH_BUDGET_ROUTE_ORDERING_MS:-1500}" 1500) ;;
+        export_generation) base=$(bench_budget_value "${G2RAY_BENCH_BUDGET_EXPORT_MS:-10000}" 10000) ;;
+        doctor_json) base=$(bench_budget_value "${G2RAY_BENCH_BUDGET_DOCTOR_MS:-6000}" 6000) ;;
+        recover_json_contract) base=$(bench_budget_value "${G2RAY_BENCH_BUDGET_RECOVER_JSON_MS:-6000}" 6000) ;;
+        log_event_cost) base=$(bench_budget_value "${G2RAY_BENCH_BUDGET_LOG_EVENT_MS:-8000}" 8000) ;;
+        *) base=$(bench_budget_value "${G2RAY_BENCH_BUDGET_DEFAULT_MS:-1000}" 1000) ;;
+    esac
+    multiplier=$(bench_platform_multiplier)
+    printf '%s' "$((base * multiplier))"
 }
 
 bench_case_json() {

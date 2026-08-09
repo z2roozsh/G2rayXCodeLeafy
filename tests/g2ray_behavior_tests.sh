@@ -2305,23 +2305,26 @@ test_config_metadata_sanitizes_invalid_max_fallback_links() {
 
 test_bench_json_reports_deterministic_budgets() {
     reset_runtime_paths
-    local output bench_file bench_root command_output
+    local output bench_file bench_root command_output platform_multiplier
     local contract_config_ms=6000 contract_route_ms=5000 contract_export_ms=30000
     local contract_doctor_ms=12000 contract_recover_ms=12000 contract_log_ms=16000
-    [[ "$(bench_budget_ms config_path_cache)" == "2500" ]] \
+    platform_multiplier=$(bench_platform_multiplier)
+    [[ "$(bench_budget_ms config_path_cache)" == "$((2500 * platform_multiplier))" ]] \
         || fail "default config_path_cache benchmark budget changed"
-    [[ "$(bench_budget_ms route_ordering)" == "1500" ]] \
+    [[ "$(bench_budget_ms route_ordering)" == "$((1500 * platform_multiplier))" ]] \
         || fail "default route_ordering benchmark budget changed"
-    [[ "$(bench_budget_ms export_generation)" == "10000" ]] \
+    [[ "$(bench_budget_ms export_generation)" == "$((10000 * platform_multiplier))" ]] \
         || fail "default export_generation benchmark budget changed"
-    [[ "$(bench_budget_ms doctor_json)" == "6000" ]] \
+    [[ "$(bench_budget_ms doctor_json)" == "$((6000 * platform_multiplier))" ]] \
         || fail "default doctor_json benchmark budget changed"
-    [[ "$(bench_budget_ms recover_json_contract)" == "6000" ]] \
+    [[ "$(bench_budget_ms recover_json_contract)" == "$((6000 * platform_multiplier))" ]] \
         || fail "default recover_json_contract benchmark budget changed"
-    [[ "$(bench_budget_ms log_event_cost)" == "8000" ]] \
+    [[ "$(bench_budget_ms log_event_cost)" == "$((8000 * platform_multiplier))" ]] \
         || fail "default log_event_cost benchmark budget changed"
-    [[ "$(G2RAY_BENCH_BUDGET_CONFIG_PATH_MS=not-a-number bench_budget_ms config_path_cache)" == "2500" ]] \
+    [[ "$(G2RAY_BENCH_BUDGET_CONFIG_PATH_MS=not-a-number bench_budget_ms config_path_cache)" == "$((2500 * platform_multiplier))" ]] \
         || fail "invalid benchmark budget did not fall back to the default"
+    [[ "$(G2RAY_BENCH_WINDOWS_MULTIPLIER=invalid bench_platform_multiplier)" == "$platform_multiplier" ]] \
+        || fail "invalid Windows benchmark multiplier did not fall back safely"
     if ! output="$(
         G2RAY_BENCH_MOCK=1 \
         G2RAY_BENCH_BUDGET_CONFIG_PATH_MS="$contract_config_ms" \

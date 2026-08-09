@@ -1863,6 +1863,8 @@ test_headless_benchmark_path_is_documented_and_guarded() {
         || fail 'script does not expose headless benchmark JSON'
     grep_fixed 'bench_budget_value()' "$SCRIPT" \
         || fail 'benchmark budgets do not sanitize environment overrides before JSON output'
+    grep_fixed 'bench_platform_multiplier()' "$SCRIPT" \
+        || fail 'benchmark budgets do not account for Windows Git Bash process overhead'
     grep_fixed 'bench_rebind_runtime_paths "$tmp"' "$SCRIPT" \
         || fail 'mock benchmarks do not isolate runtime state in a temporary root'
     grep_fixed 'G2RAY_BENCH_PREINIT_TMP=' "$SCRIPT" \
