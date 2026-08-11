@@ -302,7 +302,7 @@ async function testHealthDoesNotProbeRouteWhileCodespaceIsShutdown() {
   assert.equal(response.status, 200);
   assert.equal(body.state, "Shutdown");
   assert.equal(body.route_checked, false);
-  assert.equal(body.route_ready, null);
+  assert.equal(body.route_ready, false);
   assert.equal(body.route_probe.http_status, null);
   assert.equal(body.route_probe.error, "codespace_not_available");
   assert.equal(body.next_action_code, "wait_codespace_available");
@@ -453,11 +453,12 @@ async function testGithubStartRetriesTransientServerFailure() {
     GITHUB_API_RETRY_BACKOFF_MS: "0"
   }), {});
   const body = await responseJson(response);
-  assert.equal(response.status, 200);
+  assert.equal(response.status, 202);
   assert.equal(startCalls, 2);
   assert.equal(cancelledResponseBodies, 1);
-  assert.equal(body.route_ready, true);
-  assert.equal(body.next_action_code, "retry_vless_config");
+  assert.equal(body.start_accepted, true);
+  assert.equal(body.route_ready, false);
+  assert.equal(body.next_action_code, "wait_codespace_available");
   console.log("PASS: Worker retries transient GitHub start server failures once");
 }
 
@@ -942,7 +943,7 @@ async function testScheduledQuotaCronRetriesAfterResetIfPreResetWakeStillBlocked
   await Promise.all(waitUntilPromises);
 
   assert.equal(startCalls, 2);
-  assert.equal(routeCalls >= 2, true);
+  assert.equal(routeCalls, 0);
   const incident = JSON.parse(await kv.get("quota-incident:behavior-space"));
   assert.equal(incident.quota_drought_active, false);
   assert.equal(incident.last_successful_start_at, "2026-07-01T00:05:00.000Z");
@@ -1147,7 +1148,7 @@ async function testWakeRequiresStableRouteReadiness() {
   console.log("PASS: Worker rejects transient single route success");
 }
 
-async function testWakeWaitsBetweenStableRouteProbes() {
+async function testHealthWaitsBetweenStableRouteProbes() {
   const routeCallTimes = [];
   globalThis.fetch = async (input) => {
     const url = String(input);
@@ -1177,8 +1178,8 @@ async function testWakeWaitsBetweenStableRouteProbes() {
   };
 
   const response = await worker.fetch(
-    makeRequest("/api/wake"),
-    baseEnv({ ROUTE_READY_STABLE_SLEEP_MS: "25", WAKE_FAST_PATH: "0" }),
+    makeRequest("/api/health"),
+    baseEnv({ ROUTE_READY_STABLE_SLEEP_MS: "25" }),
     {}
   );
   const body = await responseJson(response);
@@ -1187,10 +1188,10 @@ async function testWakeWaitsBetweenStableRouteProbes() {
   assert.equal(body.route_probe.stable_probes, 2);
   assert.equal(routeCallTimes.length >= 2, true);
   assert.equal(routeCallTimes[1] - routeCallTimes[0] >= 20, true);
-  console.log("PASS: Worker waits between stable route-readiness probes");
+  console.log("PASS: Worker health waits between stable route-readiness probes");
 }
 
-async function testWakeDoesNotClaimReadyFromSingleDeadlineProbe() {
+async function testHealthDoesNotClaimReadyFromSingleDeadlineProbe() {
   let routeCalls = 0;
   globalThis.fetch = async (input) => {
     const url = String(input);
@@ -1220,12 +1221,12 @@ async function testWakeDoesNotClaimReadyFromSingleDeadlineProbe() {
   };
 
   const response = await worker.fetch(
-    makeRequest("/api/wake"),
-    baseEnv({ ROUTE_WAIT_MS: "5", ROUTE_READY_STABLE_SLEEP_MS: "25", WAKE_FAST_PATH: "0" }),
+    makeRequest("/api/health"),
+    baseEnv({ ROUTE_WAIT_MS: "5", ROUTE_READY_STABLE_SLEEP_MS: "25" }),
     {}
   );
   const body = await responseJson(response);
-  assert.equal(response.status, 202);
+  assert.equal(response.status, 200);
   assert.equal(body.route_ready, false);
   assert.equal(body.route_probe.usable, true);
   assert.equal(body.route_probe.http_status, 200);
@@ -1233,7 +1234,7 @@ async function testWakeDoesNotClaimReadyFromSingleDeadlineProbe() {
   assert.equal(body.route_probe.error, "route_stability_not_confirmed");
   assert.equal(body.route_probe.route_failure_reason, "route_stability_not_confirmed");
   assert.equal(routeCalls, 1);
-  console.log("PASS: Worker does not claim route ready from one deadline-limited probe");
+  console.log("PASS: Worker health does not claim route ready from one deadline-limited probe");
 }
 
 async function testHealthRequiresStableRouteReadiness() {
@@ -1276,7 +1277,7 @@ async function testHealthRequiresStableRouteReadiness() {
   console.log("PASS: Worker health requires stable route readiness");
 }
 
-async function testWakePreservesStartAcceptedWhenGithubStateWaitTimesOut() {
+async function testColdWakeReturnsAcceptedProgressWithoutHoldingRequestOpen() {
   let statusCalls = 0;
   const kv = makeKv();
   globalThis.fetch = async (input) => {
@@ -1305,21 +1306,22 @@ async function testWakePreservesStartAcceptedWhenGithubStateWaitTimesOut() {
 
   const response = await worker.fetch(
     makeRequest("/api/wake"),
-    baseEnv({ WAKER_KV: kv, GITHUB_STATE_WAIT_MS: "5", GITHUB_STATE_POLL_INTERVAL_MS: "1" }),
+    baseEnv({ WAKER_KV: kv }),
     {}
   );
   const body = await responseJson(response);
   assert.equal(response.status, 202);
-  assert.equal(body.ok, false);
+  assert.equal(body.ok, true);
   assert.equal(body.start_accepted, true);
-  assert.equal(body.reason, "codespace_state_not_ready");
+  assert.equal(body.reason, "codespace_start_accepted");
+  assert.equal(body.route_ready, false);
   assert.equal(body.next_action_code, "wait_codespace_available");
   assert.match(body.next_action, /finish starting/i);
-  assert.equal(body.github_wait_attempts >= 1, true);
-  assert.equal(statusCalls >= 1, true);
+  assert.equal(body.github_wait_attempts, 0);
+  assert.equal(statusCalls, 1);
   const history = await responseJson(await worker.fetch(makeRequest("/api/history"), baseEnv({ WAKER_KV: kv }), {}));
   assert.equal(history.history[0].route_checked, false);
-  console.log("PASS: Worker preserves start_accepted when GitHub state wait times out");
+  console.log("PASS: Cold wake returns accepted progress without holding the request open");
 }
 
 async function testHistorySeparatesFailedProbeDurationFromReadyLatency() {
@@ -2166,10 +2168,10 @@ try {
   await testHealthTreatsHttp400RouteAsUsable();
   await testOptionalPortCannotMasqueradeAsPrimaryXhttpReadiness();
   await testWakeRequiresStableRouteReadiness();
-  await testWakeWaitsBetweenStableRouteProbes();
-  await testWakeDoesNotClaimReadyFromSingleDeadlineProbe();
+  await testHealthWaitsBetweenStableRouteProbes();
+  await testHealthDoesNotClaimReadyFromSingleDeadlineProbe();
   await testHealthRequiresStableRouteReadiness();
-  await testWakePreservesStartAcceptedWhenGithubStateWaitTimesOut();
+  await testColdWakeReturnsAcceptedProgressWithoutHoldingRequestOpen();
   await testHistorySeparatesFailedProbeDurationFromReadyLatency();
   await testDashboardIncludesRouteHistorySummaryUi();
   await testHistoryRejectsBadSecretClearly();

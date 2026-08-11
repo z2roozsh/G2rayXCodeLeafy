@@ -76,7 +76,7 @@ Optional: add `CODESPACE_FORWARDING_DOMAIN` as a **Plaintext** variable only if 
 
 Optional: set `WAKE_FAST_PATH=0` as a **Plaintext** variable to disable the default warm-route fast path. With the default `WAKE_FAST_PATH=1`, `/wake` first does a cheap route probe; if the route is already stable and GitHub says the Codespace is Available, it returns success without calling GitHub's `/start` API again.
 
-The Worker waits only about 25 seconds for GitHub to report an initial start state and about eight seconds for an individual route check, then returns a retry hint while GitHub's edge settles. This keeps mobile and dashboard wake requests responsive; it does not make GitHub's forwarding route settle faster. You can override `GITHUB_STATE_WAIT_MS`, `ROUTE_WAIT_MS`, `ROUTE_POLL_INTERVAL_MS`, `ROUTE_FETCH_TIMEOUT_MS`, and `ROUTE_POLL_AFTER_SECONDS` as Plaintext variables if a measured deployment needs different control-plane timing.
+After GitHub accepts a cold start, the Worker returns HTTP 202 immediately and the app/dashboard polls Health until the Codespace and forwarded route are ready. An individual Health route check is bounded to about eight seconds. This avoids false mobile timeouts without pretending GitHub's forwarding route settles faster. You can override `ROUTE_WAIT_MS`, `ROUTE_POLL_INTERVAL_MS`, `ROUTE_FETCH_TIMEOUT_MS`, and `ROUTE_POLL_AFTER_SECONDS` as Plaintext variables if a measured deployment needs different route-check timing.
 
 ### Optional Worker custom domain
 

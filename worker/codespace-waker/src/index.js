@@ -1,9 +1,5 @@
 const GITHUB_API_VERSION = "2022-11-28";
 const DEFAULT_CODESPACE_PORT = 443;
-// Return progress rather than holding one mobile request open for a full cold
-// start. The caller polls with a bounded backoff until GitHub reports Available.
-const GITHUB_STATE_WAIT_MS = 25000;
-const GITHUB_STATE_POLL_INTERVAL_MS = 5000;
 // The Codespaces edge can take minutes to settle, but holding one Worker
 // request open for 35 seconds makes mobile wake UX look hung. Return an honest
 // short 202 and let the client/dashboard poll using the supplied hint instead.
@@ -249,7 +245,11 @@ async function handleHealth(request, env, ctx) {
     ...status,
     route_check_requested: checkRoute,
     route_checked: routeChecked,
-    route_ready: routeChecked ? routeData.route_ready : null,
+    route_ready: routeChecked
+      ? routeData.route_ready
+      : status.ok && checkRoute
+        ? false
+        : null,
     route_probe: routeData.route_probe,
     route_probes: routeData.route_probes,
     preferred_route_port: routeData.preferred_route_port,
@@ -702,83 +702,47 @@ async function startCodespaceData(name, token, env, priorStatus = null, routePor
     };
   }
 
-  const readyState = await waitForCodespaceAvailable(name, token, env);
-  if (!readyState.ok) {
-    return {
-      ...readyState,
-      start_accepted: true,
-      github_wait_ms: readyState.waited_ms,
-      github_wait_attempts: readyState.attempts
-    };
-  }
-
-  const routeData = await probeCodespaceRoutes(name, routePorts, env);
-  const routeReady = routeData.route_ready;
-
+  // A cold Codespace can need far longer than a mobile HTTP timeout to become
+  // Available and publish its forwarded route. Return accepted progress now;
+  // the dashboard and Android client poll /api/health with bounded backoff.
+  const firstPort = routePorts[0] || codespacePort(env);
+  const startBody = body && typeof body === "object" ? body : {};
   return {
     ok: true,
     status: res.status,
     start_accepted: true,
     codespace: name,
-    state: readyState.state || (body && typeof body === "object" ? body.state || null : null),
-    pending_operation: readyState.pending_operation,
-    last_used_at: readyState.last_used_at || (body && typeof body === "object" ? body.last_used_at || null : null),
-    idle_timeout_minutes: readyState.idle_timeout_minutes || (body && typeof body === "object" ? body.idle_timeout_minutes || null : null),
-    location: readyState.location || (body && typeof body === "object" ? body.location || null : null),
-    retention_period_minutes: readyState.retention_period_minutes ?? (body && typeof body === "object" ? body.retention_period_minutes ?? null : null),
-    retention_expires_at: readyState.retention_expires_at || (body && typeof body === "object" ? body.retention_expires_at || null : null),
-    github_wait_ms: readyState.waited_ms,
-    github_wait_attempts: readyState.attempts,
-    route_ready: routeReady,
-    route_probe: routeData.route_probe,
-    route_probes: routeData.route_probes,
-    preferred_route_port: routeData.preferred_route_port,
-    next_action: nextActionForWake({ ...readyState, route_ready: routeReady }, routeData.route_probe),
-    message: routeReady
-      ? "Codespace start request accepted and the XHTTP route is usable."
-      : "Codespace start request accepted, but the XHTTP route is still settling. The Codespace post-start recovery should keep working headlessly; keep this page open or press Check Health again shortly."
-  };
-}
-
-async function waitForCodespaceAvailable(name, token, env) {
-  const startedAt = Date.now();
-  const stateWaitMs = configuredMs(env, "GITHUB_STATE_WAIT_MS", GITHUB_STATE_WAIT_MS, 1, 300000);
-  const pollIntervalMs = configuredMs(env, "GITHUB_STATE_POLL_INTERVAL_MS", GITHUB_STATE_POLL_INTERVAL_MS, 1, 60000);
-  const deadline = startedAt + stateWaitMs;
-  let attempts = 0;
-  let last = {
-    ok: false,
-    status: 0,
-    codespace: name,
-    state: null,
-    pending_operation: null,
-    attempts,
-    waited_ms: 0,
-    reason: "not_checked",
-    message: "Codespace state has not been checked yet."
-  };
-
-  while (attempts === 0 || Date.now() < deadline) {
-    attempts += 1;
-    last = await getCodespaceStatus(name, token, env);
-    last.attempts = attempts;
-    last.waited_ms = Date.now() - startedAt;
-    if (!last.ok && isTransientGithubStatusFailure(last)) {
-      if (Date.now() + pollIntervalMs > deadline) break;
-      await sleep(pollIntervalMs);
-      continue;
-    }
-    if (!last.ok) return last;
-    if (isCodespaceAvailable(last)) return last;
-    if (Date.now() + pollIntervalMs > deadline) break;
-    await sleep(pollIntervalMs);
-  }
-
-  return {
-    ...last,
-    ok: false,
-    reason: "codespace_state_not_ready",
-    message: "GitHub accepted the start request, but the Codespace did not become Available before the wait timeout."
+    reason: "codespace_start_accepted",
+    state: startBody.state || priorStatus?.state || "Starting",
+    pending_operation: startBody.pending_operation ?? true,
+    last_used_at: startBody.last_used_at || priorStatus?.last_used_at || null,
+    idle_timeout_minutes: startBody.idle_timeout_minutes || priorStatus?.idle_timeout_minutes || null,
+    location: startBody.location || priorStatus?.location || null,
+    retention_period_minutes: startBody.retention_period_minutes ?? priorStatus?.retention_period_minutes ?? null,
+    retention_expires_at: startBody.retention_expires_at || priorStatus?.retention_expires_at || null,
+    github_wait_ms: 0,
+    github_wait_attempts: 0,
+    route_check_requested: false,
+    route_checked: false,
+    route_ready: false,
+    route_probe: {
+      url: routeUrl(name, firstPort, env),
+      usable: false,
+      http_status: null,
+      latency_ms: null,
+      attempts: 0,
+      waited_ms: 0,
+      stable_probes: 0,
+      error: "codespace_starting",
+      route_failure_reason: "not_checked"
+    },
+    route_probes: [],
+    preferred_route_port: firstPort,
+    retry_after_seconds: 3,
+    poll_after_seconds: 3,
+    next_action: "GitHub accepted the start request. Wait for the Codespace to finish starting; this page or app will check health again automatically.",
+    next_action_code: "wait_codespace_available",
+    message: "Codespace start request accepted. Route readiness will be checked separately so this request does not time out."
   };
 }
 
@@ -966,7 +930,7 @@ function githubHeaders(token) {
 }
 
 function responseStatusFor(data) {
-  if (data.start_accepted && data.reason === "codespace_state_not_ready") return 202;
+  if (data.ok && data.start_accepted && data.route_ready !== true) return 202;
   if (
     data.ok &&
     (data.start_accepted || data.wake_fast_path) &&
@@ -1097,11 +1061,6 @@ function survivalNextActionFor(data) {
   return "No quota survival action needed now. For best safety, use Keep codespace if GitHub offers it before quota runs out.";
 }
 
-function isTransientGithubStatusFailure(last) {
-  const status = Number(last && last.status || 0);
-  return status === 0 || status >= 500;
-}
-
 function isRouteSettlingStatus(routeProbe) {
   const status = Number(routeProbe && routeProbe.http_status || 0);
   return status === 0 || status === 404;
@@ -1122,9 +1081,6 @@ function isCodespaceAvailable(status) {
 }
 
 function nextActionForWake(status, routeProbe) {
-  if (status.start_accepted && status.reason === "codespace_state_not_ready") {
-    return "GitHub accepted the start request. Wait for the Codespace to finish starting, then press Check Health again.";
-  }
   if (status.reason === "github_rate_limited" || status.reason === "github_secondary_rate_limited") {
     return "GitHub is throttling this token. Wait for the retry/reset window, then press Check Health or Start Codespace again.";
   }
@@ -1162,9 +1118,6 @@ function nextActionCodeFor(status, routeProbe) {
   }
   if (status.reason === "github_forbidden") {
     return "check_github_policy_or_access";
-  }
-  if (status.start_accepted && status.reason === "codespace_state_not_ready") {
-    return "wait_codespace_available";
   }
   if (status.reason === "codespace_not_found_or_token_cannot_access_it" || Number(status.status) === 404) {
     return "codespace_missing_or_inaccessible";

@@ -952,8 +952,10 @@ test_cloudflare_worker_waker_is_safe_to_publish() {
         || fail 'Worker does not wait for the selected Codespace XHTTP route after start'
     grep_fixed 'probeCodespaceRoutes(codespaceName, context.routePorts, env)' "$WORKER_SCRIPT" \
         || fail 'Worker health check does not use stable selected-Codespace route readiness'
-    grep_fixed 'route_ready: routeChecked ? routeData.route_ready : null' "$WORKER_SCRIPT" \
+    grep_fixed 'route_ready: routeChecked' "$WORKER_SCRIPT" \
         || fail 'Worker route_ready is not derived from stable route probe state'
+    grep_fixed ': status.ok && checkRoute' "$WORKER_SCRIPT" \
+        || fail 'Worker does not distinguish an unavailable Codespace from an explicitly skipped route check'
     grep_fixed 'url.searchParams.get("route") !== "false"' "$WORKER_SCRIPT" \
         || fail 'Worker health API does not support a cheap route-skip status check'
     grep_fixed 'method: "OPTIONS"' "$WORKER_SCRIPT" \
@@ -1011,10 +1013,10 @@ test_worker_dashboard_and_history_features() {
         || fail 'Worker does not support Telegram chat routing'
     grep_fixed 'GitHub token rejected or expired' "$WORKER_SCRIPT" \
         || fail 'Worker UI/API does not warn clearly about rejected or expired GitHub tokens'
-    grep_fixed 'GITHUB_STATE_WAIT_MS' "$WORKER_SCRIPT" \
-        || fail 'Worker wake flow does not wait for GitHub Codespace state readiness'
-    grep_fixed 'waitForCodespaceAvailable(name, token, env)' "$WORKER_SCRIPT" \
-        || fail 'Worker wake flow probes route before waiting for Codespace availability'
+    grep_fixed 'reason: "codespace_start_accepted"' "$WORKER_SCRIPT" \
+        || fail 'Worker cold wake does not return explicit accepted progress'
+    grep_fixed 'github_wait_attempts: 0' "$WORKER_SCRIPT" \
+        || fail 'Worker cold wake still holds the mobile request open for GitHub state polling'
     grep_fixed 'isRouteStatusUsable(res.status)' "$WORKER_SCRIPT" \
         || fail 'Worker route readiness does not share the panel status classifier'
     grep_fixed 'return status === 200 || status === 400;' "$WORKER_SCRIPT" \
@@ -1039,8 +1041,8 @@ test_worker_dashboard_and_history_features() {
         || fail 'Worker status timeout/network errors are not returned as structured JSON'
     grep_fixed 'routeSettlingFailureText(data, route, routeReady)' "$WORKER_SCRIPT" \
         || fail 'Worker dashboard can still report no failure while the route is settling'
-    grep_fixed 'data.start_accepted && data.reason === "codespace_state_not_ready"' "$WORKER_SCRIPT" \
-        || fail 'Worker HTTP status does not return accepted/in-progress for GitHub state waits'
+    grep_fixed 'data.ok && data.start_accepted && data.route_ready !== true' "$WORKER_SCRIPT" \
+        || fail 'Worker HTTP status does not return accepted/in-progress after GitHub accepts a cold start'
     grep_fixed 'data.route_probe?.error === "route_stability_not_confirmed"' "$WORKER_SCRIPT" \
         || fail 'Worker HTTP status does not treat unconfirmed route stability as retryable'
     grep_fixed 'data && (data.ok || data.start_accepted) && data.route_ready !== true' "$WORKER_SCRIPT" \
@@ -1117,14 +1119,12 @@ test_quota_survival_layer_is_present() {
 }
 
 test_worker_wake_edge_cases_are_hardened() {
-    grep_fixed 'isTransientGithubStatusFailure(last)' "$WORKER_SCRIPT" \
-        || fail 'Worker wake flow does not retry transient GitHub status failures'
     grep_fixed 'githubFetchWithRetry(' "$WORKER_SCRIPT" \
         || fail 'Worker GitHub API calls do not use bounded retry wrapper'
     grep_fixed 'shouldRetryGithubResponse(response)' "$WORKER_SCRIPT" \
         || fail 'Worker GitHub retry wrapper does not classify retryable HTTP failures'
-    grep_fixed 'if (!last.ok && isTransientGithubStatusFailure(last)) {' "$WORKER_SCRIPT" \
-        || fail 'Worker status wait does not continue after transient status failures'
+    grep_fixed 'route_check_requested: false' "$WORKER_SCRIPT" \
+        || fail 'Worker cold wake falsely claims that route readiness was checked'
     grep_fixed 'function isRouteSettlingStatus(routeProbe)' "$WORKER_SCRIPT" \
         || fail 'Worker has no narrow route-settling classifier for 202 responses'
     grep_fixed 'id="stop"' "$WORKER_SCRIPT" \
