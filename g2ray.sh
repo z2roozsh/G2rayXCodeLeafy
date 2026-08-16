@@ -4191,14 +4191,15 @@ update_route_candidate_stats() {
         }
         $1 == target {
             found = 1
-            samples = ($2 ~ /^[0-9]+$/) ? $2 + 1 : 1
-            successes = ($3 ~ /^[0-9]+$/) ? $3 + 0 : 0
-            failures = ($4 ~ /^[0-9]+$/) ? $4 + 0 : 0
-            avg = ($5 ~ /^[0-9]+$/) ? $5 + 0 : 0
-            min = ($6 ~ /^[0-9]+$/) ? $6 + 0 : 0
-            max = ($7 ~ /^[0-9]+$/) ? $7 + 0 : 0
-            ewma = ($12 ~ /^[0-9]+$/) ? $12 + 0 : avg
-            recent_failures = ($13 ~ /^[0-9]+$/) ? $13 + 0 : 0
+            stale = (cutoff != "" && NF >= 11 && $11 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}T/ && $11 < cutoff)
+            samples = stale ? 1 : (($2 ~ /^[0-9]+$/) ? $2 + 1 : 1)
+            successes = stale ? 0 : (($3 ~ /^[0-9]+$/) ? $3 + 0 : 0)
+            failures = stale ? 0 : (($4 ~ /^[0-9]+$/) ? $4 + 0 : 0)
+            avg = stale ? 0 : (($5 ~ /^[0-9]+$/) ? $5 + 0 : 0)
+            min = stale ? 0 : (($6 ~ /^[0-9]+$/) ? $6 + 0 : 0)
+            max = stale ? 0 : (($7 ~ /^[0-9]+$/) ? $7 + 0 : 0)
+            ewma = stale ? 0 : (($12 ~ /^[0-9]+$/) ? $12 + 0 : avg)
+            recent_failures = stale ? 0 : (($13 ~ /^[0-9]+$/) ? $13 + 0 : 0)
             if (usable == "true") {
                 successes += 1
                 avg = (successes == 1) ? ms : int((((avg * (successes - 1)) + ms) / successes) + 0.5)
@@ -5989,6 +5990,23 @@ ensure_runtime_ready() {
     with_runtime_lock _ensure_runtime_ready_impl "$@"
 }
 
+start_runtime_headless_command() {
+    local runtime_status=0 supervisor_status=0
+
+    ensure_runtime_ready "headless_start" || runtime_status=$?
+    start_background_tasks || supervisor_status=$?
+
+    if (( runtime_status != 0 )); then
+        log_event ERROR "headless_start command_failed stage=runtime_ready exit_code=${runtime_status}"
+        return "$runtime_status"
+    fi
+    if (( supervisor_status != 0 )); then
+        log_event ERROR "headless_start command_failed stage=background_supervisor exit_code=${supervisor_status}"
+        return "$supervisor_status"
+    fi
+    return 0
+}
+
 _prepare_headless_runtime_impl() {
     local reason="${1:-silent_start}"
     record_resume_gap "$reason"
@@ -6347,8 +6365,7 @@ fi
 
 if [[ "${1:-}" == "--start" || "${1:-}" == "start" ]]; then
     [[ -f "$CONFIG_FILE" ]] || { echo "No config exists yet. Run the panel and generate one first." >&2; exit 1; }
-    ensure_runtime_ready "headless_start"
-    start_background_tasks
+    start_runtime_headless_command
     exit $?
 fi
 

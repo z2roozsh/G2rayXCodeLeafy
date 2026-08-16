@@ -621,6 +621,22 @@ test_route_candidate_stats_track_average_and_success_rate() {
     pass "route candidate stats track rolling average and reliability"
 }
 
+test_route_candidate_stats_reset_expired_target_history() {
+    reset_runtime_paths
+    ROUTE_STATS_MAX_AGE_SEC=60
+    cat > "$ROUTE_STATS_FILE" <<'EOF'
+20.0.0.1	500	490	10	2500	100	9000	8000	404	false	2000-01-01T00:00:00Z	7000	9	route_settling_404
+EOF
+
+    update_route_candidate_stats 20.0.0.1 200 120 cache ready
+
+    local row
+    row=$(awk -F '\t' '$1 == "20.0.0.1" {print $0}' "$ROUTE_STATS_FILE")
+    [[ "$row" == $'20.0.0.1\t1\t1\t0\t120\t120\t120\t120\t200\ttrue\t'*$'\t120\t0\tready' ]] \
+        || fail "expired target history was not reset before recording a fresh route sample: $row"
+    pass "route candidate stats reset expired target history"
+}
+
 test_xray_stats_use_inbound_counters_only() {
     reset_runtime_paths
     local fake_xray="$TMP_ROOT/fake-xray-stats"
@@ -2857,6 +2873,44 @@ test_headless_start_prepares_listener_without_waiting_for_edge() {
     pass "headless startup prepares listener without blocking on the edge"
 }
 
+test_headless_start_command_preserves_failures() {
+    (
+        reset_runtime_paths
+        local calls_file="$TMP_ROOT/headless-start-command-calls.txt" status
+        : > "$calls_file"
+        ensure_runtime_ready() {
+            printf 'runtime\n' >> "$calls_file"
+            return 7
+        }
+        start_background_tasks() {
+            printf 'supervisor\n' >> "$calls_file"
+            return 0
+        }
+        log_event() { return 0; }
+
+        if start_runtime_headless_command; then
+            status=0
+        else
+            status=$?
+        fi
+        [[ "$status" -eq 7 ]] \
+            || fail "headless start masked runtime failure with status $status"
+        [[ "$(tr '\n' ' ' < "$calls_file")" == "runtime supervisor " ]] \
+            || fail "headless start did not leave the supervisor available to repair a runtime failure"
+
+        ensure_runtime_ready() { return 0; }
+        start_background_tasks() { return 9; }
+        if start_runtime_headless_command; then
+            status=0
+        else
+            status=$?
+        fi
+        [[ "$status" -eq 9 ]] \
+            || fail "headless start masked supervisor failure with status $status"
+    )
+    pass "headless start command preserves runtime and supervisor failures"
+}
+
 test_headless_route_settle_records_background_ready_state() {
     (
         reset_runtime_paths
@@ -3539,6 +3593,7 @@ test_cached_route_order_uses_recent_weighted_score
 test_cached_route_order_does_not_overweight_tiny_reliability_delta
 test_last_good_route_decays_before_breaking_ties
 test_route_candidate_stats_track_average_and_success_rate
+test_route_candidate_stats_reset_expired_target_history
 test_xray_stats_use_inbound_counters_only
 test_save_xray_stats_marks_active_traffic_when_counters_increase
 test_atomic_write_handles_mktemp_failure
@@ -3647,6 +3702,7 @@ test_recover_now_json_reports_ready_contract
 test_recover_now_json_reports_settling_contract
 test_recover_now_json_treats_followup_ready_probe_as_success
 test_headless_start_prepares_listener_without_waiting_for_edge
+test_headless_start_command_preserves_failures
 test_headless_route_settle_records_background_ready_state
 test_diagnostic_snapshot_writes_readable_history
 test_diagnostic_log_rotation_keeps_readable_history
