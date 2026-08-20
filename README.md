@@ -203,7 +203,7 @@ bash ./g2ray.sh
 ### Safer Reproducible Settings
 
 - Set `G2RAY_AUTO_UPDATE=1` only when you want the panel to replace `g2ray.sh` from upstream on startup. It is disabled by default.
-- Override the devcontainer build argument `XRAY_VERSION` to change the pinned Xray-core version. Default: `v26.5.9`.
+- Override the devcontainer build argument `XRAY_VERSION` to change the pinned Xray-core version. Default: `v26.7.28`. Because Xray is installed by the devcontainer image, an existing Codespace must be rebuilt once to adopt a changed pin; an ordinary `git pull` cannot replace the image binary.
 
 ### Codespace Recovery
 

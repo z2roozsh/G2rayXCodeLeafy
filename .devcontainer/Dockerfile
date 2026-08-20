@@ -1,6 +1,6 @@
 FROM debian:bookworm-slim
 
-ARG XRAY_VERSION=v26.5.9
+ARG XRAY_VERSION=v26.7.28
 
 LABEL maintainer="G2rayXCodeLeafy" \
       description="Educational G2rayXCodeLeafy Codespaces environment"

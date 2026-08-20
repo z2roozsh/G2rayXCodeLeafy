@@ -721,6 +721,45 @@ async function testQuotaIncidentRouteReadyHealthBeforeResetDoesNotClearDrought()
   console.log("PASS: Worker keeps active quota drought through pre-reset route-ready health checks");
 }
 
+async function testRepeatedHealthDoesNotRewriteUnchangedQuotaIncident() {
+  const kv = makeKv();
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        retention_period_minutes: 43200,
+        last_used_at: "2026-07-01T00:05:00Z"
+      }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const env = baseEnv({
+    WAKER_KV: kv,
+    TEST_NOW_UTC: "2026-07-01T00:05:00Z",
+    QUOTA_INCIDENT_SAMPLE_MS: "900000"
+  });
+  const first = await worker.fetch(makeRequest("/api/health?route=false"), env, {});
+  const firstBody = await responseJson(first);
+  assert.equal(first.status, 200);
+  assert.equal(firstBody.quota_incident_recorded, true);
+  const writesAfterFirst = kv.putCallCount();
+
+  env.TEST_NOW_UTC = "2026-07-01T00:05:05Z";
+  const second = await worker.fetch(makeRequest("/api/health?route=false"), env, {});
+  const secondBody = await responseJson(second);
+  assert.equal(second.status, 200);
+  assert.equal(secondBody.quota_incident_recorded, false);
+  assert.equal(kv.putCallCount(), writesAfterFirst);
+  console.log("PASS: Worker samples unchanged quota incidents instead of writing on every health poll");
+}
+
 async function testHistoryWorksWithoutGithubToken() {
   const kv = makeKv();
   await kv.put("history:behavior-space", JSON.stringify([
@@ -1189,6 +1228,48 @@ async function testHealthWaitsBetweenStableRouteProbes() {
   assert.equal(routeCallTimes.length >= 2, true);
   assert.equal(routeCallTimes[1] - routeCallTimes[0] >= 20, true);
   console.log("PASS: Worker health waits between stable route-readiness probes");
+}
+
+async function testRouteFetchTimeoutOverrideIsApplied() {
+  globalThis.fetch = async (input, init = {}) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({
+        name: "behavior-space",
+        state: "Available",
+        pending_operation: false,
+        idle_timeout_minutes: 120
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+    if (url.includes("app.github.dev")) {
+      return new Promise((resolve, reject) => {
+        init.signal?.addEventListener(
+          "abort",
+          () => reject(new DOMException("Aborted", "AbortError")),
+          { once: true }
+        );
+      });
+    }
+    throw new Error(`unexpected fetch ${url}`);
+  };
+
+  const startedAt = Date.now();
+  const response = await worker.fetch(
+    makeRequest("/api/health"),
+    baseEnv({
+      ROUTE_FETCH_TIMEOUT_MS: "100",
+      ROUTE_WAIT_MS: "150",
+      ROUTE_POLL_INTERVAL_MS: "10"
+    }),
+    {}
+  );
+  const elapsedMs = Date.now() - startedAt;
+  const body = await responseJson(response);
+  assert.equal(response.status, 200);
+  assert.equal(body.route_ready, false);
+  assert.equal(body.route_probe.route_failure_reason, "timeout_or_unreachable");
+  assert.equal(elapsedMs < 1000, true);
+  console.log("PASS: Worker applies the configured per-probe route fetch timeout");
 }
 
 async function testHealthDoesNotClaimReadyFromSingleDeadlineProbe() {
@@ -2159,6 +2240,7 @@ try {
   await testKvQuotaIncidentHistoryRecordsBlockedAndRecovery();
   await testQuotaIncidentKeepsResetEstimateDuringActiveDroughtHealthChecks();
   await testQuotaIncidentRouteReadyHealthBeforeResetDoesNotClearDrought();
+  await testRepeatedHealthDoesNotRewriteUnchangedQuotaIncident();
   await testHistoryWorksWithoutGithubToken();
   await testScheduledQuotaCronIsDisabledAndThrottledBeforeReset();
   await testScheduledQuotaCronAttemptsOneNearResetWake();
@@ -2169,6 +2251,7 @@ try {
   await testOptionalPortCannotMasqueradeAsPrimaryXhttpReadiness();
   await testWakeRequiresStableRouteReadiness();
   await testHealthWaitsBetweenStableRouteProbes();
+  await testRouteFetchTimeoutOverrideIsApplied();
   await testHealthDoesNotClaimReadyFromSingleDeadlineProbe();
   await testHealthRequiresStableRouteReadiness();
   await testColdWakeReturnsAcceptedProgressWithoutHoldingRequestOpen();

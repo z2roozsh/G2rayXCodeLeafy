@@ -649,7 +649,7 @@ kill_process_tree_hard() {
 # flock is present in the Codespaces image. Minimal images use a bounded
 # mkdir lock instead of running shared-state writers concurrently.
 with_file_lock() {
-    local lock_file="${1:-}" timeout_sec="${2:-5}" lock_dir owner recheck start now
+    local lock_file="${1:-}" timeout_sec="${2:-5}" lock_dir owner recheck start now self_pid="${BASHPID:-$$}"
     shift 2 || return 1
     [[ -n "$lock_file" ]] || return 1
     [[ "$timeout_sec" =~ ^[0-9]+$ ]] || timeout_sec=5
@@ -675,7 +675,7 @@ with_file_lock() {
             (( now - start >= timeout_sec )) && return 1
             sleep 0.1
         done
-        printf '%s\n' "$$" > "$lock_dir/pid" 2>/dev/null || {
+        printf '%s\n' "$self_pid" > "$lock_dir/pid" 2>/dev/null || {
             rmdir "$lock_dir" 2>/dev/null || true
             return 1
         }
@@ -787,21 +787,39 @@ boot_status_summary() {
 }
 
 rotate_log_file() {
-    local file="$1" max="$LOG_MAX_BYTES" keep="$LOG_ROTATE_KEEP" size i prev next
+    local file="$1" max="$LOG_MAX_BYTES" keep="$LOG_ROTATE_KEEP" size i prev next snapshot="" copytruncate=false
     [[ "$max" =~ ^[0-9]+$ && "$max" -gt 0 ]] || max=1048576
     [[ "$keep" =~ ^[0-9]+$ && "$keep" -gt 0 ]] || keep=3
     [[ -f "$file" ]] || return 0
     size=$(wc -c < "$file" 2>/dev/null || echo 0)
     [[ "$size" =~ ^[0-9]+$ ]] || size=0
     (( size < max )) && return 0
+    case "$file" in
+        "$LOG_DIR/xray.log"|"$LOG_DIR/xray-error.log")
+            copytruncate=true
+            snapshot=$(mktemp "${file}.rotate.XXXXXX") || return 1
+            if ! cp -- "$file" "$snapshot" 2>/dev/null; then
+                rm -f "$snapshot" 2>/dev/null || true
+                return 1
+            fi
+            ;;
+    esac
     rm -f "${file}.${keep}" 2>/dev/null || true
     for ((i=keep-1; i>=1; i--)); do
         prev="${file}.${i}"
         next="${file}.$((i + 1))"
         [[ -f "$prev" ]] && mv -f "$prev" "$next" 2>/dev/null || true
     done
-    mv -f "$file" "${file}.1" 2>/dev/null || true
-    : > "$file" 2>/dev/null || true
+    if [[ "$copytruncate" == true ]]; then
+        mv -f "$snapshot" "${file}.1" 2>/dev/null || {
+            rm -f "$snapshot" 2>/dev/null || true
+            return 1
+        }
+        : > "$file" 2>/dev/null || return 1
+    else
+        mv -f "$file" "${file}.1" 2>/dev/null || true
+        : > "$file" 2>/dev/null || true
+    fi
     chmod 600 "$file" 2>/dev/null || true
 }
 
@@ -1159,16 +1177,25 @@ owned_xray_pids() {
 }
 
 json_dns_ips() {
-    local url="$1" header="${2:-}"
+    local url="$1" header="${2:-}" response ip
     if [[ -n "$header" ]]; then
-        (curl -sf -m 4 -H "$header" "$url" 2>/dev/null \
-            | grep -oE '"data":"[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*"' \
-            | sed -E 's/^"data":"//;s/"$//') || true
+        response=$(curl -sf -m 4 -H "$header" "$url" 2>/dev/null || true)
     else
-        (curl -sf -m 4 "$url" 2>/dev/null \
-            | grep -oE '"data":"[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*"' \
-            | sed -E 's/^"data":"//;s/"$//') || true
+        response=$(curl -sf -m 4 "$url" 2>/dev/null || true)
     fi
+    [[ -n "$response" ]] || return 0
+    if command -v jq >/dev/null 2>&1; then
+        while IFS= read -r ip; do
+            ip=${ip%$'\r'}
+            valid_ipv4 "$ip" && printf '%s\n' "$ip"
+        done < <(printf '%s' "$response" | jq -r '.. | objects | .data? | select(type == "string")' 2>/dev/null || true)
+    else
+        printf '%s' "$response" \
+            | grep -oE '"data"[[:space:]]*:[[:space:]]*"[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*"' \
+            | sed -E 's/^"data"[[:space:]]*:[[:space:]]*"//;s/"$//' \
+            || true
+    fi
+    return 0
 }
 
 curl_remote_ip() {
@@ -2727,16 +2754,16 @@ save_session_uptime() {
 # recreate the directory between our mkdir and our pid write. On any mismatch we
 # report failure so the caller retries instead of two holders running at once.
 _try_claim_lock_dir() {
-    local dir="$1" op="${2:-}" owner
+    local dir="$1" op="${2:-}" owner self_pid="${BASHPID:-$$}"
     mkdir "$dir" 2>/dev/null || return 1
-    printf '%s\n' "$$" > "$dir/pid" 2>/dev/null || true
+    printf '%s\n' "$self_pid" > "$dir/pid" 2>/dev/null || true
     [[ -n "$op" ]] && printf '%s\n' "$op" > "$dir/op" 2>/dev/null || true
     owner=$(cat "$dir/pid" 2>/dev/null || true)
-    [[ "$owner" == "$$" ]]
+    [[ "$owner" == "$self_pid" ]]
 }
 
 acquire_runtime_lock() {
-    local op="${1:-runtime}" i lock_pid recheck attempts="$RUNTIME_LOCK_WAIT_ATTEMPTS"
+    local op="${1:-runtime}" i lock_pid recheck attempts="$RUNTIME_LOCK_WAIT_ATTEMPTS" self_pid="${BASHPID:-$$}"
     [[ "$attempts" =~ ^[0-9]+$ && "$attempts" -ge 1 ]] || attempts=20
     for ((i=1; i<=attempts; i++)); do
         if _try_claim_lock_dir "$RUNTIME_LOCK_DIR" "$op"; then
@@ -2750,7 +2777,7 @@ acquire_runtime_lock() {
             _try_claim_lock_dir "$RUNTIME_LOCK_DIR" "$op" && return 0
             continue
         fi
-        if [[ "$lock_pid" == "$$" ]]; then
+        if [[ "$lock_pid" == "$self_pid" ]]; then
             rm -f "$RUNTIME_LOCK_DIR/pid" "$RUNTIME_LOCK_DIR/op" 2>/dev/null || true
             rmdir "$RUNTIME_LOCK_DIR" 2>/dev/null || true
             _try_claim_lock_dir "$RUNTIME_LOCK_DIR" "$op" && return 0
@@ -2773,9 +2800,9 @@ acquire_runtime_lock() {
 }
 
 release_runtime_lock() {
-    local lock_pid
+    local lock_pid self_pid="${BASHPID:-$$}"
     lock_pid=$(cat "$RUNTIME_LOCK_DIR/pid" 2>/dev/null || true)
-    [[ "$lock_pid" == "$$" ]] || return 0
+    [[ "$lock_pid" == "$self_pid" ]] || return 0
     rm -f "$RUNTIME_LOCK_DIR/pid" "$RUNTIME_LOCK_DIR/op" 2>/dev/null || true
     rmdir "$RUNTIME_LOCK_DIR" 2>/dev/null || true
 }
@@ -2883,6 +2910,7 @@ upgrade_config_dns() {
         )
       | (.inbounds[]? | select(.sniffing? and .sniffing.destOverride?) | .sniffing.destOverride) |= (map(select(. != "quic")))
       | (.inbounds[]? | select(.tag == "vless-ws" and .streamSettings.wsSettings?) | .streamSettings.wsSettings.heartbeatPeriod) = $ws_heartbeat
+      | (.outbounds[]? | select(.protocol == "blackhole") | .settings.response.type) = "none"
       | (.policy.levels["0"].handshake) |=
           (if . == null or . < 4 then 4 else . end)
     ' "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
@@ -3175,6 +3203,7 @@ _background_tasks() {
         write_background_supervisor_heartbeat \
             || log_event ERROR "background heartbeat_write_failed phase=loop"
         rotate_log_file "$LOG_FILE"
+        rotate_log_file "$LOG_DIR/xray.log"
         rotate_log_file "$LOG_DIR/xray-error.log"
         rotate_log_file "$ROUTE_SETTLE_LOG_FILE"
         if [[ "$PORT_DOMAIN" == unknown-codespace* ]]; then
@@ -3746,7 +3775,7 @@ JSONEOF
   ],
   "outbounds": [
     { "tag": "direct", "protocol": "freedom",   "settings": { "domainStrategy": "UseIPv4" }${direct_sockopt} },
-    { "tag": "block",  "protocol": "blackhole",  "settings": { "response": { "type": "http" } } }
+    { "tag": "block",  "protocol": "blackhole",  "settings": { "response": { "type": "none" } } }
   ],
   "routing": {
     "domainStrategy": "AsIs",

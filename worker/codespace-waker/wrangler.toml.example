@@ -1,6 +1,6 @@
 name = "g2ray-codespace-waker"
 main = "src/index.js"
-compatibility_date = "2026-05-29"
+compatibility_date = "2026-08-20"
 
 [observability]
 enabled = true
@@ -15,6 +15,9 @@ CODESPACE_NAME = "YOUR_CODESPACE_NAME"
 
 # Optional browser/API retry hint while the XHTTP route is settling.
 # ROUTE_POLL_AFTER_SECONDS = "5"
+
+# Sample unchanged quota-incident metadata instead of writing on every Health poll.
+# QUOTA_INCIDENT_SAMPLE_MS = "900000"
 
 # Optional successful-wake cooldown. Requires WAKER_KV.
 # WAKE_COOLDOWN_SECONDS = "60"

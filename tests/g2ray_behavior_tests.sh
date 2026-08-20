@@ -295,6 +295,28 @@ test_runtime_lock_serializes_operations_and_allows_reentry() {
     pass "runtime lock serializes operations and allows same-process reentry"
 }
 
+test_runtime_lock_distinguishes_background_subshells() {
+    reset_runtime_paths
+    local result_file="$TMP_ROOT/runtime-sibling-result.txt" child
+    acquire_runtime_lock "parent" || fail "parent could not acquire runtime lock"
+    (
+        RUNTIME_LOCK_WAIT_ATTEMPTS=1
+        unset G2RAY_RUNTIME_LOCK_HELD
+        if acquire_runtime_lock "background-sibling"; then
+            printf 'stolen\n' > "$result_file"
+            release_runtime_lock
+        else
+            printf 'blocked\n' > "$result_file"
+        fi
+    ) &
+    child=$!
+    wait "$child"
+    release_runtime_lock
+    [[ "$(cat "$result_file" 2>/dev/null || true)" == "blocked" ]] \
+        || fail "background subshell was mistaken for the parent runtime-lock owner"
+    pass "runtime lock distinguishes sibling Bash processes"
+}
+
 test_stop_xray_succeeds_when_engine_is_already_stopped() {
     (
         reset_runtime_paths
@@ -1436,7 +1458,10 @@ test_existing_config_upgrade_preserves_uuid_and_safe_handshake_floor() {
     "streamSettings": {"network": "ws", "wsSettings": {"path": "/ws"}},
     "sniffing": {"enabled": true, "destOverride": ["http", "tls"]}
   }],
-  "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+  "outbounds": [
+    {"tag": "direct", "protocol": "freedom"},
+    {"tag": "block", "protocol": "blackhole", "settings": {"response": {"type": "http"}}}
+  ],
   "routing": {"domainStrategy": "AsIs", "rules": []}
 }
 JSON
@@ -1449,7 +1474,9 @@ JSON
         || fail "existing config migration changed the active UUID"
     [[ "$(jq -r '.inbounds[0].streamSettings.wsSettings.heartbeatPeriod' "$CONFIG_FILE")" == "30" ]] \
         || fail "existing config migration did not add the WebSocket idle heartbeat"
-    pass "existing config upgrade preserves UUID and restores safe handshake and WebSocket idle settings"
+    [[ "$(jq -r '.outbounds[] | select(.tag == "block") | .settings.response.type' "$CONFIG_FILE")" == "none" ]] \
+        || fail "existing config migration retained an HTTP payload on the generic blackhole outbound"
+    pass "existing config upgrade preserves UUID and restores safe handshake, blackhole, and WebSocket settings"
 }
 
 test_start_xray_restores_config_when_migrated_config_is_invalid() {
@@ -3572,12 +3599,52 @@ JSON
     pass "export hash tracks the active config XHTTP mode"
 }
 
+test_json_dns_ips_parses_formatted_provider_json() {
+    (
+        curl() {
+            printf '%s\n' '{ "Status": 0, "Answer": [ { "data": "1.2.3.4" }, {"data":"5.6.7.8"}, { "data": "999.1.1.1" } ] }'
+        }
+        local output
+        output=$(json_dns_ips "https://dns.example.test/resolve")
+        grep -Fxq '1.2.3.4' <<< "$output" \
+            || fail "formatted DoH JSON did not yield its first IPv4 candidate"
+        grep -Fxq '5.6.7.8' <<< "$output" \
+            || fail "compact DoH JSON did not yield its IPv4 candidate"
+        if grep -Fxq '999.1.1.1' <<< "$output"; then
+            fail "DoH JSON parser accepted an invalid IPv4 candidate"
+        fi
+    )
+    pass "DoH candidate discovery parses structured JSON regardless of whitespace"
+}
+
+test_active_xray_log_rotation_preserves_open_descriptor() {
+    (
+        local file="$LOG_DIR/xray.log"
+        LOG_MAX_BYTES=1
+        LOG_ROTATE_KEEP=2
+        printf 'before\n' > "$file"
+        exec 8>>"$file"
+        rotate_log_file "$file" || fail "copy-truncate rotation returned failure"
+        printf 'after\n' >&8
+        exec 8>&-
+        grep -Fxq 'before' "${file}.1" \
+            || fail "rotated Xray snapshot lost the pre-rotation content"
+        grep -Fxq 'after' "$file" \
+            || fail "open Xray log descriptor kept writing to the rotated inode"
+        if grep -Fxq 'after' "${file}.1"; then
+            fail "copy-truncate rotation did not preserve the active Xray log path"
+        fi
+    )
+    pass "active Xray log rotation preserves daemon file descriptors"
+}
+
 test_port_visibility_is_throttled
 test_codespace_detection_uses_shared_environment_in_headless_ssh
 test_codespace_detection_uses_local_metadata_when_gh_is_unauthenticated
 test_port_domains_use_codespaces_forwarding_domain_env
 test_run_gh_uses_shared_codespaces_token_when_shell_is_unauthenticated
 test_runtime_lock_serializes_operations_and_allows_reentry
+test_runtime_lock_distinguishes_background_subshells
 test_stop_xray_succeeds_when_engine_is_already_stopped
 test_port_visibility_cache_is_scoped_by_codespace_and_port
 test_lifecycle_port_publish_forces_visibility_cache
@@ -3626,6 +3693,7 @@ test_links_and_export_hash_use_active_config_uuid
 test_active_uuid_rejects_invalid_existing_config
 test_export_hash_tracks_active_config_xhttp_mode
 test_route_preference_write_failures_return_failure
+test_json_dns_ips_parses_formatted_provider_json
 test_pinned_route_is_a_durable_candidate_source
 test_cached_route_health_is_a_durable_candidate_source
 test_dns_candidate_cache_reuses_fresh_provider_results
@@ -3689,6 +3757,7 @@ test_panel_modes_apply_real_performance_profiles
 test_switching_performance_modes_reapplies_once
 test_performance_profile_settings_are_available
 test_xray_configtest_logs_prune_old_files
+test_active_xray_log_rotation_preserves_open_descriptor
 test_route_settling_history_records_summary
 test_doctor_json_reports_probe_state
 test_doctor_json_sanitizes_invalid_port

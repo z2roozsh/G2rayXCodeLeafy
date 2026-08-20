@@ -1333,11 +1333,45 @@ async function recordQuotaIncident(env, event, data) {
       incident.same_codespace_exists = false;
     }
 
+    if (!shouldWriteQuotaIncident(env, existing, incident, nowIso)) {
+      return { recorded: false, incident: Object.keys(existing).length ? existing : incident };
+    }
+
     await env.WAKER_KV.put(quotaIncidentKey(event.codespace), JSON.stringify(incident));
     return { recorded: true, incident };
   } catch {
     return { recorded: false, incident: null };
   }
+}
+
+function shouldWriteQuotaIncident(env, existing, incident, nowIso) {
+  if (!existing || Object.keys(existing).length === 0) return true;
+
+  const stateFields = [
+    "codespace",
+    "quota_reset_estimate_utc",
+    "retention_period_minutes",
+    "retention_expires_at",
+    "retention_risk",
+    "quota_drought_active",
+    "same_codespace_exists",
+    "first_quota_blocked_at",
+    "last_successful_start_at"
+  ];
+  if (stateFields.some((field) => existing[field] !== incident[field])) return true;
+
+  const sampleMs = configuredMs(
+    env,
+    "QUOTA_INCIDENT_SAMPLE_MS",
+    900000,
+    60000,
+    86400000
+  );
+  const previousMs = Date.parse(existing.last_observed_at || "");
+  const currentMs = Date.parse(nowIso || "");
+  return !Number.isFinite(previousMs) ||
+    !Number.isFinite(currentMs) ||
+    currentMs - previousMs >= sampleMs;
 }
 
 async function readHistory(env, codespace) {
@@ -1724,7 +1758,8 @@ async function probeXhttpRoute(name, port, attempts = 1, startedAt = Date.now(),
   const url = routeUrl(name, port, env);
   const probeStartedAt = Date.now();
   try {
-    const res = await fetchWithTimeout(url, { method: "OPTIONS", redirect: "manual" }, ROUTE_FETCH_TIMEOUT_MS);
+    const timeoutMs = configuredMs(env, "ROUTE_FETCH_TIMEOUT_MS", ROUTE_FETCH_TIMEOUT_MS, 100, 30000);
+    const res = await fetchWithTimeout(url, { method: "OPTIONS", redirect: "manual" }, timeoutMs);
     return {
       url,
       usable: isRouteStatusUsable(res.status),

@@ -366,6 +366,8 @@ test_generated_config_uses_resilient_dns_fallback() {
         || fail 'routing still forces a per-connection DNS lookup; use AsIs to cut connection latency'
     grep_fixed '"network": "udp", "port": "443"' "$SCRIPT" \
         || fail 'generated Xray config does not block outbound UDP/443 to avoid QUIC-over-TCP stalls'
+    grep_fixed '"protocol": "blackhole",  "settings": { "response": { "type": "none" } }' "$SCRIPT" \
+        || fail 'generic blackhole outbound still injects an HTTP payload into non-HTTP blocked traffic'
     if grep_fixed 'sniffQuic=true' "$SCRIPT"; then
         fail 'performance profiles still enable QUIC sniffing by default'
     fi
@@ -381,6 +383,14 @@ test_generated_config_uses_resilient_dns_fallback() {
         fail 'generated Xray DNS config still pins most lookups to a single domain-matched resolver before fallback'
     fi
     pass 'generated Xray config uses low-latency resilient DNS and AsIs routing'
+}
+
+test_daemon_logs_use_copytruncate_rotation() {
+    grep_fixed '"$LOG_DIR/xray.log"|"$LOG_DIR/xray-error.log"' "$SCRIPT" \
+        || fail 'active Xray daemon logs are not identified for copy-truncate rotation'
+    grep_fixed 'rotate_log_file "$LOG_DIR/xray.log"' "$SCRIPT" \
+        || fail 'background supervisor does not rotate the Xray runtime log'
+    pass 'active Xray daemon logs use bounded copy-truncate rotation'
 }
 
 test_tcp_fast_open_is_gated_and_outbound_only() {
@@ -2139,6 +2149,7 @@ test_shell_files_are_lf_normalized
 test_panel_script_is_executable
 test_xray_version_can_be_pinned
 test_generated_config_uses_resilient_dns_fallback
+test_daemon_logs_use_copytruncate_rotation
 test_tcp_fast_open_is_gated_and_outbound_only
 test_connection_keepalive_and_halfclose_are_tuned
 test_performance_profile_is_persistent_and_bench_is_isolated
