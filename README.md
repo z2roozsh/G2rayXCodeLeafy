@@ -116,8 +116,8 @@ Offline benchmarks and isolated test fixtures remain available. There is no
 claim of a provider-approved safe duration, uninterrupted hosting, instant
 media, or guaranteed reinstatement.
 
-See [the suspension-risk review](HOSTING_POLICY_REVIEW_2026-11-13.md) for the
-initial findings and the subsequent compatibility correction.
+The checks below verify local behavior and config compatibility. Only GitHub
+can confirm why an account was restricted or whether it can be reinstated.
 
 ## Local Verification
 

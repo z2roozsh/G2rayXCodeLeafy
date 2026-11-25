@@ -37,10 +37,11 @@ backed by the official XTLS `libXray` Android wrapper.
 
 Connection options and their information buttons are under **Settings > Connection
 settings**. Each config's **Share** button offers Copy link and an offline QR.
-The import screen also scans individual or all-config QRs. See the
-[daily-use workflows and options](WORKFLOWS_AND_OPTIONS_2026-10-18.md) for account
-switching, local usage estimates, Quick Settings, bypass routing, and protocol
-tradeoffs.
+The import screen also scans individual or all-config QRs. Select an account
+on Home to switch Codespaces without deleting saved profiles. Usage is a local
+estimate; GitHub billing is authoritative. The G2Ray Quick Settings tile can
+start or stop the selected VPN. Domain and app bypasses intentionally route
+matching traffic outside the tunnel.
 
 Wake setup is optional for an imported profile whose server is already running.
 Start VPN tries that profile directly even when no Worker or GitHub token is

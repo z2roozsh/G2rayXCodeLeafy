@@ -1937,7 +1937,7 @@ test_xhttp_route_settling_is_observable() {
 test_docs_and_public_configs_are_consistent() {
     for text in 'personal network hobby project' 'full-time VPN' 'Compatibility Status' \
         'Do not rotate accounts' 'not a turnkey VPS deployment tool' \
-        'HOSTING_POLICY_REVIEW_2026-11-13.md' 'Private Local Exports' \
+        'reports local behavior, not GitHub approval' 'Private Local Exports' \
         'This project intentionally does not publish a raw GitHub subscription URL' \
         'configs-to-copy-for-mobile.txt' 'G2RAY_QR_MODE' 'G2RAY_EXTRA_FALLBACK_IPS' \
         'G2RAY_ROUTE_WAIT_SEC' 'insecure=0&allowInsecure=0' 'high-resolution QR PNG files under'
