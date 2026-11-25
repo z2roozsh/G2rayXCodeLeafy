@@ -92,6 +92,12 @@ test_background_tasks_uses_owned_pid_file() {
         || fail 'stale supervisor reexec does not use the actual running script path'
     grep_fixed 'if [[ "${1:-}" == "--background-supervisor" ]]; then' "$SCRIPT" \
         || fail 'script has no dedicated background supervisor entrypoint'
+    grep_fixed 'G2RAY_BG_WATCHDOG_TOKEN="$token" nohup bash "$SCRIPT_PATH" --background-watchdog' "$SCRIPT" \
+        || fail 'supervisor has no independent owned watchdog process'
+    grep_fixed 'start_background_tasks "$token"' "$SCRIPT" \
+        || fail 'watchdog restart does not retain the observed generation fence'
+    grep_fixed 'BG_WATCHDOG_PID_FILE=' "$SCRIPT" \
+        || fail 'watchdog ownership is not tracked independently'
     if grep_fixed '_background_tasks </dev/null >/dev/null 2>&1 &' "$SCRIPT"; then
         fail 'background supervisor still runs as an in-process child of postStart/postAttach'
     fi
@@ -325,6 +331,19 @@ test_shell_files_are_lf_normalized() {
     pass 'shell files are LF-normalized for Linux Bash'
 }
 
+test_patch_files_are_lf_normalized() {
+    local file
+    grep_fixed '*.patch text eol=lf' "$GITATTRIBUTES" \
+        || fail '.gitattributes does not force patch files to LF'
+    while IFS= read -r file; do
+        [[ -f "$ROOT_DIR/$file" ]] || continue
+        if LC_ALL=C grep -q $'\r' "$ROOT_DIR/$file"; then
+            fail "tracked patch file contains CRLF bytes: $file"
+        fi
+    done < <(git -C "$ROOT_DIR" ls-files '*.patch' 2>/dev/null)
+    pass 'patch files are LF-normalized for portable application'
+}
+
 test_panel_script_is_executable() {
     git -C "$ROOT_DIR" ls-files --stage -- g2ray.sh | grep -q '^100755 ' \
         || fail 'g2ray.sh is not tracked as executable, so ./g2ray.sh fails after git pull in Linux Codespaces'
@@ -341,6 +360,16 @@ test_xray_version_can_be_pinned() {
         || fail 'Dockerfile does not download Xray digest metadata'
     grep_fixed 'sha256sum -c -' "$DOCKERFILE" \
         || fail 'Dockerfile does not verify Xray zip checksum before installing'
+    grep_fixed 'FROM golang:1.27.3-bookworm AS xray-build' "$DOCKERFILE" \
+        || fail 'maintained server builder does not pin Go 1.27.3'
+    grep_fixed 'COPY --from=xray-build /out/xray /usr/local/bin/xray' "$DOCKERFILE" \
+        || fail 'container rebuild does not retain the tested WebSocket reader correction'
+    grep_fixed '/usr/local/lib/g2ray/xray-official' "$DOCKERFILE" \
+        || fail 'maintained server image does not preserve the verified official binary for rollback'
+    grep_fixed 'pin=1b1647cd9ddf0abc34b981d4611fc03bcac1ca74' "$ROOT_DIR/.devcontainer/build-xray.sh" \
+        || fail 'maintained server source is not pinned to the reviewed release commit'
+    grep_fixed 'go test -race ./transport/internet/websocket' "$ROOT_DIR/.devcontainer/build-xray.sh" \
+        || fail 'maintained server build does not run reader regression tests before compiling'
     pass 'Dockerfile supports pinned Xray version'
 }
 
@@ -411,8 +440,10 @@ test_tcp_fast_open_is_gated_and_outbound_only() {
         || fail 'TCP Fast Open auto mode does not check kernel client support before enabling'
     grep_fixed 'tcpFastOpen\": true' "$SCRIPT" \
         || fail 'generated config does not apply tcpFastOpen via outbound sockopt'
-    grep_fixed '"settings": { "domainStrategy": "UseIPv4" }${direct_sockopt}' "$SCRIPT" \
+    grep_fixed '"tag": "direct", "protocol": "freedom"${direct_sockopt}' "$SCRIPT" \
         || fail 'tcpFastOpen sockopt is not attached to the freedom (direct) outbound'
+    grep_fixed 'sockopt_inner="\"domainStrategy\": \"UseIPv4\",' "$SCRIPT" \
+        || fail 'the generated direct outbound does not use the supported IPv4 DNS setting'
     grep_fixed 'G2RAY_TCP_FAST_OPEN' "$README" \
         || fail 'README does not document the TCP Fast Open toggle'
     grep_fixed 'TCP FastOpen:' "$SCRIPT" \
@@ -439,6 +470,10 @@ test_connection_keepalive_and_halfclose_are_tuned() {
         || fail 'exported links cannot carry an explicitly requested XHTTP extra object'
     grep_fixed 'G2RAY_XHTTP_LINK_TUNING' "$SCRIPT" \
         || fail 'measured XHTTP link tuning has no compatibility escape hatch'
+    grep_fixed 'value:-off' "$SCRIPT" \
+        || fail 'XHTTP link tuning is still enabled by default'
+    grep_fixed '1|true|yes|on|enabled' "$SCRIPT" \
+        || fail 'XHTTP link tuning enables unexpected preference values'
     grep_fixed 'xhttp_link_tuning_enabled || return 0' "$SCRIPT" \
         || fail 'XHTTP link tuning cannot be disabled without changing the server'
     pass 'TCP keepalive, half-close timeouts, and reversible XHTTP link tuning are present'
@@ -628,12 +663,12 @@ test_websocket_fallback_is_advanced_opt_in() {
         || fail 'README does not document the WebSocket fallback panel toggle'
     grep_fixed '20) Cloudflare WS Front' "$README" \
         || fail 'README does not document the Cloudflare WS front panel manager'
-    grep_fixed 'If your Cloudflare plan cannot set Host/SNI override rules' "$README" \
-        || fail 'README does not warn that Cloudflare Free/simple CNAME fronting is unreliable'
-    grep_fixed 'survives future panel sessions until you toggle it again' "$README" \
-        || fail 'README does not document persistent WebSocket fallback state'
-    grep_fixed 'XHTTP remains the recommended default' "$README" \
-        || fail 'README does not keep XHTTP as the recommended default'
+    grep_fixed 'a domain alone neither supplies origin Host/SNI routing nor changes provider terms' "$README" \
+        || fail 'README omits the domain fronting limitation'
+    grep_fixed 'persists its setting across sessions' "$README" \
+        || fail 'README omits persisted fallback preferences'
+    grep_fixed 'Transport defaults are unchanged' "$README" \
+        || fail 'README implies this policy change retunes transports'
     pass 'WebSocket fallback is advanced opt-in'
 }
 
@@ -940,8 +975,11 @@ test_local_reopen_helper_is_documented() {
         || fail 'README does not document the local reopen helper'
     grep_fixed 'Default idle timeout' "$README" \
         || fail 'README does not document setting the Codespaces idle timeout'
-    grep_fixed '240 minutes' "$README" \
-        || fail 'README does not recommend the maximum supported idle timeout'
+    if grep_fixed 'if (-not $DevelopmentOnly)' "$REOPEN_SCRIPT"; then
+        fail 'existing reopen commands require an incompatible new argument'
+    fi
+    grep_fixed 'no new mandatory opt-in argument' "$README" \
+        || fail 'README omits the preserved reopen interface'
     pass 'local reopen helper is documented'
 }
 
@@ -982,8 +1020,10 @@ test_cloudflare_worker_waker_is_safe_to_publish() {
         || fail 'Worker does not redact GitHub error response details'
     grep_fixed 'idle_timeout_minutes:' "$WORKER_SCRIPT" \
         || fail 'Worker success response does not retain useful redacted status fields'
-    grep_fixed 'probeCodespaceRoutes(name, routePorts, env)' "$WORKER_SCRIPT" \
+    grep_fixed 'await probeCodespaceRoutes(name, routePorts, env, {' "$WORKER_SCRIPT" \
         || fail 'Worker does not wait for the selected Codespace XHTTP route after start'
+    grep_fixed 'await waitForXhttpRoute(name, port, env, firstProbe, startedAt)' "$WORKER_SCRIPT" \
+        || fail 'Worker warm precheck does not pass through stable primary-route verification'
     grep_fixed 'probeCodespaceRoutes(codespaceName, context.routePorts, env)' "$WORKER_SCRIPT" \
         || fail 'Worker health check does not use stable selected-Codespace route readiness'
     grep_fixed 'route_ready: routeChecked' "$WORKER_SCRIPT" \
@@ -1135,21 +1175,24 @@ test_quota_survival_layer_is_present() {
         || fail 'Worker does not provide quota-survival next actions'
     grep_fixed 'QUOTA_INCIDENT_KEY_PREFIX' "$WORKER_SCRIPT" \
         || fail 'Worker does not persist quota incident history'
-    grep_fixed 'QUOTA_SURVIVAL_CRON_ENABLED' "$WORKER_SCRIPT" \
-        || fail 'Worker scheduled quota checks are not explicitly opt-in'
-    grep_fixed 'quotaSurvivalCronEnabled(env)' "$WORKER_SCRIPT" \
-        || fail 'Worker scheduled handler is not gated behind opt-in config'
+    if grep_fixed 'handleQuotaSurvivalCron' "$WORKER_SCRIPT" || grep_fixed 'quotaSurvivalCronEnabled' "$WORKER_SCRIPT"; then
+        fail 'retired quota-revival code remains reachable'
+    fi
+    grep_fixed 'async scheduled()' "$WORKER_SCRIPT" || fail 'legacy scheduled events are not handled inertly'
+    if grep_fixed 'env.CODESPACE_WAKE_PURPOSE' "$WORKER_SCRIPT"; then
+        fail 'existing authenticated Worker starts require a new purpose flag'
+    fi
     grep_fixed 'Keep codespace' "$SCRIPT" \
         || fail 'panel does not guide users to Keep codespace before quota exhaustion'
     grep_fixed 'same configs can survive until reset' "$SCRIPT" \
         || fail 'quota panel does not explain same-Codespace survival'
     grep_fixed 'Keep codespace' "$README" \
-        || fail 'README does not tell users to preserve the Codespace with Keep codespace'
-    grep_fixed 'same VLESS configs survive into the next monthly reset only if the same Codespace name/domain survives' "$README" \
-        || fail 'README does not explain same-domain survival through quota reset'
+        || fail 'README omits how to preserve the stopped workspace'
+    grep_fixed 'same Codespace name/domain and UUID' "$README" \
+        || fail 'README omits what existing links depend on'
     grep_fixed 'QUOTA_SURVIVAL_CRON_ENABLED' "$WORKER_README" \
-        || fail 'Worker README does not document optional quota-survival Cron'
-    pass 'quota survival layer is present and documented'
+        || fail 'Worker README does not explain removing legacy Cron settings'
+    pass 'quota history is retained without scheduled quota revival'
 }
 
 test_worker_wake_edge_cases_are_hardened() {
@@ -1602,97 +1645,26 @@ test_diagnostics_show_external_waker_state() {
 }
 
 test_docs_cover_panel_waker_setup() {
-    grep_fixed 'Option 15' "$README" \
-        || fail 'README does not document the panel recovery setup option'
-    grep_fixed 'choose `1) Generate Config & Start`' "$README" \
-        || fail 'README fresh-start flow does not tell users which panel option to choose'
-    grep_fixed 'Do not paste the GitHub token into G2ray' "$README" \
-        || fail 'README does not warn against storing GitHub tokens in the panel'
-    grep_fixed 'paste the existing key instead of generating another one' "$README" \
-        || fail 'README does not explain shared wake-key reuse'
-    grep_fixed 'Recovery / Waker Setup' "$README" \
-        || fail 'README does not name the recovery setup screen'
-    grep_fixed 'Default idle timeout** to **240 minutes' "$README" \
-        || fail 'README does not retain the 240 minute idle-timeout recommendation'
-    grep_fixed 'Recovery / Waker Setup' "$WORKER_README" \
-        || fail 'Worker README does not mention the panel setup flow'
-    grep_fixed 'GET /wake` page is public' "$README" \
-        || fail 'README does not clarify that the Worker page is public but actions are protected'
-    grep_fixed 'GET /wake` page is public' "$WORKER_README" \
-        || fail 'Worker README does not clarify that the page is public but actions are protected'
-    grep_fixed 'Return to panel option `15`' "$README" \
-        || fail 'README does not tell users to return to option 15 after Worker deployment'
-    grep_fixed 'Return to **Option 15: Recovery / Waker Setup**' "$WORKER_README" \
-        || fail 'Worker README does not tell users to return to option 15 after deploy'
-    grep_fixed 'bash ./g2ray.sh --silent-start' "$README" \
-        || fail 'README does not document the post-pull runtime refresh command'
-    grep_fixed '`--recover-now` is non-interactive and soft-only' "$README" \
-        || fail 'README does not clarify headless recover limitations'
-    grep_fixed 'This project intentionally does not publish a raw GitHub subscription URL' "$README" \
-        || fail 'README does not explain local-only subscription exports'
-    grep_fixed 'Local subscription file' "$SCRIPT" \
-        || fail 'diagnostics does not show the local subscription file'
+    for text in 'No additional purpose flag is required' \
+        'Scheduled quota revival has been retired' 'GitHub Support' \
+        'GET /wake' 'Do not paste the GitHub token into G2ray' \
+        'next_action_code' 'history_deferred: true' \
+        'history and quota-incident work were queued through Cloudflare' \
+        'notification_status: "deferred"' \
+        'read -rsp "Wake secret: " WAKE_SECRET'
+    do
+        grep_fixed "$text" "$WORKER_README" || fail "Worker guide is missing: $text"
+    done
+    grep_fixed 'worker/codespace-waker/README.md' "$README" || fail 'README does not link to Worker setup'
+    grep_fixed 'authenticated on-demand workspace starts' "$README" || fail 'README omits the compatible wake interface'
+    if grep_fixed 'require_runtime_host' "$SCRIPT"; then fail 'Codespaces runtime remains disabled by the temporary guard'; fi
+    grep_fixed 'Local server/Worker changes do not remotely disable' "$README" \
+        || fail 'README implies editing source changes an installed app'
     if grep_fixed 'publish-subscription' "$README" || grep_fixed 'publish-subscription' "$SCRIPT"; then
-        fail 'public subscription publishing command is still documented or wired'
+        fail 'public subscription publishing command is documented or wired'
     fi
-    if grep_fixed 'Raw subscription URL' "$SCRIPT"; then
-        fail 'panel still prints a raw subscription URL'
-    fi
-    grep_fixed 'Option `49) Toggle Latency Focus Mode`' "$README" \
-        || fail 'README does not document latency focus mode'
-    grep_fixed 'G2RAY_LATENCY_FOCUS=1' "$README" \
-        || fail 'README does not document the latency focus environment flag'
-    grep_fixed 'applies the `low_latency` profile' "$README" \
-        || fail 'README does not state that latency focus applies the real low_latency profile'
-    grep_fixed 'applies the `low_overhead` profile' "$README" \
-        || fail 'README does not state that low-overhead applies the real low_overhead profile'
-    grep_fixed 'wake attempts' "$WORKER_README" \
-        || fail 'Worker README overstates or omits alert trigger scope'
-    grep_fixed 'next_action_code' "$WORKER_README" \
-        || fail 'Worker README does not document stable next-action codes'
-    grep_fixed 'history_deferred: true' "$WORKER_README" \
-        || fail 'Worker README does not document deferred KV history writes'
-    grep_fixed 'history and quota-incident work were queued through Cloudflare' "$WORKER_README" \
-        || fail 'Worker README does not document deferred quota-incident work'
-    grep_fixed '`quota_incident_recorded: false` while deferred' "$WORKER_README" \
-        || fail 'Worker README claims deferred quota-incident writes completed'
-    grep_fixed 'Do not paste the GitHub token into G2ray' "$WORKER_README" \
-        || fail 'Worker README does not mirror the token handling warning'
-    grep_fixed 'read -rsp "Wake secret: " WAKE_SECRET' "$README" \
-        || fail 'README still encourages typing the wake secret directly into curl commands'
-    grep_fixed 'read -rsp "Wake secret: " WAKE_SECRET' "$WORKER_README" \
-        || fail 'Worker README still encourages typing the wake secret directly into curl commands'
-    grep_fixed 'keeps the wake secret out of shell history' "$README" \
-        || fail 'README does not explain safer wake secret CLI handling'
-    grep_fixed 'https://github.com/settings/tokens/new?scopes=codespace' "$README" \
-        || fail 'README does not give a direct GitHub token creation path'
-    grep_fixed 'CODESPACE_NAME`: **Plaintext** variable' "$README" \
-        || fail 'README does not clarify CODESPACE_NAME as a plaintext Cloudflare variable'
-    grep_fixed 'GITHUB_TOKEN`: **Secret** variable' "$README" \
-        || fail 'README does not clarify GITHUB_TOKEN as a Cloudflare secret'
-    grep_fixed 'CODESPACE_PORT`: **Plaintext** variable only if you changed `XRAY_PORT`' "$README" \
-        || fail 'README does not document the optional CODESPACE_PORT Worker binding'
-    grep_fixed 'route_ready: true' "$README" \
-        || fail 'README does not explain successful Worker route readiness'
-    grep_fixed 'route_ready: false' "$README" \
-        || fail 'README does not explain Worker route settling failures'
-    grep_fixed 'with or without `https://`, and with or without `/wake`' "$README" \
-        || fail 'README does not clarify accepted Worker URL formats'
-    grep_fixed '| Plaintext | `CODESPACE_NAME`' "$WORKER_README" \
-        || fail 'Worker README does not clarify CODESPACE_NAME dashboard binding type'
-    grep_fixed 'CODESPACE_PORT` as a **Plaintext** variable only if you changed' "$WORKER_README" \
-        || fail 'Worker README does not document the optional CODESPACE_PORT binding'
-    grep_fixed '| Secret | `GITHUB_TOKEN`' "$WORKER_README" \
-        || fail 'Worker README does not clarify GITHUB_TOKEN as a secret'
-    grep_fixed '| Secret | `WAKE_SECRET`' "$WORKER_README" \
-        || fail 'Worker README does not clarify WAKE_SECRET as a secret'
-    grep_fixed 'route_ready: false` with HTTP `404`' "$WORKER_README" \
-        || fail 'Worker README does not explain the route-settling response'
-    grep_fixed 'notification_status: "deferred"' "$WORKER_README" \
-        || fail 'Worker README does not explain deferred notification status'
-    grep_fixed 'VS Code Desktop' "$README" \
-        || fail 'README does not mention VS Code Desktop fallback for slow browser Codespaces'
-    pass 'docs cover panel waker setup'
+    grep_fixed 'Local subscription file' "$SCRIPT" || fail 'diagnostics omits the private local subscription'
+    pass 'Worker authorization and existing wake/runtime interfaces remain compatible'
 }
 
 test_background_supervisor_ownership_is_strict() {
@@ -1963,77 +1935,31 @@ test_xhttp_route_settling_is_observable() {
 }
 
 test_docs_and_public_configs_are_consistent() {
-    if grep_fixed '1-to-17' "$README" || grep_fixed '1 to 17' "$README"; then
-        fail 'README menu count is stale'
-    fi
-    grep_fixed 'numbered menu actions grouped by core controls' "$README" \
-        || fail 'README does not describe the current grouped menu'
-    if grep_fixed 'did now get shown' "$README"; then
-        fail 'README still contains the "did now" typo'
-    fi
-    grep_fixed 'G2RAY_QR_MODE' "$README" \
-        || fail 'README does not document G2RAY_QR_MODE'
-    grep_fixed 'high-resolution QR PNG files under `data/qr/`' "$README" \
-        || fail 'README does not document the scan-friendly QR PNG export'
-    grep_fixed 'G2RAY_EXTRA_FALLBACK_IPS' "$README" \
-        || fail 'README does not document G2RAY_EXTRA_FALLBACK_IPS'
-    grep_fixed 'G2RAY_ROUTE_WAIT_SEC' "$README" \
-        || fail 'README does not document startup route wait'
-    grep_fixed 'configs-to-copy-for-mobile.txt' "$README" \
-        || fail 'README does not document the mobile copy-link fallback for QR scan failures'
-    grep_fixed 'Choose Your Codespace Region Before Creating It' "$README" \
-        || fail 'README does not tell users to choose a region before creating a Codespace'
-    grep_fixed 'You cannot move an existing Codespace to another region' "$README" \
-        || fail 'README does not explain that region changes require a new Codespace'
-    grep_fixed 'gh codespace create -R OWNER/REPO -l WestEurope --idle-timeout 240m' "$README" \
-        || fail 'README does not include a CLI example for region selection'
-    grep_fixed 'Linux recovery after Worker wake' "$README" \
-        || fail 'README does not include Linux recovery troubleshooting after Worker wake'
-    grep_fixed 'gh codespace ports visibility 443:public -c "$CS"' "$README" \
-        || fail 'README Linux recovery flow does not include public port repair'
-    grep_fixed 'Startup automation and port forwarding' "$README" \
-        || fail 'README does not explain automatic startup port forwarding and its rebuild requirement'
-    grep_fixed 'curl -sS -o /dev/null -w "route=%{http_code} time=%{time_total}s\n" -X OPTIONS "$APP"' "$README" \
-        || fail 'README Linux recovery flow does not include an external route probe'
-    grep_fixed '12) Server Location' "$README" \
-        || fail 'README does not tell users to verify the observed exit location'
-    [[ ! -e "$ROOT_DIR/configs.txt" ]] \
-        || fail 'public configs.txt should not exist in the repo'
-    grep_fixed '/configs.txt' "$GITIGNORE" \
-        || fail '.gitignore does not block regenerated public configs.txt'
-    grep_fixed 'Personal test and educational use only' "$README" \
-        || fail 'README does not state personal/test-only use'
-    grep_fixed 'Private Local Exports' "$README" \
-        || fail 'README does not describe private local exports'
-    grep_fixed 'This project intentionally does not publish a raw GitHub subscription URL' "$README" \
-        || fail 'README does not explain that subscriptions are local-only'
-    grep_fixed 'Local base64 subscription file' "$SCRIPT" \
-        || fail 'config screen does not label the local subscription file'
-    grep_fixed '"subscription_scope": "local_codespace_only"' "$SCRIPT" \
-        || fail 'config metadata is not marked local-only'
-    for removed in \
-        'Community Donated Configs' \
-        'Community Config Network' \
-        'Donate Config' \
-        'send_to_vless_forwarder' \
-        'publish-subscription' \
+    for text in 'personal network hobby project' 'full-time VPN' 'Compatibility Status' \
+        'Do not rotate accounts' 'not a turnkey VPS deployment tool' \
+        'HOSTING_POLICY_REVIEW_2026-11-13.md' 'Private Local Exports' \
+        'This project intentionally does not publish a raw GitHub subscription URL' \
+        'configs-to-copy-for-mobile.txt' 'G2RAY_QR_MODE' 'G2RAY_EXTRA_FALLBACK_IPS' \
+        'G2RAY_ROUTE_WAIT_SEC' 'insecure=0&allowInsecure=0' 'high-resolution QR PNG files under'
+    do
+        grep_fixed "$text" "$README" || fail "README is missing: $text"
+    done
+    [[ ! -e "$ROOT_DIR/configs.txt" ]] || fail 'public configs.txt should not exist'
+    grep_fixed '/configs.txt' "$GITIGNORE" || fail 'generated configs are not ignored'
+    grep_fixed 'Local base64 subscription file' "$SCRIPT" || fail 'config screen mislabels the private subscription'
+    grep_fixed '"subscription_scope": "local_codespace_only"' "$SCRIPT" || fail 'config metadata loses its private scope'
+    grep_fixed 'insecure=0&allowInsecure=0' "$SCRIPT" || fail 'TLS verification changed'
+    for removed in 'Community Donated Configs' 'Community Config Network' \
+        'Donate Config' 'send_to_vless_forwarder' 'publish-subscription' \
         'raw.githubusercontent.com/shayanay80atomic/G2rayXCodeLeafy/main/configs.txt' \
-        'shayanay80atomic/G2rayXCodeLeafy' \
-        'shaunme32/G2rayXCodeLeafy' \
-        'https://code-leafy.github.io/NetLeafy' \
-        'https://t.me/CodeLeafy'
+        'shayanay80atomic/G2rayXCodeLeafy' 'shaunme32/G2rayXCodeLeafy' \
+        'https://code-leafy.github.io/NetLeafy' 'https://t.me/CodeLeafy'
     do
         if grep_fixed "$removed" "$README" || grep_fixed "$removed" "$SCRIPT"; then
-            fail "public config sharing reference remains: $removed"
+            fail "public sharing reference remains: $removed"
         fi
     done
-    grep_fixed 'insecure=0&allowInsecure=0' "$README" \
-        || fail 'README does not document secure-by-default TLS verification in exported links'
-    grep_fixed 'insecure=0&allowInsecure=0' "$SCRIPT" \
-        || fail 'generated links are not secure-by-default for TLS verification'
-    grep_fixed 'allowInsecure=1` can be tried manually as a compatibility workaround' "$README" \
-        || fail 'README does not disclose the optional TLS verification compatibility tradeoff'
-    pass 'docs and local-only config exports are consistent'
+    pass 'hosting guidance is explicit and private export/TLS protections are preserved'
 }
 
 test_devcontainer_tooling_is_not_duplicated() {
@@ -2060,10 +1986,8 @@ test_devcontainer_tooling_is_not_duplicated() {
     if grep_fixed 'openssh-server' "$ROOT_DIR/.devcontainer/Dockerfile"; then
         fail 'Dockerfile manually installs openssh-server instead of using the devcontainer sshd feature'
     fi
-    grep_fixed 'gh codespace ssh' "$README" \
-        || fail 'README does not document remote Codespace SSH access'
-    grep_fixed 'socks5://127.0.0.1:10808' "$README" \
-        || fail 'README does not document the working proxy scheme for gh codespace ssh/rebuild'
+    grep_fixed 'development workspace' "$README" \
+        || fail 'README does not describe the development-only container'
     if grep_fixed '/workspaces/G2rayXCodeLeafy' "$README"; then
         fail 'README hard-codes the workspace folder and breaks renamed forks'
     fi
@@ -2085,10 +2009,10 @@ test_devcontainer_post_start_wrapper_is_present() {
     grep_fixed 'bash ./scripts/post-start.sh' "$ROOT_DIR/.devcontainer/devcontainer.json" \
         || fail 'devcontainer does not run the post-start wrapper'
     grep_fixed '--silent-start' "$POST_START_SCRIPT" \
-        || fail 'post-start wrapper does not call the silent-start recovery path'
-    grep_fixed 'post-start.log' "$POST_START_SCRIPT" \
-        || fail 'post-start wrapper does not write a persistent post-start log'
-    pass 'devcontainer post-start wrapper is present and wired'
+        || fail 'post-start no longer resumes the saved tunnel after wake'
+    grep_fixed 'post_start failed rc=%s' "$POST_START_SCRIPT" \
+        || fail 'post-start omits the actual failure status'
+    pass 'post-start remains wired to the compatible headless tunnel resume path'
 }
 
 test_menu_loop_and_link_output_are_tidy() {
@@ -2112,8 +2036,8 @@ test_menu_loop_and_link_output_are_tidy() {
         || fail 'wait_for_port does not provide animated progress frames'
     grep_fixed 'Initializing engine... (${i}s)' "$SCRIPT" \
         || fail 'wait_for_port does not show elapsed initialization time'
-    grep_fixed 'Toggle Anti-Sleep Mode ($(echo -e "$_KA_LABEL"))' "$SCRIPT" \
-        || fail 'anti-sleep toggle menu item does not show the current state inline'
+    grep_fixed 'Anti-Sleep (retired)' "$SCRIPT" \
+        || fail 'panel still offers anti-idle traffic as an active toggle'
     grep_fixed 'Toggle Latency Focus Mode ($(echo -e "$_LATENCY_LABEL"))' "$SCRIPT" \
         || fail 'latency focus toggle menu item does not show the current state inline'
     grep_fixed 'latency_focus_enabled()' "$SCRIPT" \
@@ -2172,6 +2096,7 @@ test_exit_trap_preserves_failures
 test_generated_files_are_ignored
 test_support_bundle_has_safe_entrypoint
 test_shell_files_are_lf_normalized
+test_patch_files_are_lf_normalized
 test_panel_script_is_executable
 test_xray_version_can_be_pinned
 test_generated_config_uses_resilient_dns_fallback

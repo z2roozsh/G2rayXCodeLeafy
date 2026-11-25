@@ -1,6 +1,13 @@
 package com.g2ray.client.ui
 
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.compose.runtime.saveable.listSaver
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -10,16 +17,20 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.filled.AltRoute
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.g2ray.client.model.*
+import com.g2ray.client.parser.CodespaceProfileIdentity
 import com.g2ray.client.parser.VlessUriParser
 import com.g2ray.client.vpn.SpeedFormatter
 
@@ -31,6 +42,39 @@ sealed interface SettingsDest {
     data class ApiKeyEditor(val accountId: String, val keyId: String?) : SettingsDest
     data class Profiles(val accountId: String) : SettingsDest
     data class ProfileImport(val accountId: String) : SettingsDest
+    object Connection : SettingsDest
+    object Routing : SettingsDest
+    data class Quota(val accountId: String) : SettingsDest
+}
+
+internal fun encodeSettingsDestination(destination: SettingsDest): String = when (destination) {
+    SettingsDest.Accounts -> "accounts"
+    SettingsDest.WorkerControlPlane -> "worker"
+    SettingsDest.Connection -> "connection"
+    SettingsDest.Routing -> "routing"
+    is SettingsDest.AccountEditor -> "account|${destination.accountId.orEmpty()}"
+    is SettingsDest.ApiKeys -> "keys|${destination.accountId}"
+    is SettingsDest.ApiKeyEditor -> "key|${destination.accountId}|${destination.keyId.orEmpty()}"
+    is SettingsDest.Profiles -> "profiles|${destination.accountId}"
+    is SettingsDest.ProfileImport -> "import|${destination.accountId}"
+    is SettingsDest.Quota -> "quota|${destination.accountId}"
+}
+
+internal fun decodeSettingsDestination(value: String): SettingsDest? {
+    val parts = value.split('|')
+    return when (parts.firstOrNull()) {
+        "accounts" -> SettingsDest.Accounts
+        "worker" -> SettingsDest.WorkerControlPlane
+        "connection" -> SettingsDest.Connection
+        "routing" -> SettingsDest.Routing
+        "account" -> SettingsDest.AccountEditor(parts.getOrNull(1)?.ifBlank { null })
+        "keys" -> parts.getOrNull(1)?.takeIf(String::isNotBlank)?.let(SettingsDest::ApiKeys)
+        "key" -> parts.getOrNull(1)?.takeIf(String::isNotBlank)?.let { SettingsDest.ApiKeyEditor(it, parts.getOrNull(2)?.ifBlank { null }) }
+        "profiles" -> parts.getOrNull(1)?.takeIf(String::isNotBlank)?.let(SettingsDest::Profiles)
+        "import" -> parts.getOrNull(1)?.takeIf(String::isNotBlank)?.let(SettingsDest::ProfileImport)
+        "quota" -> parts.getOrNull(1)?.takeIf(String::isNotBlank)?.let(SettingsDest::Quota)
+        else -> null
+    }
 }
 
 internal fun wakeKeyDisplayTextVisibleForTesting(secret: String): String = wakeKeyDisplayText(secret)
@@ -51,11 +95,11 @@ fun SettingsScreen(
     viewModel: G2RayViewModel,
     onNavigateBack: () -> Unit
 ) {
-    val savedDataReady by viewModel.savedDataReady.collectAsState()
-    val savedDataError by viewModel.repositoryLoadError.collectAsState()
-    val isReloading by viewModel.isReloadingSavedData.collectAsState()
-    val originalConfig by viewModel.legacyProfileForRecovery.collectAsState()
-    val vpnState by VpnStateRepository.state.collectAsState()
+    val savedDataReady by viewModel.savedDataReady.collectAsStateWithLifecycle()
+    val savedDataError by viewModel.repositoryLoadError.collectAsStateWithLifecycle()
+    val isReloading by viewModel.isReloadingSavedData.collectAsStateWithLifecycle()
+    val originalConfig by viewModel.legacyProfileForRecovery.collectAsStateWithLifecycle()
+    val vpnState by VpnStateRepository.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     if (!savedDataReady) {
         Scaffold(topBar = {
@@ -72,7 +116,7 @@ fun SettingsScreen(
                 SavedDataNotice(
                     message = savedDataError ?: "Reloading saved settings...",
                     reloading = isReloading,
-                    retryEnabled = vpnState.tunnelState in setOf(TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error),
+                    retryEnabled = vpnState.tunnelState in setOf(TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error, TunnelState.Blocked),
                     onRetry = viewModel::reloadSavedData,
                     onCopyOriginal = originalConfig?.let { raw ->
                         {
@@ -85,7 +129,10 @@ fun SettingsScreen(
         }
         return
     }
-    val backstack = remember { mutableStateListOf<SettingsDest>(SettingsDest.Accounts) }
+    val backstack = rememberSaveable(saver = listSaver(
+        save = { stack: androidx.compose.runtime.snapshots.SnapshotStateList<SettingsDest> -> stack.map(::encodeSettingsDestination) },
+        restore = { saved -> saved.mapNotNull(::decodeSettingsDestination).ifEmpty { listOf(SettingsDest.Accounts) }.toMutableStateList() }
+    )) { mutableStateListOf<SettingsDest>(SettingsDest.Accounts) }
     val currentDest = backstack.last()
 
     fun handleBack() {
@@ -96,7 +143,12 @@ fun SettingsScreen(
         }
     }
 
-    when (currentDest) {
+    val savingSettings by viewModel.isSavingSettings.collectAsStateWithLifecycle()
+    BackHandler(enabled = backstack.size > 1) { if (!savingSettings) handleBack() }
+    val feedback by viewModel.statusMessage.collectAsStateWithLifecycle()
+    Column(Modifier.fillMaxSize().imePadding()) {
+      Box(Modifier.weight(1f)) {
+      when (currentDest) {
         is SettingsDest.Accounts -> {
             AccountsScreen(
                 viewModel = viewModel,
@@ -104,6 +156,10 @@ fun SettingsScreen(
                 onAddAccount = { backstack.add(SettingsDest.AccountEditor(null)); Unit },
                 onEditAccount = { backstack.add(SettingsDest.AccountEditor(it)); Unit },
                 onManageSharedWorker = { backstack.add(SettingsDest.WorkerControlPlane); Unit },
+                onConnectionSettings = { backstack.add(SettingsDest.Connection); Unit },
+                onRoutingSettings = { backstack.add(SettingsDest.Routing); Unit },
+                onManageKeys = { backstack.add(SettingsDest.ApiKeys(it)); Unit },
+                onManageQuota = { backstack.add(SettingsDest.Quota(it)); Unit },
                 onManageProfiles = { backstack.add(SettingsDest.Profiles(it)); Unit }
             )
         }
@@ -138,7 +194,7 @@ fun SettingsScreen(
             ProfilesScreen(
                 viewModel = viewModel,
                 accountId = currentDest.accountId,
-                delayStates = viewModel.profileDelayStates.collectAsState().value,
+                delayStates = viewModel.profileDelayStates.collectAsStateWithLifecycle().value,
                 onNavigateBack = { handleBack() },
                 onImportProfile = { backstack.add(SettingsDest.ProfileImport(currentDest.accountId)); Unit }
             )
@@ -147,9 +203,24 @@ fun SettingsScreen(
             ProfileImportScreen(
                 viewModel = viewModel,
                 accountId = currentDest.accountId,
-                onNavigateBack = { handleBack() }
+                onNavigateBack = { handleBack() },
+                onImported = { importedAccountId ->
+                    handleBack()
+                    if (backstack.lastOrNull() is SettingsDest.Profiles) {
+                        backstack[backstack.lastIndex] = SettingsDest.Profiles(importedAccountId)
+                    }
+                }
             )
         }
+        SettingsDest.Connection -> ConnectionSettingsScreen(viewModel, ::handleBack)
+        SettingsDest.Routing -> RoutingSettingsScreen(viewModel, ::handleBack)
+        is SettingsDest.Quota -> QuotaSettingsScreen(viewModel, currentDest.accountId, ::handleBack)
+      }
+      }
+      if (feedback != "Idle") Surface(color = MaterialTheme.colorScheme.surfaceVariant) {
+          Text(feedback, Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+              style = MaterialTheme.typography.bodySmall, maxLines = 3)
+      }
     }
 }
 
@@ -161,25 +232,31 @@ fun AccountsScreen(
     onAddAccount: () -> Unit,
     onEditAccount: (String) -> Unit,
     onManageSharedWorker: () -> Unit,
+    onConnectionSettings: () -> Unit,
+    onRoutingSettings: () -> Unit,
+    onManageKeys: (String) -> Unit,
+    onManageQuota: (String) -> Unit,
     onManageProfiles: (String) -> Unit
 ) {
-    val accounts by viewModel.accounts.collectAsState()
-    val activeSelection by viewModel.activeSelection.collectAsState()
-    val keys by viewModel.apiKeys.collectAsState()
-    val profiles by viewModel.profiles.collectAsState()
-    val controlPlane by viewModel.workerControlPlane.collectAsState()
+    val accounts by viewModel.accounts.collectAsStateWithLifecycle()
+    val activeSelection by viewModel.activeSelection.collectAsStateWithLifecycle()
+    val keys by viewModel.apiKeys.collectAsStateWithLifecycle()
+    val profiles by viewModel.profiles.collectAsStateWithLifecycle()
+    val controlPlane by viewModel.workerControlPlane.collectAsStateWithLifecycle()
     var accountPendingDelete by remember { mutableStateOf<G2RayAccount?>(null) }
 
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Codespaces") },
+                title = { Text("Settings", maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 navigationIcon = {
                     IconButton(onClick = onNavigateBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
                 actions = {
+                    IconButton(onClick = onConnectionSettings) { Icon(Icons.Default.Tune, "Connection settings") }
+                    IconButton(onClick = onRoutingSettings) { Icon(Icons.AutoMirrored.Filled.AltRoute, "Bypass routing") }
                     IconButton(onClick = onManageSharedWorker) {
                         Icon(Icons.Default.SettingsEthernet, contentDescription = "Shared Worker control plane")
                     }
@@ -302,6 +379,10 @@ fun AccountsScreen(
                                     Text("Configs (${accountProfs.size})", style = MaterialTheme.typography.labelMedium)
                                 }
                             }
+                            Row {
+                                TextButton(onClick = { onManageKeys(account.id) }) { Text("Keys") }
+                                TextButton(onClick = { onManageQuota(account.id) }) { Text("Usage") }
+                            }
                         }
                     }
                 }
@@ -340,9 +421,9 @@ fun AccountEditorScreen(
     accountId: String?,
     onNavigateBack: () -> Unit
 ) {
-    val accounts by viewModel.accounts.collectAsState()
-    val apiKeys by viewModel.apiKeys.collectAsState()
-    val controlPlane by viewModel.workerControlPlane.collectAsState()
+    val accounts by viewModel.accounts.collectAsStateWithLifecycle()
+    val apiKeys by viewModel.apiKeys.collectAsStateWithLifecycle()
+    val controlPlane by viewModel.workerControlPlane.collectAsStateWithLifecycle()
     val editingAccount = remember(accountId, accounts) { accounts.find { it.id == accountId } }
     val directToken = remember(editingAccount?.id, apiKeys) {
         apiKeys.firstOrNull {
@@ -350,14 +431,14 @@ fun AccountEditorScreen(
         }
     }
 
-    var displayName by remember(editingAccount?.id) { mutableStateOf(editingAccount?.displayName ?: "") }
-    var codespaceName by remember(editingAccount?.id) { mutableStateOf(editingAccount?.codespaceName ?: "") }
-    var wakeMode by remember(editingAccount?.id) {
+    val drafts: FormDraftViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
+    val saving by viewModel.isSavingSettings.collectAsStateWithLifecycle()
+    var displayName by rememberSaveable(editingAccount?.id) { mutableStateOf(editingAccount?.displayName ?: "") }
+    var codespaceName by rememberSaveable(editingAccount?.id) { mutableStateOf(editingAccount?.codespaceName ?: "") }
+    var wakeMode by rememberSaveable(editingAccount?.id) {
         mutableStateOf(editingAccount?.wakeMode ?: CodespaceWakeMode.AUTO)
     }
-    var githubToken by remember(editingAccount?.id, directToken?.updatedAt) {
-        mutableStateOf(directToken?.encryptedValue.orEmpty())
-    }
+    var githubToken by drafts.text("account:${accountId}:${directToken?.updatedAt}:token", directToken?.encryptedValue.orEmpty())
     var statusMessage by remember { mutableStateOf("") }
 
     Scaffold(
@@ -365,7 +446,7 @@ fun AccountEditorScreen(
             TopAppBar(
                 title = { Text(if (accountId == null) "Add Codespace" else "Edit Codespace") },
                 navigationIcon = {
-                    IconButton(onClick = onNavigateBack) {
+                    IconButton(onClick = onNavigateBack, enabled = !saving) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 }
@@ -395,7 +476,10 @@ fun AccountEditorScreen(
                 modifier = Modifier.fillMaxWidth()
             )
 
-            Text("Wake Method", style = MaterialTheme.typography.titleSmall)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Wake Method", Modifier.weight(1f), style = MaterialTheme.typography.titleSmall)
+                FeatureInfoButton(FeatureHelp.Wake)
+            }
             val wakeModes = CodespaceWakeMode.entries
             SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                 wakeModes.forEachIndexed { index, mode ->
@@ -458,9 +542,10 @@ fun AccountEditorScreen(
                         }
                     }
                 },
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !saving
             ) {
-                Text("Save Codespace")
+                Text(if (saving) "Saving..." else "Save Codespace")
             }
         }
     }
@@ -472,10 +557,12 @@ fun WorkerControlPlaneScreen(
     viewModel: G2RayViewModel,
     onNavigateBack: () -> Unit
 ) {
-    val controlPlane by viewModel.workerControlPlane.collectAsState()
-    var workerUrl by remember(controlPlane?.updatedAt) { mutableStateOf(controlPlane?.workerBaseUrl.orEmpty()) }
-    var fallbackUrl by remember(controlPlane?.updatedAt) { mutableStateOf(controlPlane?.fallbackWorkerBaseUrl.orEmpty()) }
-    var wakeSecret by remember(controlPlane?.updatedAt) { mutableStateOf(controlPlane?.encryptedWakeSecret.orEmpty()) }
+    val controlPlane by viewModel.workerControlPlane.collectAsStateWithLifecycle()
+    val drafts: FormDraftViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
+    val saving by viewModel.isSavingSettings.collectAsStateWithLifecycle()
+    var workerUrl by rememberSaveable(controlPlane?.updatedAt) { mutableStateOf(controlPlane?.workerBaseUrl.orEmpty()) }
+    var fallbackUrl by rememberSaveable(controlPlane?.updatedAt) { mutableStateOf(controlPlane?.fallbackWorkerBaseUrl.orEmpty()) }
+    var wakeSecret by drafts.text("worker:${controlPlane?.updatedAt}:secret", controlPlane?.encryptedWakeSecret.orEmpty())
     var statusMessage by remember { mutableStateOf("") }
 
     Scaffold(
@@ -483,7 +570,7 @@ fun WorkerControlPlaneScreen(
             TopAppBar(
                 title = { Text("Shared Worker") },
                 navigationIcon = {
-                    IconButton(onClick = onNavigateBack) {
+                    IconButton(onClick = onNavigateBack, enabled = !saving) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 }
@@ -535,9 +622,10 @@ fun WorkerControlPlaneScreen(
                         else statusMessage = result.exceptionOrNull()?.message ?: "Could not save shared Worker"
                     }
                 },
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !saving
             ) {
-                Text("Save Shared Worker")
+                Text(if (saving) "Saving..." else "Save Shared Worker")
             }
         }
     }
@@ -552,10 +640,10 @@ fun ApiKeysScreen(
     onAddKey: () -> Unit,
     onEditKey: (String) -> Unit
 ) {
-    val accounts by viewModel.accounts.collectAsState()
-    val account = remember(accountId) { accounts.find { it.id == accountId } }
-    val apiKeys by viewModel.apiKeys.collectAsState()
-    val activeSelection by viewModel.activeSelection.collectAsState()
+    val accounts by viewModel.accounts.collectAsStateWithLifecycle()
+    val account = remember(accountId, accounts) { accounts.find { it.id == accountId } }
+    val apiKeys by viewModel.apiKeys.collectAsStateWithLifecycle()
+    val activeSelection by viewModel.activeSelection.collectAsStateWithLifecycle()
     val accountKeys = apiKeys.filter { it.accountId == accountId }
     var keyPendingDelete by remember { mutableStateOf<G2RayApiKey?>(null) }
 
@@ -695,12 +783,14 @@ fun ApiKeyEditorScreen(
     keyId: String?,
     onNavigateBack: () -> Unit
 ) {
-    val apiKeys by viewModel.apiKeys.collectAsState()
+    val apiKeys by viewModel.apiKeys.collectAsStateWithLifecycle()
     val editingKey = remember(keyId, apiKeys) { apiKeys.find { it.id == keyId } }
 
-    var label by remember(editingKey?.id) { mutableStateOf(editingKey?.label ?: "") }
-    var secret by remember(editingKey?.id) { mutableStateOf(editingKey?.encryptedValue ?: "") }
-    var enabled by remember(editingKey?.id) { mutableStateOf(editingKey?.enabled ?: true) }
+    val drafts: FormDraftViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
+    val saving by viewModel.isSavingSettings.collectAsStateWithLifecycle()
+    var label by rememberSaveable(editingKey?.id) { mutableStateOf(editingKey?.label ?: "") }
+    var secret by drafts.text("key:${accountId}:${keyId}:${editingKey?.updatedAt}", editingKey?.encryptedValue.orEmpty())
+    var enabled by rememberSaveable(editingKey?.id) { mutableStateOf(editingKey?.enabled ?: true) }
     var statusMessage by remember { mutableStateOf("") }
 
     Scaffold(
@@ -746,6 +836,7 @@ fun ApiKeyEditorScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text("Enabled")
+                FeatureInfoButton(FeatureHelp.Key)
                 Switch(checked = enabled, onCheckedChange = { enabled = it })
             }
 
@@ -769,9 +860,10 @@ fun ApiKeyEditorScreen(
                         }
                     }
                 },
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !saving
             ) {
-                Text("Save Key")
+                Text(if (saving) "Saving..." else "Save Key")
             }
         }
     }
@@ -786,12 +878,12 @@ fun ProfilesScreen(
     onNavigateBack: () -> Unit,
     onImportProfile: () -> Unit
 ) {
-    val accounts by viewModel.accounts.collectAsState()
-    val account = remember(accountId) { accounts.find { it.id == accountId } }
-    val profiles by viewModel.profiles.collectAsState()
-    val activeSelection by viewModel.activeSelection.collectAsState()
+    val accounts by viewModel.accounts.collectAsStateWithLifecycle()
+    val account = remember(accountId, accounts) { accounts.find { it.id == accountId } }
+    val profiles by viewModel.profiles.collectAsStateWithLifecycle()
+    val activeSelection by viewModel.activeSelection.collectAsStateWithLifecycle()
     val now = System.currentTimeMillis()
-    val measurementNetworkKey by viewModel.measurementNetworkKey.collectAsState()
+    val measurementNetworkKey by viewModel.measurementNetworkKey.collectAsStateWithLifecycle()
     val accountProfiles = profiles
         .filter { it.accountId == accountId }
         .sortedWith(
@@ -848,7 +940,6 @@ fun ProfilesScreen(
                     val delayState = delayStates[profile.id]
                     val displayedDelay = ProfileHealth.displayDelay(profile, delayState, networkKey = measurementNetworkKey)
                     val effectiveDelayMs = displayedDelay.delayMs
-                    val effectiveP95Ms = displayedDelay.p95Ms
                     val effectiveSuccessfulSamples = displayedDelay.successfulSamples
                     val effectiveSampleCount = displayedDelay.sampleCount
                     val effectiveError = displayedDelay.error
@@ -905,7 +996,7 @@ fun ProfilesScreen(
                                     delayState?.testing == true -> "Real delay: testing..."
                                     effectiveDelayMs != null -> buildString {
                                         append("Real delay: median ${effectiveDelayMs} ms")
-                                        effectiveP95Ms?.let { append(", p95 ${it} ms") }
+                                        ProfileHealth.tailLabel(displayedDelay)?.let { append(", $it") }
                                         if (effectiveSampleCount > 0) {
                                             append(" (${effectiveSuccessfulSamples}/${effectiveSampleCount} samples)")
                                         }
@@ -927,10 +1018,11 @@ fun ProfilesScreen(
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 TextButton(
                                     onClick = { viewModel.measureProfileDelay(profile.id) },
-                                    enabled = delayState?.testing != true
+                                    enabled = delayStates.values.none { it.testing }
                                 ) {
                                     Text(if (delayState?.testing == true) "..." else "Ping")
                                 }
+                                ConfigShareButton(profile.rawUri)
                                 IconButton(onClick = { profilePendingDelete = profile }) {
                                     Icon(Icons.Default.Delete, contentDescription = "Delete")
                                 }
@@ -971,25 +1063,70 @@ private fun failureSuffix(count: Int): String {
     return if (count == 1) " (1 fail)" else " ($count fails)"
 }
 
+private data class PendingProfileImport(val accountId: String, val text: String)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfileImportScreen(
     viewModel: G2RayViewModel,
     accountId: String,
-    onNavigateBack: () -> Unit
+    onNavigateBack: () -> Unit,
+    onImported: (String) -> Unit
 ) {
-    var inputText by remember { mutableStateOf("") }
-    var parseResults by remember { mutableStateOf<List<Result<G2RayProfile>>>(emptyList()) }
-    var selectedToImport by remember { mutableStateOf<Map<Int, Boolean>>(emptyMap()) }
-    var statusMessage by remember { mutableStateOf("") }
-    var errorLogs by remember { mutableStateOf<List<String>>(emptyList()) }
+    val accounts by viewModel.accounts.collectAsStateWithLifecycle()
+    val drafts: FormDraftViewModel = viewModel()
+    val draft = remember(accountId) { drafts.imports.getOrPut(accountId) { ProfileImportDraft(accountId) } }
+    var targetAccountId by draft.targetAccountId
+    val targetAccount = accounts.firstOrNull { it.id == targetAccountId }
+    var showTargetPicker by remember { mutableStateOf(false) }
+    var importing by draft.importing
+    val parsing by draft.parsing
+    var pendingImport by remember { mutableStateOf<PendingProfileImport?>(null) }
+    var inputText by draft.inputText
+    var parseResults by draft.results
+    var selectedToImport by draft.selection
+    var statusMessage by draft.status
+    var errorLogs by draft.errors
+    val importedAccountId by draft.importedAccountId
+    LaunchedEffect(importedAccountId) {
+        importedAccountId?.let { imported ->
+            draft.importedAccountId.value = null
+            drafts.imports.remove(accountId)
+            onImported(imported)
+        }
+    }
+    val scanner = rememberLauncherForActivityResult(ScanContract()) { result ->
+        result.contents?.let { scanned ->
+            if (scanned.length <= 1_000_000) {
+                inputText = scanned
+                parseResults = emptyList()
+                drafts.parse(draft)
+            } else statusMessage = "Scanned config is too large."
+        }
+    }
+    BackHandler(enabled = importing) { statusMessage = "Import is finishing. Please wait." }
+
+    fun submitImport(request: PendingProfileImport, allowUnidentifiedOrigins: Boolean = false) {
+        if (importing) return
+        importing = true
+        statusMessage = ""
+        viewModel.importProfilesText(request.accountId, request.text, allowUnidentifiedOrigins) { result ->
+            importing = false
+            if (result.isSuccess) {
+                viewModel.saveQuotaFromBundle(request.accountId, draft.inputText.value)
+                draft.importedAccountId.value = request.accountId
+            } else {
+                statusMessage = result.exceptionOrNull()?.message ?: "Import failed"
+            }
+        }
+    }
 
     Scaffold(
         topBar = {
             TopAppBar(
                 title = { Text("Import Profiles") },
                 navigationIcon = {
-                    IconButton(onClick = onNavigateBack) {
+                    IconButton(onClick = onNavigateBack, enabled = !importing && !parsing) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 }
@@ -1004,39 +1141,83 @@ fun ProfileImportScreen(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
+            Box(Modifier.fillMaxWidth()) {
+                OutlinedButton(
+                    onClick = { showTargetPicker = true },
+                    enabled = accounts.isNotEmpty() && !importing,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(targetAccount?.displayName ?: "Choose Codespace")
+                        targetAccount?.codespaceName?.takeIf { it.isNotBlank() }?.let {
+                            Text(it, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                    Icon(Icons.Default.ArrowDropDown, contentDescription = "Choose import destination")
+                }
+                DropdownMenu(
+                    expanded = showTargetPicker,
+                    onDismissRequest = { showTargetPicker = false },
+                    modifier = Modifier.heightIn(max = 320.dp).widthIn(max = 320.dp)
+                ) {
+                    accounts.sortedBy { it.priority }.forEach { account ->
+                        DropdownMenuItem(
+                            text = {
+                                Column {
+                                    Text(account.displayName)
+                                    account.codespaceName?.takeIf { it.isNotBlank() }?.let {
+                                        Text(it, style = MaterialTheme.typography.bodySmall)
+                                    }
+                                }
+                            },
+                            onClick = {
+                                targetAccountId = account.id
+                                showTargetPicker = false
+                                statusMessage = ""
+                            }
+                        )
+                    }
+                }
+            }
+            if (targetAccount == null) {
+                Text("Choose a saved Codespace before importing.", color = MaterialTheme.colorScheme.error)
+            }
+            if (statusMessage.isNotEmpty() && parseResults.isEmpty()) {
+                Text(statusMessage, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
+            }
             if (parseResults.isEmpty()) {
                 Text(
                     "Paste a raw VLESS URI, messy text that contains VLESS links, a multi-line list, or a Base64-encoded subscription.",
                     style = MaterialTheme.typography.bodyMedium
                 )
 
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(onClick = { drafts.parse(draft) }, enabled = inputText.isNotBlank() && !parsing && !importing) {
+                        Text(if (parsing) "Parsing..." else "Parse Configs")
+                    }
+                    OutlinedButton(onClick = {
+                        scanner.launch(ScanOptions().setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                            .setPrompt("Scan a config or all-config QR").setBeepEnabled(false).setOrientationLocked(false))
+                    }, enabled = !parsing && !importing) {
+                        Icon(Icons.Default.QrCodeScanner, contentDescription = null)
+                        Spacer(Modifier.width(6.dp))
+                        Text("Scan QR")
+                    }
+                }
                 OutlinedTextField(
                     value = inputText,
-                    onValueChange = { inputText = it },
-                    label = { Text("Subscription Text / VLESS URI") },
-                    modifier = Modifier.fillMaxWidth(),
-                    minLines = 6
-                )
-
-                if (statusMessage.isNotEmpty()) {
-                    Text(statusMessage, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
-                }
-
-                Button(
-                    onClick = {
-                        val parsed = VlessUriParser.parseAllProfiles(inputText)
-                        if (parsed.isEmpty()) {
-                            statusMessage = "No supported vless:// profiles found in the pasted text or subscription."
-                        } else {
-                            parseResults = parsed
-                            selectedToImport = parsed.mapIndexed { index, res -> index to res.isSuccess }.toMap()
-                            errorLogs = parsed.filter { it.isFailure }.map { it.exceptionOrNull()?.message ?: "Unknown error" }
-                        }
+                    onValueChange = {
+                        if (it.length <= 1_000_000) {
+                            inputText = it
+                            statusMessage = ""
+                        } else statusMessage = "Import text is too large; use a smaller bundle."
                     },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Parse Configs")
-                }
+                    label = { Text("Subscription Text / VLESS URI") },
+                    modifier = Modifier.fillMaxWidth().heightIn(max = 240.dp),
+                    minLines = 4,
+                    maxLines = 8,
+                    enabled = !parsing && !importing
+                )
             } else {
                 Text("Select Profiles to Import", style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold))
 
@@ -1050,13 +1231,20 @@ fun ProfileImportScreen(
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable { selectedToImport = selectedToImport + (index to !isChecked) }
+                                .clickable(enabled = !importing) {
+                                    selectedToImport = selectedToImport + (index to !isChecked)
+                                    statusMessage = ""
+                                }
                                 .padding(vertical = 4.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Checkbox(
                                 checked = isChecked,
-                                onCheckedChange = { selectedToImport = selectedToImport + (index to it) }
+                                enabled = !importing,
+                                onCheckedChange = {
+                                    selectedToImport = selectedToImport + (index to it)
+                                    statusMessage = ""
+                                }
                             )
                             Spacer(modifier = Modifier.width(8.dp))
                             Column {
@@ -1077,26 +1265,36 @@ fun ProfileImportScreen(
 
                 Spacer(modifier = Modifier.height(16.dp))
 
+                if (statusMessage.isNotEmpty()) {
+                    Text(statusMessage, color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodyMedium)
+                }
                 Button(
                     onClick = {
-                        val selectedUris = parseResults.mapIndexedNotNull { index, res ->
+                        val selectedProfiles = parseResults.mapIndexedNotNull { index, res ->
                             if (res.isSuccess && (selectedToImport[index] == true)) {
-                                res.getOrThrow().rawUri
+                                res.getOrThrow()
                             } else {
                                 null
                             }
                         }
-                        viewModel.importProfilesText(accountId, selectedUris.joinToString("\n")) { result ->
-                            if (result.isSuccess) {
-                                onNavigateBack()
-                            } else {
-                                statusMessage = result.exceptionOrNull()?.message ?: "Import failed"
-                            }
+                        val request = PendingProfileImport(targetAccountId, selectedProfiles.joinToString("\n") { it.rawUri })
+                        val name = targetAccount?.codespaceName?.trim().orEmpty()
+                        if (name.isNotEmpty() &&
+                            selectedProfiles.any { !CodespaceProfileIdentity.hasKnownOrigin(it) } &&
+                            selectedProfiles.none { CodespaceProfileIdentity.conflictsWith(it, name) }) {
+                            pendingImport = request
+                        } else {
+                            submitImport(request)
                         }
                     },
                     modifier = Modifier.fillMaxWidth(),
-                    enabled = selectedToImport.values.any { it }
+                    enabled = targetAccount != null && !importing && selectedToImport.values.any { it }
                 ) {
+                    if (importing) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(8.dp))
+                    }
                     Text("Import Selected (${selectedToImport.values.count { it }})")
                 }
 
@@ -1107,11 +1305,31 @@ fun ProfileImportScreen(
                         errorLogs = emptyList()
                         statusMessage = ""
                     },
-                    modifier = Modifier.fillMaxWidth()
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !importing
                 ) {
                     Text("Start Over")
                 }
             }
         }
+    }
+    pendingImport?.let { request ->
+        val destination = accounts.firstOrNull { it.id == request.accountId }
+        AlertDialog(
+            onDismissRequest = { pendingImport = null },
+            title = { Text("Confirm Codespace binding") },
+            text = {
+                Text("A custom or unrecognized hostname does not identify its Codespace. Import into ${destination?.displayName ?: "the removed Codespace"}?")
+            },
+            confirmButton = {
+                TextButton(enabled = destination != null, onClick = {
+                    pendingImport = null
+                    submitImport(request, allowUnidentifiedOrigins = true)
+                }) { Text("Import") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingImport = null }) { Text("Cancel") }
+            }
+        )
     }
 }

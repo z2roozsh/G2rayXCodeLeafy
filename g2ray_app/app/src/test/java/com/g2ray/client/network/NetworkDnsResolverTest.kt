@@ -8,7 +8,10 @@ import java.io.IOException
 import java.net.InetAddress
 import java.net.UnknownHostException
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Callable
 import java.util.concurrent.Executor
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Future
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
@@ -50,6 +53,7 @@ class NetworkDnsResolverTest {
         platformError = false
         legacyCalls.set(0)
         legacyRelease = CountDownLatch(0)
+        legacyEntered = CountDownLatch(0)
     }
 
     @After
@@ -191,12 +195,23 @@ class NetworkDnsResolverTest {
     @Config(sdk = [24, 28])
     fun stuckLegacyLookupCannotGrowTheWorkerPoolOrQueueMoreLookups() {
         val executor = NetworkDnsResolver.createLegacyExecutor(1)
-        legacyRelease = CountDownLatch(1)
         try {
             val network = Shadow.newInstanceOf(Network::class.java)
-            val resolver = NetworkDnsResolver(timeoutMs = 100, legacyExecutor = executor)
+            legacyRelease = CountDownLatch(1)
+            legacyEntered = CountDownLatch(1)
+            // Synchronize fault admission, not a warm Future's completion:
+            // the latter can precede the worker returning to SynchronousQueue.
+            // Only the fixture waits; production admission and deadlines stay unchanged.
+            val admittedExecutor = object : ExecutorService by executor {
+                override fun <T> submit(task: Callable<T>): Future<T> {
+                    val result = executor.submit(task)
+                    check(legacyEntered.await(5, TimeUnit.SECONDS)) { "Legacy DNS fixture did not enter its blocking call" }
+                    return result
+                }
+            }
+            val resolver = NetworkDnsResolver(timeoutMs = 100, legacyExecutor = admittedExecutor)
             val timeout = assertThrows(UnknownHostException::class.java) { resolver.lookup(network, "stalled.example") }
-            assertTrue(timeout.cause is TimeoutException)
+            assertTrue("Expected an admitted native lookup timeout, got ${timeout.cause}", timeout.cause is TimeoutException)
             val busy = assertThrows(UnknownHostException::class.java) { resolver.lookup(network, "other.example") }
             assertTrue(busy.cause is RejectedExecutionException)
             assertEquals(1, executor.largestPoolSize)
@@ -249,6 +264,7 @@ class NetworkDnsResolverTest {
         @Implementation
         fun getAllByName(hostname: String): Array<InetAddress> {
             legacyCalls.incrementAndGet()
+            legacyEntered.countDown()
             // Model old native resolvers that cannot be interrupted.
             while (legacyRelease.count > 0) {
                 try { legacyRelease.await(5, TimeUnit.MILLISECONDS) } catch (_: InterruptedException) { }
@@ -265,5 +281,6 @@ class NetworkDnsResolverTest {
         var pending = false
         var platformError = false
         var legacyRelease = CountDownLatch(0)
+        var legacyEntered = CountDownLatch(0)
     }
 }

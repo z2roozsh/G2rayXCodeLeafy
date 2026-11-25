@@ -42,32 +42,38 @@ import com.g2ray.client.network.GitHubCodespaceCoordinator
 import com.g2ray.client.network.GitHubNetwork
 import com.g2ray.client.network.WorkerNetwork
 import com.g2ray.client.network.WorkerRouteCoordinator
+import com.g2ray.client.parser.VlessUriParser
 import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.net.Proxy
+import java.net.InetSocketAddress
 import java.net.Socket
+import java.util.Collections
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.ConnectionPool
-import okhttp3.Call
-import okhttp3.Connection
 import okhttp3.EventListener
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -77,6 +83,25 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class LiveVpnDeviceTest {
+    private val traceIdentity = VpnProbeTraceIdentity()
+
+    @Test
+    fun savedWebSocketEarlyDataUsageIsReportedWithoutSecrets() {
+        assumeTrue("Saved-profile inspection requires liveVpn=true",
+            InstrumentationRegistry.getArguments().getString("liveVpn") == "true")
+        val repository = ApplicationProvider.getApplicationContext<G2RayApplication>().accountRepository
+        assertTrue("Saved data failed to load", repository.loadError.value == null)
+        val selection = repository.activeSelection.value
+        val profiles = repository.profiles.value.mapNotNull { VlessUriParser.parse(it.rawUri).getOrNull() }
+        val ws = profiles.filter { it.transport == Transport.WS }
+        val earlyDataCount = ws.count {
+            (Uri.parse("https://config.invalid${it.path}").getQueryParameter("ed")?.toIntOrNull() ?: 0) > 0
+        }
+        report("event=saved_transport_summary ws_profiles=${ws.size} ws_early_data_profiles=$earlyDataCount " +
+            "configuration_unchanged=true")
+        assertEquals(selection, repository.activeSelection.value)
+    }
+
     @Test
     fun debugDataPathClientAttachesPerRequestTimingWithoutNetworkAccess() = runBlocking {
         assertTrue("This regression requires the actual debug client", com.g2ray.client.BuildConfig.DEBUG)
@@ -173,6 +198,85 @@ class LiveVpnDeviceTest {
     }
 
     @Test
+    fun experimentalRouteComparedWithoutChangingSavedConfiguration() = runBlocking {
+        val args = InstrumentationRegistry.getArguments()
+        assumeTrue("Experimental routes require -e liveExperimentalRoute true",
+            args.getString("liveExperimentalRoute") == "true")
+        val context = ApplicationProvider.getApplicationContext<G2RayApplication>()
+        val repository = context.accountRepository
+        assertTrue("Saved data failed to load", repository.loadError.value == null)
+        val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        fun requirePhysicalNetwork() {
+            val capabilities = connectivity.getNetworkCapabilities(connectivity.activeNetwork)
+            assertTrue("A working physical network is required",
+                capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true)
+            assertFalse("Stop VPN before comparing physical routes",
+                capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true)
+        }
+        requirePhysicalNetwork()
+        val selection = repository.activeSelection.value
+        val settings = VpnEnginePreferences(context.secureStore).readSettings()
+        // A shell-readable test file avoids placing the VLESS credential in
+        // instrumentation arguments, logcat, or the saved profile repository.
+        val bytes = ParcelFileDescriptor.AutoCloseInputStream(
+            InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommand(
+                "cat /data/local/tmp/g2ray-experimental-route.vless"
+            )
+        ).use { input ->
+            val buffer = ByteArray(16_385)
+            var length = 0
+            while (length < buffer.size) {
+                val count = input.read(buffer, length, buffer.size - length)
+                if (count < 0) break
+                length += count
+            }
+            buffer.copyOf(length)
+        }
+        require(bytes.size <= 16_384) { "Experimental route file is too large" }
+        val experimentalText = bytes.toString(Charsets.UTF_8).trim()
+        require(experimentalText.isNotEmpty()) {
+            "Push an owned VLESS link to /data/local/tmp/g2ray-experimental-route.vless before running"
+        }
+        val experimental = VlessUriParser.parse(experimentalText).getOrThrow()
+        val candidates = repository.profiles.value.mapNotNull { stored ->
+            VlessUriParser.parse(stored.rawUri).getOrNull()?.takeIf { it.uuid == experimental.uuid }
+        }
+        val direct = candidates.firstOrNull {
+            it.transport == experimental.transport && it.alpn == experimental.alpn &&
+                it.address != experimental.address
+        } ?: error("Import a matching direct profile before comparing an experimental route")
+        val manager = XrayCoreManager()
+        val results = mutableListOf<Pair<String, XrayDelaySummary>>()
+        withTimeout(180_000L) {
+            withContext(Dispatchers.IO) {
+                listOf("direct" to direct, "experimental" to experimental,
+                    "experimental" to experimental, "direct" to direct).forEach { (label, profile) ->
+                    requirePhysicalNetwork()
+                    val result = manager.measureDelaySummary(
+                        profile, context.filesDir.absolutePath, timeoutSeconds = 4,
+                        testUrls = SocksRunningRouteProbe.HEALTH_URLS, sampleCount = 3,
+                        dpiCompatibilityEnabled = settings.dpiCompatibilityEnabled,
+                        checkActive = { coroutineContext.ensureActive() }
+                    )
+                    results += label to result
+                    report("event=experimental_route_comparison route=$label " +
+                        "successful=${result.successfulSamples} total=${result.totalSamples} " +
+                        "median_ms=${result.medianMs} p95_ms=${result.p95Ms}")
+                }
+            }
+        }
+        assertEquals("Route comparison changed the active selection", selection,
+            repository.activeSelection.value)
+        assertEquals("Route comparison changed settings", settings,
+            VpnEnginePreferences(context.secureStore).readSettings())
+        assertFalse("Route comparison left a core running", ReflectionXrayBridge().getState())
+        assertTrue("A direct comparison round failed its health quorum",
+            results.filter { it.first == "direct" }.all { it.second.successfulSamples >= 2 })
+        assertTrue("The experimental route failed its health quorum on the phone",
+            results.filter { it.first == "experimental" }.all { it.second.successfulSamples >= 2 })
+    }
+
+    @Test
     fun selectedAccountWakesOnPhysicalNetwork() = runBlocking {
         val args = InstrumentationRegistry.getArguments()
         assumeTrue("Wake tests require -e liveWake true", args.getString("liveWake") == "true")
@@ -248,6 +352,64 @@ class LiveVpnDeviceTest {
     fun selectedProfileStartsWithSmallProbes() = runLiveTest(startupOnly = true)
 
     @Test
+    fun selectedProfileVerifiesSyntheticIntegrity() {
+        assumeTrue("Requires explicit liveIntegrity=true",
+            InstrumentationRegistry.getArguments().getString("liveIntegrity") == "true")
+        runLiveTest(acceptanceCheck = { context, client ->
+            withContext(Dispatchers.IO) { verifySyntheticIntegrity(context, client, ::report) }
+        })
+    }
+
+    @Test
+    fun optionalDomainBypassUsesPhysicalExitWithoutChangingDefaultVpnRouting() {
+        val args = InstrumentationRegistry.getArguments()
+        assumeTrue("Bypass checks require -e liveRouting true and -e liveVpn true",
+            args.getString("liveRouting") == "true" && args.getString("liveVpn") == "true")
+        val context = ApplicationProvider.getApplicationContext<G2RayApplication>()
+        val preferences = VpnEnginePreferences(context.secureStore)
+        val original = preferences.readSettings()
+        val fakeDns = args.getString("routingFakeDns") == "true"
+        try {
+            preferences.setRoutingPolicy(RoutingPolicy(bypassDomains = listOf("www.cloudflare.com")))
+            preferences.setFastDnsEnabled(fakeDns)
+            runLiveTest(acceptanceCheck = { _, client ->
+                withContext(Dispatchers.IO) {
+                    val network = requireNotNull(SocketProtector.underlyingNetworks.value)
+                    val url = "https://www.cloudflare.com/cdn-cgi/trace"
+                    val direct = network.openConnection(java.net.URL(url)) as java.net.HttpURLConnection
+                    val expectedIp = try {
+                        direct.connectTimeout = 10_000; direct.readTimeout = 10_000
+                        assertEquals("Physical trace endpoint unavailable", 200, direct.responseCode)
+                        direct.inputStream.use(::traceIp)
+                    } finally { direct.disconnect() }
+                    val bypassIp = client.newCall(Request.Builder().url(url).build()).execute().use { response ->
+                        assertEquals("Bypass trace endpoint unavailable", 200, response.code)
+                        requireNotNull(response.body).byteStream().use(::traceIp)
+                    }
+                    assertEquals("Domain rule did not use the physical exit", expectedIp, bypassIp)
+                    report("optional_domain_bypass_verified=true fake_dns=$fakeDns physical_ip_match=true")
+                }
+            })
+        } finally {
+            preferences.setRoutingPolicy(original.routingPolicy)
+            preferences.setFastDnsEnabled(original.fastDnsEnabled)
+        }
+    }
+
+    private fun traceIp(input: InputStream): String {
+        val bytes = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(1024)
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            require(bytes.size() + count <= 16_384) { "Trace response exceeded its budget" }
+            bytes.write(buffer, 0, count)
+        }
+        return bytes.toString(Charsets.UTF_8.name()).lineSequence().firstOrNull { it.startsWith("ip=") }
+            ?.removePrefix("ip=")?.trim()?.takeIf { it.isNotBlank() } ?: error("Trace response omitted its IP")
+    }
+
+    @Test
     fun selectedProfileCarriesBoundedTransferSamples() {
         assumeTrue("Larger transfers require -e liveTransfers true",
             InstrumentationRegistry.getArguments().getString("liveTransfers") == "true")
@@ -286,12 +448,64 @@ class LiveVpnDeviceTest {
     }
 
     @Test
+    fun youtubeLimitsKeepBudgetDefaultsAndRequireLongerPlaybackForExtendedRuns() {
+        assertEquals(VideoTestLimits(60_000L, 12L * 1024 * 1024, 15_000L), videoTestLimits(Bundle()))
+        val extended = Bundle().apply {
+            putString("videoDurationSeconds", "180")
+            putString("videoBudgetMiB", "256")
+        }
+        assertEquals(VideoTestLimits(180_000L, 256L * 1024 * 1024, 150_000L), videoTestLimits(extended))
+        for ((key, values) in mapOf(
+            "videoDurationSeconds" to listOf("", "invalid", "59", "601", "9223372036854775807"),
+            "videoBudgetMiB" to listOf("", "invalid", "11", "2049", "9223372036854775807")
+        )) {
+            values.forEach { value ->
+                assertThrows(IllegalArgumentException::class.java) {
+                    videoTestLimits(Bundle().apply { putString(key, value) })
+                }
+            }
+        }
+        assertEquals(2_048L * 1024 * 1024,
+            videoTestLimits(Bundle().apply { putString("videoBudgetMiB", "2048") }).mobileBudgetBytes)
+    }
+
+    @Test
     fun selectedProfileRecoversAfterRepeatedCoreFailures() {
         assumeTrue(
             "Core failure injection requires -e liveCoreRecovery true",
             InstrumentationRegistry.getArguments().getString("liveCoreRecovery") == "true"
         )
         runLiveTest(coreFailureCycles = 2)
+    }
+
+    @Test
+    fun selectedProfileRecoversAfterMobileDataOutage() {
+        assumeTrue("Physical network changes require -e liveNetworkRecovery true",
+            InstrumentationRegistry.getArguments().getString("liveNetworkRecovery") == "true")
+        assumeTrue("The on-device restoration script requires Android 12 or newer",
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+        runLiveTest(acceptanceCheck = ::verifyMobileDataOutage)
+    }
+
+    @Test
+    fun selectedProfileKeepsResponsiveDuringConcurrentTransfers() {
+        assumeTrue("Loaded transfers require -e liveLoadedTransfers true",
+            InstrumentationRegistry.getArguments().getString("liveLoadedTransfers") == "true")
+        runLiveTest(acceptanceCheck = { _, client -> verifyLoadedTransfers(client) })
+    }
+
+    @Test
+    fun selectedProfileUploadsThroughTunAndSocksControls() {
+        assumeTrue("Upload controls require -e liveUploadControls true",
+            InstrumentationRegistry.getArguments().getString("liveUploadControls") == "true")
+        runLiveTest(acceptanceCheck = { context, client -> verifyUploadControls(context, client) })
+    }
+
+    @Test
+    fun deviceShellScriptExecutesMultipleCommandsThroughStdin() {
+        assumeTrue("Bidirectional shell commands require Android 12 or newer",
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+        assertEquals("first\nsecond\n", executeOnDeviceScript("printf 'first\\n'\nprintf 'second\\n'"))
     }
 
     private fun engineFromTestArgument(value: String?): VpnEngineMode {
@@ -307,7 +521,8 @@ class LiveVpnDeviceTest {
         controlPlaneCheck: Boolean = false,
         startupOnly: Boolean = false,
         transferOnly: Boolean = false,
-        videoOnly: Boolean = false
+        videoOnly: Boolean = false,
+        acceptanceCheck: (suspend (Context, OkHttpClient) -> Unit)? = null
     ) = runBlocking {
         val args = InstrumentationRegistry.getArguments()
         assumeTrue("Live network tests require -e liveVpn true", args.getString("liveVpn") == "true")
@@ -324,12 +539,37 @@ class LiveVpnDeviceTest {
             Transport.entries.firstOrNull { it.name.equals(value, ignoreCase = true) }
                 ?: error("Test transport must be xhttp or ws")
         }
-        val profile = if (transport == null || transport == selected!!.transport) selected else {
+        val savedProfile = if (transport == null || transport == selected!!.transport) selected else {
             repository.profiles.value.firstOrNull {
                 it.accountId == selected!!.accountId && it.address == selected.address && it.transport == transport
             }
         }
-        assertNotNull("No matching saved transport profile exists on the selected edge", profile)
+        assertNotNull("No matching saved transport profile exists on the selected edge", savedProfile)
+        val tuning = args.getString("xhttpTuning") ?: "saved"
+        require(tuning == "saved" || !uiStart) { "UI startup must use the unchanged saved profile" }
+        val parsedProfile = VlessUriParser.parse(savedProfile!!.rawUri).getOrThrow()
+        val factors = Regex("ablate-(60000|1000000)-(10|30)-(0|20)").matchEntire(tuning)
+        val profile = when {
+            tuning == "saved" -> parsedProfile
+            tuning == "core-default" -> SyntheticProfileVariants.withoutXhttpExtra(parsedProfile)
+            factors != null -> SyntheticProfileVariants.controlledXhttp(parsedProfile,
+                factors.groupValues[1].toInt(), factors.groupValues[2].toInt(), factors.groupValues[3].toInt())
+            else -> error("Unknown controlled XHTTP tuning variant")
+        }
+        fun assertControlledRuntimeIdentity() {
+            if (tuning == "saved") return
+            val service = requireNotNull(SocketProtector.vpnService)
+            val actual = G2RayVpnService::class.java.getDeclaredField("activeProfile")
+                .apply { isAccessible = true }.get(service)
+            assertTrue("Controlled comparison changed route or tuning during recovery", actual == profile)
+            val extraHash = profile.xhttpExtraJson?.let {
+                java.security.MessageDigest.getInstance("SHA-256").digest(it.toByteArray())
+                    .joinToString("") { byte -> "%02x".format(byte) }
+            } ?: "absent"
+            report("event=controlled_runtime_identity matched=true extra_sha256=$extraHash")
+        }
+        report("event=profile_variant xhttp_tuning=$tuning " +
+            "extra_present=${profile.xhttpExtraJson != null} saved_profile_unchanged=true")
         assertTrue("UI startup uses the selected profile, not a transport override",
             !uiStart || transport == null || transport == selected!!.transport)
         val settings = VpnEnginePreferences(context.secureStore).readSettings()
@@ -354,17 +594,16 @@ class LiveVpnDeviceTest {
             // No SOCKS proxy, socket protection, or underlying-network binding:
             // these requests must traverse Android's default full-device VPN.
             .proxy(Proxy.NO_PROXY)
+            .strictSyntheticRequests()
             .connectionPool(ConnectionPool(5, 10, TimeUnit.MINUTES))
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
             .writeTimeout(20, TimeUnit.SECONDS)
             .callTimeout(30, TimeUnit.SECONDS)
-            .eventListener(object : EventListener() {
-                override fun connectionAcquired(call: Call, connection: Connection) {
-                    report("event=connection_acquired endpoint=${call.request().url.host} " +
-                        "protocol=${connection.protocol()} connection=${System.identityHashCode(connection)}")
-                }
-            })
+            .eventListenerFactory { call ->
+                call.request().tag(VpnProbeTimingTrace::class.java)
+                    ?.listenerFor(call.request().url.host) ?: EventListener.NONE
+            }
             .build()
 
         var scenario = ActivityScenario.launch(MainActivity::class.java)
@@ -389,7 +628,7 @@ class LiveVpnDeviceTest {
                 } else {
                     ContextCompat.startForegroundService(activity, Intent(activity, G2RayVpnService::class.java).apply {
                         action = G2RayVpnService.ACTION_START
-                        putExtra(G2RayVpnService.EXTRA_RAW_PROFILE_URI, profile!!.rawUri)
+                        putExtra(G2RayVpnService.EXTRA_RAW_PROFILE_URI, profile.rawUri)
                         putExtra(G2RayVpnService.EXTRA_ACCOUNT_ID, selection.accountId)
                         putExtra(G2RayVpnService.EXTRA_VPN_ENGINE_MODE, mode.storageValue)
                     })
@@ -398,14 +637,18 @@ class LiveVpnDeviceTest {
             }
             val connected = withTimeout(180_000L) {
                 VpnStateRepository.state.first {
-                    (it.tunnelState == TunnelState.Connected && it.tunnelVerified) || it.tunnelState == TunnelState.Error
+                    (it.tunnelState == TunnelState.Connected && it.tunnelVerified) ||
+                        it.tunnelState in setOf(TunnelState.Error, TunnelState.Blocked)
                 }
             }
-            assertEquals("Tunnel failed to verify", TunnelState.Connected, connected.tunnelState)
-            val expectedEngine = if (mode == VpnEngineMode.XrayNative) ActiveVpnEngine.XrayNative else ActiveVpnEngine.Hev
-            assertEquals("The requested engine was not exercised", expectedEngine, connected.activeVpnEngine)
-            report("engine=${mode.storageValue} transport=${profile!!.transport} ui_start=$uiStart " +
-                "verified_start_ms=${SystemClock.elapsedRealtime() - startedAt}")
+            assertEquals("Tunnel failed to verify: ${connected.message}", TunnelState.Connected, connected.tunnelState)
+            val actualEngine = requireNotNull(connected.activeVpnEngine) { "Verified VPN has no active engine" }
+            if (mode != VpnEngineMode.Auto) {
+                val requestedEngine = if (mode == VpnEngineMode.XrayNative) ActiveVpnEngine.XrayNative else ActiveVpnEngine.Hev
+                assertEquals("The requested engine was not exercised", requestedEngine, actualEngine)
+            }
+            report("engine=${mode.storageValue} transport=${profile.transport} ui_start=$uiStart " +
+                "actual_engine=$actualEngine verified_start_ms=${SystemClock.elapsedRealtime() - startedAt}")
 
             val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
             assertTrue(
@@ -419,7 +662,7 @@ class LiveVpnDeviceTest {
             } else {
                 transferSample(client, downloadBytes, uploadBytes)
             }
-            if (expectedEngine == ActiveVpnEngine.Hev) {
+            if (actualEngine == ActiveVpnEngine.Hev) {
                 val minimumRxBytes = if (smallProbesOnly) 1L else downloadBytes.toLong()
                 val counters = withTimeout(15_000L) {
                     VpnStateRepository.state.first {
@@ -429,7 +672,15 @@ class LiveVpnDeviceTest {
                 assertTrue("Real TUN upload counters did not advance", counters.totalTxBytes > 0L)
                 report("hev_tun_rx_bytes=${counters.totalRxBytes} hev_tun_tx_bytes=${counters.totalTxBytes}")
             } else {
-                assertEquals(TunnelTrafficSource.Unavailable, VpnStateRepository.state.value.tunnelTrafficSource)
+                val nativeSource = VpnStateRepository.state.value.tunnelTrafficSource
+                assertTrue("Native mode must not display HEV counters",
+                    nativeSource in setOf(TunnelTrafficSource.NativeUid, TunnelTrafficSource.Unavailable))
+                if (nativeSource == TunnelTrafficSource.NativeUid) {
+                    val counters = withTimeout(15_000L) {
+                        VpnStateRepository.state.first { it.totalRxBytes > 0L && it.totalTxBytes > 0L }
+                    }
+                    report("native_uid_rx_bytes=${counters.totalRxBytes} native_uid_tx_bytes=${counters.totalTxBytes} approximate=true")
+                } else report("native_uid_counters_unavailable=true")
             }
 
             if (startupOnly) {
@@ -448,6 +699,12 @@ class LiveVpnDeviceTest {
             }
             if (controlPlaneCheck) {
                 verifyActiveControlPlane(context)
+                return@runBlocking
+            }
+            if (acceptanceCheck != null) {
+                assertControlledRuntimeIdentity()
+                acceptanceCheck(context, client)
+                assertControlledRuntimeIdentity()
                 return@runBlocking
             }
             if (coreFailureCycles > 0) {
@@ -520,6 +777,7 @@ class LiveVpnDeviceTest {
                     client.dispatcher.cancelAll()
                     client.connectionPool.evictAll()
                     client.dispatcher.executorService.shutdown()
+                    traceIdentity.releaseConnections()
                     val mobileRxAfter = TrafficStats.getMobileRxBytes()
                     val mobileTxAfter = TrafficStats.getMobileTxBytes()
                     if (mobileRxBefore >= 0L && mobileTxBefore >= 0L &&
@@ -599,15 +857,156 @@ class LiveVpnDeviceTest {
                 val reconnected = withTimeout(180_000L) {
                     VpnStateRepository.state.first {
                         (it.tunnelState == TunnelState.Connected && it.tunnelVerified) ||
-                            it.tunnelState == TunnelState.Error
+                            it.tunnelState in setOf(TunnelState.Error, TunnelState.Blocked)
                     }
                 }
-                assertEquals("Core failure $cycle did not recover", TunnelState.Connected, reconnected.tunnelState)
+                assertEquals("Core failure $cycle did not recover: ${reconnected.message}",
+                    TunnelState.Connected, reconnected.tunnelState)
                 client.connectionPool.evictAll()
                 assertResponsiveQuorum(probeHttpsQuorum(client, "core_recovery_$cycle"), "core_recovery_$cycle")
                 report("event=core_recovery_verified cycle=$cycle " +
                     "elapsed_ms=${SystemClock.elapsedRealtime() - startedAt}")
             }
+        }
+
+    @Suppress("DEPRECATION")
+    private suspend fun verifyMobileDataOutage(context: Context, client: OkHttpClient) =
+        kotlinx.coroutines.coroutineScope {
+            val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            fun physicalInternet() = connectivity.allNetworks.mapNotNull { network ->
+                connectivity.getNetworkCapabilities(network)?.takeIf {
+                    it.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                        it.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                }
+            }
+            val physical = physicalInternet()
+            assertTrue("This test requires LTE only, with no second Internet network",
+                physical.isNotEmpty() && physical.all { it.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) })
+            val automation = InstrumentationRegistry.getInstrumentation().uiAutomation
+            fun shell(command: String): String = ParcelFileDescriptor.AutoCloseInputStream(
+                automation.executeShellCommand(command)
+            ).bufferedReader().use { it.readText() }
+            assertEquals("Refuse to change a radio that was not originally enabled",
+                "1", shell("settings get global mobile_data").trim())
+            val startedAt = SystemClock.elapsedRealtime()
+            // Keep restoration in the on-device script and the non-cancellable cleanup.
+            val radioCycle = async(Dispatchers.IO) {
+                executeOnDeviceScript("svc data disable\nsleep 8\nsvc data enable")
+            }
+            try {
+                withTimeout(20_000L) {
+                    while (physicalInternet().isNotEmpty()) delay(100L)
+                }
+                report("event=physical_network_lost elapsed_ms=${SystemClock.elapsedRealtime() - startedAt}")
+                val unverified = withTimeout(8_000L) {
+                    VpnStateRepository.state.first { !it.tunnelVerified }
+                }
+                assertTrue("Network loss discarded the user's connected intent",
+                    unverified.tunnelState !in setOf(TunnelState.Disconnected, TunnelState.Disabled, TunnelState.Error))
+                radioCycle.await()
+                withTimeout(30_000L) {
+                    while (physicalInternet().isEmpty()) delay(100L)
+                }
+                val restoredAt = SystemClock.elapsedRealtime()
+                report("event=physical_network_returned clock_ms=$restoredAt " +
+                    "elapsed_ms=${restoredAt - startedAt}")
+                val recovered = withTimeout(90_000L) {
+                    VpnStateRepository.state.first {
+                        (it.tunnelState == TunnelState.Connected && it.tunnelVerified) ||
+                            it.tunnelState in setOf(TunnelState.Error, TunnelState.Blocked)
+                    }
+                }
+                assertEquals("VPN did not recover automatically after the LTE outage: ${recovered.message}",
+                    TunnelState.Connected, recovered.tunnelState)
+                report("event=physical_network_tunnel_verified " +
+                    "after_network_return_ms=${SystemClock.elapsedRealtime() - restoredAt}")
+                client.connectionPool.evictAll()
+                assertResponsiveQuorum(probeHttpsQuorum(client, "physical_network_recovery"), "physical_network_recovery")
+                report("event=physical_network_recovery_verified outage_command_ms=8000 " +
+                    "after_network_return_ms=${SystemClock.elapsedRealtime() - restoredAt} " +
+                    "total_ms=${SystemClock.elapsedRealtime() - startedAt}")
+            } finally {
+                withContext(NonCancellable + Dispatchers.IO) {
+                    shell("svc data enable")
+                    assertEquals("The test did not restore mobile data",
+                        "1", shell("settings get global mobile_data").trim())
+                }
+            }
+        }
+
+    private fun executeOnDeviceScript(script: String): String {
+        check(Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            "Bidirectional shell commands require Android 12 or newer"
+        }
+        val descriptors = InstrumentationRegistry.getInstrumentation().uiAutomation.executeShellCommandRw("sh")
+        return ParcelFileDescriptor.AutoCloseInputStream(descriptors[0]).use { output ->
+            ParcelFileDescriptor.AutoCloseOutputStream(descriptors[1]).use { input ->
+                input.write((script + "\n").toByteArray(Charsets.UTF_8))
+            }
+            output.bufferedReader().readText()
+        }
+    }
+
+    private data class RequestInterval(val startedMs: Long, val finishedMs: Long) {
+        fun containsComplete(probe: RequestInterval): Boolean =
+            finishedMs > startedMs && probe.finishedMs > probe.startedMs &&
+                probe.startedMs >= startedMs && probe.finishedMs <= finishedMs
+    }
+
+    @Test
+    fun loadedOverlapRequiresACompleteProbeInsideAnActualTransferRequest() {
+        val transfer = RequestInterval(100L, 200L)
+        assertTrue(transfer.containsComplete(RequestInterval(110L, 190L)))
+        assertTrue(transfer.containsComplete(RequestInterval(100L, 200L)))
+        assertFalse(transfer.containsComplete(RequestInterval(50L, 90L)))
+        assertFalse(transfer.containsComplete(RequestInterval(210L, 250L)))
+        assertFalse(transfer.containsComplete(RequestInterval(90L, 110L)))
+        assertFalse(transfer.containsComplete(RequestInterval(190L, 210L)))
+        assertFalse(transfer.containsComplete(RequestInterval(150L, 150L)))
+        assertFalse(RequestInterval(100L, 100L).containsComplete(RequestInterval(100L, 100L)))
+    }
+
+    private suspend fun verifyLoadedTransfers(client: OkHttpClient) =
+        kotlinx.coroutines.coroutineScope {
+            val startedAt = SystemClock.elapsedRealtime()
+            val transferStarted = CompletableDeferred<Unit>()
+            val transfers = Collections.synchronizedList(mutableListOf<RequestInterval>())
+            val responsiveProbes = mutableListOf<RequestInterval>()
+            val workload = async(Dispatchers.IO) {
+                transferStarted.complete(Unit)
+                repeat(LOADED_TRANSFER_CHUNKS) { index ->
+                    coroutineContext.ensureActive()
+                    report("event=loaded_transfer_chunk chunk=${index + 1}")
+                    transferSample(client, BOUNDED_DOWNLOAD_BYTES, BOUNDED_UPLOAD_BYTES) { start, end ->
+                        transfers.add(RequestInterval(start, end))
+                    }
+                }
+            }
+            transferStarted.await()
+            var quorumChecks = 0
+            while (!workload.isCompleted) {
+                val phase = "during_transfer_${quorumChecks + 1}"
+                withContext(Dispatchers.IO) {
+                    assertResponsiveQuorum(probeHttpsQuorum(client, phase) { start, end ->
+                        responsiveProbes.add(RequestInterval(start, end))
+                    }, phase)
+                }
+                quorumChecks++
+                delay(250L)
+            }
+            workload.await()
+            // A scheduled coroutine (or an unfinished quorum) does not prove overlap.
+            // Require a complete usable, responsive request inside a completed bulk
+            // request's lifetime. This proves request concurrency, not link saturation.
+            val completedTransfers = synchronized(transfers) { transfers.toList() }
+            val overlappedProbes = responsiveProbes.count { probe ->
+                completedTransfers.any { it.containsComplete(probe) }
+            }
+            assertTrue("No complete responsive HTTPS probe occurred inside a bulk request", overlappedProbes > 0)
+            report("event=loaded_transfer_acceptance checks=$quorumChecks overlapped_probes=$overlappedProbes " +
+                "chunks=$LOADED_TRANSFER_CHUNKS " +
+                "payload_bytes=${LOADED_TRANSFER_CHUNKS.toLong() * (BOUNDED_DOWNLOAD_BYTES + BOUNDED_UPLOAD_BYTES)} " +
+                "elapsed_ms=${SystemClock.elapsedRealtime() - startedAt}")
         }
 
     private suspend fun waitForBackgroundIdle(durationMs: Long, screenOffPower: PowerManager? = null) {
@@ -622,7 +1021,11 @@ class LiveVpnDeviceTest {
         }
     }
 
-    private fun probeHttpsQuorum(client: OkHttpClient, phase: String): Int {
+    private fun probeHttpsQuorum(
+        client: OkHttpClient,
+        phase: String,
+        onResponsiveRequest: (Long, Long) -> Unit = { _, _ -> }
+    ): Int {
         val endpoints = listOf(
             "https://www.gstatic.com/generate_204" to 204,
             "https://cp.cloudflare.com/generate_204" to 204,
@@ -631,20 +1034,32 @@ class LiveVpnDeviceTest {
         var responsive = 0
         for ((url, status) in endpoints) {
             val started = SystemClock.elapsedRealtime()
+            val requestId = traceIdentity.nextRequestId()
+            val trace = VpnProbeTimingTrace(SystemClock::elapsedRealtime, traceIdentity, requestId)
             try {
-                client.newCall(Request.Builder().url(url).header("Cache-Control", "no-store").build())
+                client.newCall(Request.Builder().url(url).header("Cache-Control", "no-store")
+                    .tag(VpnProbeTimingTrace::class.java, trace).build())
                     .execute().use { response ->
                         val body = response.body?.string().orEmpty()
                         val valid = response.code == status && (status == 204 || body.contains("Example Domain"))
-                        val elapsedMs = SystemClock.elapsedRealtime() - started
+                        val finished = SystemClock.elapsedRealtime()
+                        val elapsedMs = finished - started
                         val fast = valid && elapsedMs <= RESPONSIVE_ENDPOINT_LIMIT_MS
-                        if (fast) responsive++
-                        report("phase=$phase endpoint=${url.substringAfter("https://").substringBefore('/')} " +
-                            "http=${response.code} usable=$valid responsive=$fast elapsed_ms=$elapsedMs")
+                        if (fast) {
+                            responsive++
+                            onResponsiveRequest(started, finished)
+                        }
+                        report("phase=$phase ${correlation(requestId)} endpoint=${url.substringAfter("https://").substringBefore('/')} " +
+                            "http=${response.code} usable=$valid responsive=$fast elapsed_ms=$elapsedMs " +
+                            "request_start_ms=$started request_end_ms=$finished")
                     }
             } catch (error: Exception) {
-                report("phase=$phase endpoint=${url.substringAfter("https://").substringBefore('/')} " +
-                    "error=${error.javaClass.simpleName} elapsed_ms=${SystemClock.elapsedRealtime() - started}")
+                val finished = SystemClock.elapsedRealtime()
+                report("phase=$phase ${correlation(requestId)} endpoint=${url.substringAfter("https://").substringBefore('/')} " +
+                    "error=${error.javaClass.simpleName} elapsed_ms=${finished - started} " +
+                    "request_start_ms=$started request_end_ms=$finished")
+            } finally {
+                trace.summaries().forEach { report("event=http_timing phase=$phase $it") }
             }
         }
         return responsive
@@ -658,45 +1073,180 @@ class LiveVpnDeviceTest {
         )
     }
 
-    private fun transferSample(client: OkHttpClient, downloadBytes: Int, uploadBytes: Int) {
+    private fun transferSample(
+        client: OkHttpClient,
+        downloadBytes: Int,
+        uploadBytes: Int,
+        onCompletedRequest: (Long, Long) -> Unit = { _, _ -> }
+    ) {
         // A failed transfer must not silently consume another copy of the budget.
-        val transferClient = client.newBuilder().retryOnConnectionFailure(false)
-            .followRedirects(false).followSslRedirects(false).build()
+        val transferClient = client.newBuilder().strictSyntheticRequests().build()
         val nonce = SystemClock.elapsedRealtimeNanos()
         val started = SystemClock.elapsedRealtime()
-        transferClient.newCall(Request.Builder()
-            .url("https://speed.cloudflare.com/__down?bytes=$downloadBytes&nonce=$nonce")
-            .header("Accept-Encoding", "identity")
-            .header("Cache-Control", "no-store")
-            .build()).execute().use { response ->
-                assertEquals("Download endpoint rejected the transfer", 200, response.code)
-                val body = response.body ?: throw IOException("Download response has no body")
-                body.byteStream().use { readTransferBody(it, downloadBytes) }
+        val downloadId = traceIdentity.nextRequestId()
+        recordBulkRequest(SyntheticTransferRecorder.Kind.Download, downloadId) { trace, progress ->
+            transferClient.newCall(Request.Builder()
+                .url("https://speed.cloudflare.com/__down?bytes=$downloadBytes&nonce=$nonce")
+                .tag(VpnProbeTimingTrace::class.java, trace)
+                .header("Accept-Encoding", "identity")
+                .header("Cache-Control", "no-store")
+                .build()).execute().use { response ->
+                    assertEquals("Download endpoint rejected the transfer", 200, response.code)
+                    val body = response.body ?: throw IOException("Download response has no body")
+                    body.byteStream().use { readTransferBody(it, downloadBytes, progress, downloadId) }
             }
-        report("download_bytes=$downloadBytes elapsed_ms=${SystemClock.elapsedRealtime() - started}")
-        val uploadStarted = SystemClock.elapsedRealtime()
+        }
+        val downloadFinished = SystemClock.elapsedRealtime()
+        onCompletedRequest(started, downloadFinished)
+        report("download_bytes=$downloadBytes ${correlation(downloadId)} elapsed_ms=${downloadFinished - started} " +
+            "request_start_ms=$started request_end_ms=$downloadFinished")
         val payload = ByteArray(uploadBytes) { (it and 0xff).toByte() }
-        transferClient.newCall(Request.Builder()
-            .url("https://speed.cloudflare.com/__up?nonce=$nonce")
-            .post(payload.toRequestBody("application/octet-stream".toMediaType()))
-            .build()).execute().use { response ->
-                assertTrue("Upload endpoint rejected the transfer: HTTP ${response.code}", response.isSuccessful)
+        val uploadStarted = SystemClock.elapsedRealtime()
+        val uploadId = traceIdentity.nextRequestId()
+        recordBulkRequest(SyntheticTransferRecorder.Kind.Upload, uploadId) { trace, progress ->
+            transferClient.newCall(Request.Builder()
+                .url("https://speed.cloudflare.com/__up?nonce=$nonce")
+                .tag(VpnProbeTimingTrace::class.java, trace)
+                .post(SyntheticProgressRequestBody(payload.toRequestBody("application/octet-stream".toMediaType()), progress))
+                .build()).execute().use { response ->
+                    assertTrue("Upload endpoint rejected the transfer: HTTP ${response.code}", response.isSuccessful)
             }
-        report("upload_bytes=$uploadBytes elapsed_ms=${SystemClock.elapsedRealtime() - uploadStarted}")
+        }
+        val uploadFinished = SystemClock.elapsedRealtime()
+        onCompletedRequest(uploadStarted, uploadFinished)
+        report("upload_bytes=$uploadBytes ${correlation(uploadId)} elapsed_ms=${uploadFinished - uploadStarted} " +
+            "request_start_ms=$uploadStarted request_end_ms=$uploadFinished")
     }
 
-    private fun readTransferBody(input: InputStream, expectedBytes: Int): Int {
+    private fun <T> recordBulkRequest(
+        kind: SyntheticTransferRecorder.Kind,
+        requestId: Long?,
+        transfer: (VpnProbeTimingTrace, SyntheticTransferProgress) -> T
+    ): T {
+        val trace = VpnProbeTimingTrace(SystemClock::elapsedRealtime, traceIdentity, requestId)
+        val progress = SyntheticTransferProgress(SystemClock::elapsedRealtime)
+        try {
+            return SyntheticTransferRecorder(SystemClock::elapsedRealtime, ::report, traceIdentity, requestId)
+                .record(kind) { transfer(trace, progress) }
+        } finally {
+            // No diagnostic I/O in HTTP callbacks, and no reporter failure may
+            // replace the original transfer/cancellation exception.
+            runCatching {
+                report("event=transfer_progress kind=${kind.name.lowercase()} ${correlation(requestId)} ${progress.summary()}")
+                trace.summaries().forEach { report("event=http_timing phase=bulk_${kind.name.lowercase()} $it") }
+            }
+        }
+    }
+
+    private fun correlation(requestId: Long?): String =
+        "run_id=${traceIdentity.runId} request_id=${requestId ?: "unknown"}"
+
+    private suspend fun verifyUploadControls(context: Context, client: OkHttpClient) = withContext(Dispatchers.IO) {
+        val args = InstrumentationRegistry.getArguments()
+        require(args.getString("smallProbesOnly") == "true") { "Controls have their own explicit upload budget" }
+        val samples = (args.getString("uploadSamples") ?: "4").toInt().also { require(it in 1..12) }
+        val size = (args.getString("uploadMiB") ?: "2").toInt().also { require(it in 1..8) } * 1024 * 1024
+        val socksFirst = when (args.getString("controlOrder")) {
+            null, "tun-first" -> false
+            "socks-first" -> true
+            else -> error("controlOrder must be tun-first or socks-first")
+        }
+        val service = requireNotNull(SocketProtector.vpnService)
+        val core = G2RayVpnService::class.java.getDeclaredField("core").apply { isAccessible = true }
+            .get(service) as XrayCoreManager
+        val port = requireNotNull(core.activeSocksPort())
+        val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        fun requireSameTunnel() {
+            check(SocketProtector.vpnService === service && core.activeSocksPort() == port) {
+                "Runtime changed during the matched upload comparison"
+            }
+            check(connectivity.getNetworkCapabilities(connectivity.activeNetwork)
+                ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true) { "Full VPN routing was lost" }
+        }
+        val socks = client.newBuilder().strictSyntheticRequests()
+            .proxy(Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", port)))
+            .connectionPool(ConnectionPool(5, 10, TimeUnit.MINUTES)).build()
+        val payload = ByteArray(size) { (it and 255).toByte() }
+        var failed = 0
+        var attempted = 0
+        report("event=upload_control_budget samples_per_path=$samples upload_bytes_each=$size " +
+            "payload_budget_bytes=${2L * samples * size} same_core=true no_direct_egress=true")
+        try {
+            repeat(samples) { index ->
+                val paths = listOf("tun" to client, "socks" to socks).let {
+                    if ((index % 2 == 0) == socksFirst) it.reversed() else it
+                }
+                for ((path, pathClient) in paths) {
+                    coroutineContext.ensureActive()
+                    requireSameTunnel()
+                    val generation = SocketProtector.underlyingNetworkGeneration()
+                    val id = traceIdentity.nextRequestId()
+                    attempted++
+                    try {
+                        recordBulkRequest(SyntheticTransferRecorder.Kind.Upload, id) { trace, progress ->
+                            val request = Request.Builder()
+                                .url("https://speed.cloudflare.com/__up?nonce=${SystemClock.elapsedRealtimeNanos()}")
+                                .tag(VpnProbeTimingTrace::class.java, trace)
+                                .post(SyntheticProgressRequestBody(
+                                    payload.toRequestBody("application/octet-stream".toMediaType()), progress))
+                                .build()
+                            pathClient.newCall(request).execute().use { response ->
+                                check(response.code == 200) { "Synthetic upload rejected" }
+                                response.body?.byteStream()?.use { input ->
+                                    val buffer = ByteArray(65_537)
+                                    var count = 0
+                                    while (count < buffer.size) {
+                                        val next = input.read(buffer, count, buffer.size - count)
+                                        if (next < 0) break
+                                        count += next
+                                    }
+                                    check(count <= 65_536) { "Synthetic upload response exceeded budget" }
+                                }
+                            }
+                        }
+                        report("event=upload_control ${correlation(id)} path=$path attempt=${index + 1} " +
+                            "outcome=completed expected_bytes=$size network_generation=$generation")
+                    } catch (error: Exception) {
+                        coroutineContext.ensureActive()
+                        failed++
+                        report("event=upload_control ${correlation(id)} path=$path attempt=${index + 1} " +
+                            "outcome=failed error_type=${error.javaClass.simpleName} expected_bytes=$size " +
+                            "network_generation=$generation")
+                    }
+                    requireSameTunnel()
+                    check(generation == SocketProtector.underlyingNetworkGeneration()) {
+                        "Physical network changed during a matched upload; do not attribute it to TUN"
+                    }
+                }
+                assertResponsiveQuorum(probeHttpsQuorum(client, "after_upload_pair_${index + 1}"), "after_upload_pair")
+            }
+            report("event=upload_control_acceptance attempts=$attempted failed=$failed")
+            assertEquals("Matched upload attempts failed; inspect per-call progress without discarding failures", 0, failed)
+        } finally {
+            socks.connectionPool.evictAll()
+        }
+    }
+
+    private fun readTransferBody(
+        input: InputStream, expectedBytes: Int,
+        progress: SyntheticTransferProgress? = null, requestId: Long? = null
+    ): Int {
         require(expectedBytes > 0)
         var total = 0
         val buffer = ByteArray(8 * 1024)
-        while (true) {
-            val count = input.read(buffer, 0, minOf(buffer.size, expectedBytes - total + 1))
-            if (count == -1) break
-            total += count
-            if (total > expectedBytes) throw IOException("Download response exceeded the byte budget")
+        try {
+            while (true) {
+                val count = input.read(buffer, 0, minOf(buffer.size, expectedBytes - total + 1))
+                if (count == -1) break
+                total += count
+                progress?.advance(count.toLong())
+                if (total > expectedBytes) throw IOException("Download response exceeded the byte budget")
+            }
+            if (total != expectedBytes) throw IOException("Download response was truncated: $total/$expectedBytes bytes")
+            return total
+        } finally {
+            runCatching { report("event=download_body ${correlation(requestId)} received_bytes=$total expected_bytes=$expectedBytes") }
         }
-        if (total != expectedBytes) throw IOException("Download response was truncated: $total/$expectedBytes bytes")
-        return total
     }
 
     private suspend fun playBoundedYoutubeSample(context: Context) {
@@ -704,6 +1254,7 @@ class LiveVpnDeviceTest {
             error("Budgeted third-party playback requires Android 10 or newer")
         }
         val args = InstrumentationRegistry.getArguments()
+        val limits = videoTestLimits(args)
         val uri = Uri.parse(requireNotNull(args.getString("videoUrl")) { "Pass an explicit public YouTube videoUrl" })
         require(uri.scheme == "https" && uri.host == "www.youtube.com" && uri.path == "/watch" &&
             !uri.getQueryParameter("v").isNullOrBlank()) { "videoUrl must be a public HTTPS YouTube watch URL" }
@@ -731,14 +1282,16 @@ class LiveVpnDeviceTest {
         var bufferingTransitions = 0
         var previousState: Int? = null
         var budgetReached = false
+        report("event=youtube_limits duration_ms=${limits.durationMs} " +
+            "mobile_budget_bytes=${limits.mobileBudgetBytes} required_playing_ms=${limits.requiredPlayingMs}")
         try {
             context.startActivity(Intent(Intent.ACTION_VIEW, uri).setPackage("com.google.android.youtube")
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-            while (SystemClock.elapsedRealtime() - started < 60_000L) {
+            while (SystemClock.elapsedRealtime() - started < limits.durationMs) {
                 val elapsed = SystemClock.elapsedRealtime() - started
                 val used = mobileBytes() - initialBytes
                 check(used >= 0L) { "Mobile counters reset during video; stop rather than guess the budget" }
-                if (used >= VIDEO_MOBILE_BUDGET_BYTES) {
+                if (used >= limits.mobileBudgetBytes) {
                     budgetReached = true
                     break
                 }
@@ -773,7 +1326,7 @@ class LiveVpnDeviceTest {
                 // Stop only the explicitly launched video app, so it cannot
                 // continue prefetching after the test or its budget guard ends.
                 ParcelFileDescriptor.AutoCloseInputStream(automation.executeShellCommand(
-                    "am force-stop com.google.android.youtube"
+                    "am force-stop --user current com.google.android.youtube"
                 )).use { output -> while (output.read() != -1) { /* Drain shell completion. */ } }
             } finally {
                 automation.dropShellPermissionIdentity()
@@ -786,10 +1339,31 @@ class LiveVpnDeviceTest {
                 "buffering_transitions=$bufferingTransitions")
         }
         assertNotNull("The requested video never reported active playback", firstPlayingAt)
-        assertTrue("The requested video did not report local Playing state for 15 observed seconds",
-            playingObservation.observedMs >= 15_000L)
+        assertTrue("The requested video did not report local Playing state for ${limits.requiredPlayingMs} observed ms",
+            playingObservation.observedMs >= limits.requiredPlayingMs)
         assertTrue("YouTube reported rebuffering during the bounded sample", bufferingTransitions == 0)
         report("bounded_youtube_acceptance=true")
+    }
+
+    private data class VideoTestLimits(
+        val durationMs: Long,
+        val mobileBudgetBytes: Long,
+        val requiredPlayingMs: Long
+    )
+
+    private fun videoTestLimits(args: Bundle): VideoTestLimits {
+        fun argument(name: String, default: Long, allowed: LongRange): Long {
+            val value = args.getString(name)?.let {
+                requireNotNull(it.toLongOrNull()) { "$name must be an integer" }
+            } ?: default
+            require(value in allowed) { "$name must be in $allowed" }
+            return value
+        }
+        val durationSeconds = argument("videoDurationSeconds", 60L, 60L..600L)
+        val budgetMiB = argument("videoBudgetMiB", 12L, 12L..2_048L)
+        // Preserve the limited-data check; extended runs require all but 30 s playing.
+        val requiredSeconds = if (durationSeconds == 60L) 15L else durationSeconds - 30L
+        return VideoTestLimits(durationSeconds * 1_000L, budgetMiB * 1024 * 1024, requiredSeconds * 1_000L)
     }
 
     private class PlayingObservation {
@@ -833,7 +1407,7 @@ class LiveVpnDeviceTest {
         const val UPLOAD_BYTES = 64 * 1024
         const val BOUNDED_DOWNLOAD_BYTES = 8 * 1024 * 1024
         const val BOUNDED_UPLOAD_BYTES = 2 * 1024 * 1024
-        const val VIDEO_MOBILE_BUDGET_BYTES = 12 * 1024 * 1024L
+        const val LOADED_TRANSFER_CHUNKS = 12
         // A generous regression ceiling, not a promise of instant browsing.
         const val RESPONSIVE_ENDPOINT_LIMIT_MS = 6_000L
     }

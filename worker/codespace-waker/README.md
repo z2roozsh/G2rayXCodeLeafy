@@ -6,9 +6,16 @@ This Cloudflare Worker gives you a manual wake page for one or more GitHub Codes
 
 It does not expose VLESS configs, keep the Codespace alive forever, or bypass quota, billing, deletion, or account restrictions.
 
+**Network hobby use:** authenticated on-demand starts remain compatible with
+the original setup. No additional purpose flag is required. The server can
+resume its saved tunnel after a Codespace starts; it is not disabled by a
+provider-wide software guard. Use the project for genuine development/testing,
+not a full-time VPN service or free-account rotation. GitHub Support must resolve
+account restrictions; the Worker cannot bypass them or guarantee approval.
+
 The browser page is a small mobile-friendly health dashboard. It has a large **Start Codespace** button, a **Check Health** action, route latency/status cards, copyable status text, a stop-polling button, a route history summary, a latency trend, and auto-refresh while the route is still settling.
 
-After GitHub accepts the start request, the Worker waits for the Codespace state to become available, then probes the public `app.github.dev` XHTTP route. If the response says `route_ready: true`, the external route answered a usable XHTTP probe and the VLESS configs should usually be usable. If it says `route_ready: false`, follow the returned `next_action`; HTTP `404` usually means GitHub's port route is still settling, while HTTP `0` usually means DNS or the app route did not answer.
+After GitHub accepts a cold start, the Worker returns progress immediately; the app/dashboard polls Health until the Codespace is available and its public `app.github.dev` XHTTP route passes two consecutive probes. If the response says `route_ready: true`, the external route answered usable XHTTP probes, not a full VLESS traffic test. If it says `route_ready: false`, follow the returned `next_action`; HTTP `404` usually means GitHub's port route is still settling, while HTTP `0` usually means DNS or the app route did not answer.
 
 When the start request is accepted but the route is still settling, the API returns HTTP `202` with `ok: true`, `route_ready: false`, `retry_after_seconds`, `poll_after_seconds`, and a `Retry-After` header. The browser page keeps polling health until the route becomes ready or you stop checking.
 
@@ -39,13 +46,17 @@ No Wrangler or KV setup is required.
 
 1. Open **Workers & Pages**, create or open your Worker, and click **Edit code**.
 2. Replace all code with `worker/codespace-waker/src/index.js`, then click **Deploy**.
-3. Open **Settings > Variables and Secrets** and add exactly these three values:
+3. Open **Settings > Variables and Secrets** and add these values for authenticated on-demand wake, status and history:
 
 | Type | Name | Value |
 | --- | --- | --- |
 | Plaintext | `CODESPACE_NAME` | Your exact GitHub Codespace name |
 | Secret | `GITHUB_TOKEN` | Token belonging to the account that owns that Codespace |
 | Secret | `WAKE_SECRET` | One shared wake key used by the Worker and Android app |
+
+These three values remain sufficient. `CODESPACE_WAKE_PURPOSE` is not required;
+the temporary purpose gate was withdrawn to preserve existing app/dashboard
+compatibility. An old value may be removed; it does not enable or disable wake.
 
 To add another Codespace to the same Worker, add two more dashboard variables:
 
@@ -85,19 +96,23 @@ Optional: add `CODESPACE_FORWARDING_DOMAIN` as a **Plaintext** variable only if 
 
 Optional: set `WAKE_FAST_PATH=0` as a **Plaintext** variable to disable the default warm-route fast path. With the default `WAKE_FAST_PATH=1`, `/wake` first does a cheap route probe; if the route is already stable and GitHub says the Codespace is Available, it returns success without calling GitHub's `/start` API again.
 
+Warm wake reuses the primary port's first successful probe as attempt one, waits the stability interval, then confirms it with a second probe. Confirmation runs concurrently with optional diagnostics, using the primary port's own deadline. Optional ports are checked once and cannot establish primary-route readiness. A warm primary 404 returns polling guidance instead of entering a settling loop merely because an optional port answered 200.
+
 After GitHub accepts a cold start, the Worker returns HTTP 202 immediately and the app/dashboard polls Health until the Codespace and forwarded route are ready. An individual Health route check is bounded to about eight seconds. This avoids false mobile timeouts without pretending GitHub's forwarding route settles faster. You can override `ROUTE_WAIT_MS`, `ROUTE_POLL_INTERVAL_MS`, `ROUTE_FETCH_TIMEOUT_MS`, and `ROUTE_POLL_AFTER_SECONDS` as Plaintext variables if a measured deployment needs different route-check timing.
 
 ### Optional Worker custom domain
 
 If a phone or ISP cannot reach your `workers.dev` hostname, attach a hostname you own directly to this Worker, for example `wake.example.com`, then save `https://wake.example.com` as the Worker URL in both the panel and Android account. This is a Worker custom domain, not a proxy in front of the Codespaces tunnel: it needs no Codespaces Host/SNI override and it does not change VLESS transport behavior. In Cloudflare, open **Workers & Pages > your Worker > Settings > Domains & Routes > Add > Custom Domain**. The hostname must not already have a CNAME record. Test the new URL from the affected phone before replacing `workers.dev` everywhere.
 
-Optional history: create a Cloudflare KV namespace and bind it as `WAKER_KV`. Without this binding, the dashboard still works but shows history as disabled. With `WAKER_KV`, it stores recent wake/health events, route HTTP status, latency, route wait time, and last failures under a per-Codespace key. Identical health polls are sampled with `HEALTH_HISTORY_SAMPLE_MS` (default 5 minutes). Unchanged quota-incident state, including repeated accepted-start timestamps, is sampled with `QUOTA_INCIDENT_SAMPLE_MS` (default 15 minutes); state transitions and the first accepted start are written immediately. A warm route check is not recorded as a GitHub start. Cron observation and scheduler timestamps share one incident write. History/alerts and optional cooldowns have their own writes, so this is not a guarantee against exhausting KV limits. Failed-auth IPv6 addresses share a `/64` budget. KV remains eventually consistent: this is a best-effort anti-spam guard, not a strict distributed rate limiter.
+Optional history: create a Cloudflare KV namespace and bind it as `WAKER_KV`. Without this binding, the dashboard still works but shows history as disabled. With `WAKER_KV`, it stores recent wake/health events, route HTTP status, latency, route wait time, and last failures under a per-Codespace key. Identical health polls are sampled with `HEALTH_HISTORY_SAMPLE_MS` (default 5 minutes). Unchanged quota-incident state, including repeated accepted-start timestamps, is sampled with `QUOTA_INCIDENT_SAMPLE_MS` (default 15 minutes); state transitions and the first accepted start are written immediately. A warm route check is not recorded as a GitHub start. History/alerts and optional cooldowns have their own writes, so this is not a guarantee against exhausting KV limits. Failed-auth IPv6 addresses share a `/64` budget. KV remains eventually consistent: this is a best-effort anti-spam guard, not a strict distributed rate limiter.
 
 Quota survival history also uses `WAKER_KV`. When GitHub returns HTTP `402`, the Worker records the first quota block, latest quota block, estimated monthly reset, retention/deletion fields from GitHub, and the next later successful wake or health check. This helps confirm that the same Codespace survived into the next monthly reset.
 
-Optional quota survival Cron: add a Cloudflare Cron Trigger only if you want automatic low-frequency checks while quota is blocked, then set `QUOTA_SURVIVAL_CRON_ENABLED=true` as a **Plaintext** variable. The Worker is disabled by default for scheduled events, checks at most about daily before reset, and only attempts a wake near the estimated monthly reset window.
-
-An automatic wake consumes Codespaces compute time even if no VPN client connects. Leave this option disabled for on-demand-only operation.
+Scheduled quota revival has been retired. Remove old Cloudflare Cron Triggers
+and `QUOTA_SURVIVAL_CRON_ENABLED` variables. Scheduled events are now no-ops even
+if those old settings remain enabled: they do not read KV, poll GitHub, queue
+notifications or start a workspace. Quota history is retained as diagnostic data,
+not a reason to create or switch to another free account.
 
 Optional alerts:
 

@@ -4,6 +4,7 @@ import android.content.Context
 import com.g2ray.client.data.EncryptedPrefsStore
 import com.g2ray.client.data.SecureKeyValueStore
 import com.g2ray.client.model.VpnEngineMode
+import org.json.JSONArray
 
 internal data class VpnSettingsSnapshot(
     val mode: VpnEngineMode = VpnEngineMode.Auto,
@@ -11,7 +12,9 @@ internal data class VpnSettingsSnapshot(
     val ipv4OnlyEnabled: Boolean = false,
     val dpiCompatibilityEnabled: Boolean = false,
     val autoRouteOptimizationEnabled: Boolean = true,
-    val seamlessFailoverEnabled: Boolean = true
+    val seamlessFailoverEnabled: Boolean = true,
+    val routingPolicy: RoutingPolicy = RoutingPolicy(),
+    val diagnosticsEnabled: Boolean = false
 )
 
 /** Persists the user's engine preference independently of a VPN service restart. */
@@ -26,7 +29,9 @@ class VpnEnginePreferences internal constructor(
         ipv4OnlyEnabled = isIpv4OnlyEnabled(),
         dpiCompatibilityEnabled = isDpiCompatibilityEnabled(),
         autoRouteOptimizationEnabled = isAutoRouteOptimizationEnabled(),
-        seamlessFailoverEnabled = isSeamlessFailoverEnabled()
+        seamlessFailoverEnabled = isSeamlessFailoverEnabled(),
+        routingPolicy = getRoutingPolicy(),
+        diagnosticsEnabled = isDiagnosticsEnabled()
     )
 
     fun getMode(): VpnEngineMode = VpnEngineMode.fromStorage(store.getString(PREF_VPN_ENGINE_MODE, null))
@@ -68,6 +73,47 @@ class VpnEnginePreferences internal constructor(
     fun setSeamlessFailoverEnabled(enabled: Boolean) {
         store.putString(PREF_SEAMLESS_FAILOVER_ENABLED, enabled.toString())
     }
+
+    fun getRoutingPolicy(): RoutingPolicy {
+        val domains = store.getString("vpn_bypass_domains", null)
+        val packages = store.getString("vpn_excluded_packages", null)
+        val bypassIranianDomains = readBoolean("vpn_bypass_ir")
+        // Invalid persisted rules must not introduce bypass or prevent a full-tunnel start.
+        return runCatching {
+            validateRoutingPolicy(RoutingPolicy(
+                bypassIranianDomains,
+                readRoutingStrings(domains, 100),
+                readRoutingStrings(packages, 200).toSet()
+            ))
+        }.getOrDefault(RoutingPolicy())
+    }
+
+    fun setRoutingPolicy(policy: RoutingPolicy) {
+        val validated = validateRoutingPolicy(policy)
+        store.putStrings(mapOf(
+            "vpn_bypass_ir" to validated.bypassIranianDomains.toString(),
+            "vpn_bypass_domains" to JSONArray(validated.bypassDomains).toString(),
+            "vpn_excluded_packages" to JSONArray(validated.excludedPackages.sorted()).toString()
+        ))
+    }
+
+    private fun validateRoutingPolicy(policy: RoutingPolicy): RoutingPolicy {
+        val domains = RoutingPolicy.parseDomains(policy.bypassDomains.joinToString("\n"))
+        require(policy.excludedPackages.size <= 200 && policy.excludedPackages.all {
+            it.length <= 255 && it.matches(Regex("[a-zA-Z0-9_]+(?:\\.[a-zA-Z0-9_]+)+"))
+        }) { "Invalid app selection" }
+        return policy.copy(bypassDomains = domains)
+    }
+
+    private fun readRoutingStrings(text: String?, limit: Int): List<String> {
+        if (text == null) return emptyList()
+        val array = JSONArray(text)
+        require(array.length() <= limit) { "Too many saved routing rules" }
+        return (0 until array.length()).map { array.get(it) as? String ?: error("Invalid saved routing rule") }
+    }
+
+    fun isDiagnosticsEnabled(): Boolean = readBoolean("vpn_diagnostics_enabled")
+    fun setDiagnosticsEnabled(enabled: Boolean) = store.putString("vpn_diagnostics_enabled", enabled.toString())
 
     fun getLastRouteOptimizationAttemptAt(accountId: String, networkKey: String? = null): Long {
         if (!networkKey.isNullOrBlank() &&

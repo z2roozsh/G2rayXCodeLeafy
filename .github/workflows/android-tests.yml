@@ -4,10 +4,28 @@ on:
   push:
     paths:
       - "g2ray_app/**"
+      - "g2ray.sh"
+      - ".devcontainer/Dockerfile"
+      - ".devcontainer/build-xray.sh"
+      - ".devcontainer/patches/**"
+      - ".devcontainer/fixtures/**"
+      - "tests/g2ray_config_validation.sh"
+      - "tests/xray_isolated_server_pair_check.py"
+      - "tests/xray_authenticated_transport_check.py"
+      - "tests/xray_retained_http_check.go"
       - ".github/workflows/android-tests.yml"
   pull_request:
     paths:
       - "g2ray_app/**"
+      - "g2ray.sh"
+      - ".devcontainer/Dockerfile"
+      - ".devcontainer/build-xray.sh"
+      - ".devcontainer/patches/**"
+      - ".devcontainer/fixtures/**"
+      - "tests/g2ray_config_validation.sh"
+      - "tests/xray_isolated_server_pair_check.py"
+      - "tests/xray_authenticated_transport_check.py"
+      - "tests/xray_retained_http_check.go"
       - ".github/workflows/android-tests.yml"
   workflow_dispatch:
 
@@ -21,12 +39,94 @@ concurrency:
 jobs:
   native-payload-tests:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v5
       - name: Verify upstream payload counters and engine restart cleanup
         run: bash ./g2ray_app/scripts/test-hev-payload.sh
+      - name: Verify native build workspace ownership
+        shell: pwsh
+        run: ./g2ray_app/scripts/test-native-build-workspace.ps1
+      - name: Set up the pinned native Go toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.10"
+          cache: false
+      - name: Verify the actual patched native HTTP measurements
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref=$(tr -d '\r' < g2ray_app/app/libs/libXray.properties | sed -nE 's/^libxray.ref=([0-9a-f]{40})$/\1/p')
+          core_ref=$(tr -d '\r' < g2ray_app/app/libs/libXray.properties | sed -nE 's/^libxray.xray.ref=([0-9a-f]{40})$/\1/p')
+          [[ "$ref" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$core_ref" =~ ^[0-9a-f]{40}$ ]]
+          tmp=$(mktemp -d)
+          trap 'rm -rf -- "$tmp"' EXIT
+          mkdir "$tmp/libxray-src" "$tmp/Xray-core"
+          git -C "$tmp/libxray-src" init
+          git -C "$tmp/libxray-src" fetch --depth=1 https://github.com/XTLS/libXray.git "$ref"
+          git -C "$tmp/libxray-src" -c core.autocrlf=false checkout --detach FETCH_HEAD
+          git -C "$tmp/Xray-core" init
+          git -C "$tmp/Xray-core" fetch --depth=1 https://github.com/XTLS/Xray-core.git "$core_ref"
+          git -C "$tmp/Xray-core" -c core.autocrlf=false checkout --detach FETCH_HEAD
+          git -C "$tmp/libxray-src" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/libxray-measure-status.patch"
+          git -C "$tmp/libxray-src" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/libxray-android-controller.patch"
+          git -C "$tmp/Xray-core" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-observer-detached-snapshot.patch"
+          git -C "$tmp/Xray-core" apply --check "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-xhttp-upstream-races-5ca.patch"
+          git -C "$tmp/Xray-core" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-xhttp-upstream-races-5ca.patch"
+          git -C "$tmp/Xray-core" apply --check "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-xhttp-close-error-5ca.patch"
+          git -C "$tmp/Xray-core" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-xhttp-close-error-5ca.patch"
+          git -C "$tmp/Xray-core" apply --check "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-websocket-integrity-5ca.patch"
+          git -C "$tmp/Xray-core" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-websocket-integrity-5ca.patch"
+          git -C "$tmp/Xray-core" apply --check "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-vless-cancel-5ca.patch"
+          git -C "$tmp/Xray-core" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-vless-cancel-5ca.patch"
+          git -C "$tmp/Xray-core" apply --check "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-xhttp-lifecycle-5ca.patch"
+          git -C "$tmp/Xray-core" apply "$GITHUB_WORKSPACE/g2ray_app/scripts/patches/xray-xhttp-lifecycle-5ca.patch"
+          cp g2ray_app/scripts/fixtures/g2ray_xhttp_regression_test.go "$tmp/Xray-core/transport/internet/splithttp/g2ray_xhttp_regression_test.go"
+          cp g2ray_app/scripts/fixtures/g2ray_ws_regression_test.go "$tmp/Xray-core/transport/internet/websocket/g2ray_ws_regression_test.go"
+          cp g2ray_app/scripts/fixtures/g2ray_retry_regression_test.go "$tmp/Xray-core/common/retry/g2ray_retry_regression_test.go"
+          cp g2ray_app/scripts/fixtures/g2ray_vless_cancel_test.go "$tmp/Xray-core/proxy/vless/outbound/g2ray_vless_cancel_test.go"
+          cp g2ray_app/scripts/fixtures/g2ray_vless_xhttp_cancel_test.go "$tmp/Xray-core/proxy/vless/outbound/g2ray_vless_xhttp_cancel_test.go"
+          cp g2ray_app/scripts/fixtures/g2ray_xhttp_dial_regression_test.go "$tmp/Xray-core/transport/internet/splithttp/g2ray_xhttp_dial_regression_test.go"
+          cp g2ray_app/scripts/fixtures/g2ray_xhttp_request_lifecycle_test.go "$tmp/Xray-core/transport/internet/splithttp/g2ray_xhttp_request_lifecycle_test.go"
+          (cd "$tmp/Xray-core" && go test -race ./common/retry ./proxy/vless/outbound -count=1 -timeout=90s)
+          (cd "$tmp/Xray-core" && go test -race ./transport/internet/splithttp -run '^TestG2RayX' -count=3 -timeout=180s)
+          (cd "$tmp/Xray-core" && go test -race ./transport/internet/websocket -run '^TestG2RayWS(RealFrame|ReadPreserves|HandshakeDeadline|Blackholed|EarlierParent|FailedTLS)' -count=1 -timeout=90s)
+          # Xray's separate TLS-server certificate reload has a known race;
+          # keep the real local WSS success control, without claiming it is race-clean.
+          (cd "$tmp/Xray-core" && go test ./transport/internet/websocket -run '^TestG2RayWSFinalFrameOnTLSClose$' -count=3 -timeout=30s)
+          # Use the same patched, pinned client source as the AAR and the
+          # separately pinned server release. Everything below is loopback-only.
+          (cd "$tmp/Xray-core" && go build -trimpath -buildvcs=false -o "$tmp/client-xray" ./main)
+          version=$(sed -nE 's/^ARG XRAY_VERSION=(v[0-9]+\.[0-9]+\.[0-9]+)$/\1/p' .devcontainer/Dockerfile)
+          [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          curl --fail --location --retry 2 --max-time 180 --silent --show-error \
+            "https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-64.zip" -o "$tmp/server.zip"
+          curl --fail --location --retry 2 --max-time 60 --silent --show-error \
+            "https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-64.zip.dgst" -o "$tmp/server.zip.dgst"
+          hash=$(awk -F'= ' '/^SHA2-256=/{print $2}' "$tmp/server.zip.dgst")
+          [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]]
+          printf '%s  %s\n' "$hash" "$tmp/server.zip" | sha256sum -c -
+          unzip -q "$tmp/server.zip" -d "$tmp/server"
+          chmod +x "$tmp/server/xray"
+          go build -o "$tmp/retained-http-probe" tests/xray_retained_http_check.go
+          python3 tests/xray_isolated_server_pair_check.py "$tmp/server/xray" "$tmp/retained-http-probe" \
+            --client-xray "$tmp/client-xray" --profile balanced --loopback-baseline --idle-seconds 0
+          # Exercise the exact maintained image's binary, not only its official
+          # release control or an independently built source approximation.
+          docker build --tag g2ray-pair-maintained --file .devcontainer/Dockerfile .devcontainer
+          docker run --rm --entrypoint cat g2ray-pair-maintained /usr/local/bin/xray > "$tmp/maintained-xray"
+          chmod +x "$tmp/maintained-xray"
+          XRAY_LOCATION_ASSET="$tmp/server" python3 tests/xray_isolated_server_pair_check.py \
+            "$tmp/maintained-xray" "$tmp/retained-http-probe" --client-xray "$tmp/client-xray" \
+            --profile balanced --loopback-baseline --idle-seconds 0
+          cp g2ray_app/scripts/fixtures/libxray_measure_status_test.go "$tmp/libxray-src/nodep/g2ray_measure_status_test.go"
+          cp g2ray_app/scripts/fixtures/libxray_batch_policy_test.go "$tmp/libxray-src/xray/g2ray_batch_policy_test.go"
+          cd "$tmp/libxray-src"
+          go mod edit -replace=github.com/xtls/xray-core=../Xray-core
+          [[ "$(go list -m -f '{{.Replace.Dir}}' github.com/xtls/xray-core)" == "$tmp/Xray-core" ]]
+          go test -race ./nodep ./xray -run TestG2Ray -count=1 -timeout=90s -v
 
   source-checks:
     runs-on: ubuntu-latest
@@ -58,12 +158,53 @@ jobs:
           packages: "platform-tools platforms;android-36.1 build-tools;36.0.0"
           log-accepted-android-sdk-licenses: false
       - name: Test source and verify native build inputs
+        env:
+          JAVA_TOOL_OPTIONS: -Dg2ray.configFixtureDir=${{ github.workspace }}/g2ray_app/app/build/vpn-config-fixtures
         run: >-
           bash ./gradlew :app:testDebugUnitTest :app:lintDebug
           :app:compileDebugAndroidTestKotlin
           :app:verifyHevBundle :app:verifyLibXrayBuildContract
           --no-daemon --console=plain
-      - name: Test release-schema mapping verifier
+      - name: Validate all generated VPN variants with the real pinned core
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -nE 's/^ARG XRAY_VERSION=(v[0-9]+\.[0-9]+\.[0-9]+)$/\1/p' ../.devcontainer/Dockerfile)
+          [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          tmp=$(mktemp -d)
+          trap 'rm -rf -- "$tmp"' EXIT
+          curl --fail --location --retry 2 --max-time 180 --silent --show-error \
+            "https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-64.zip" -o "$tmp/release.zip"
+          curl --fail --location --retry 2 --max-time 60 --silent --show-error \
+            "https://github.com/XTLS/Xray-core/releases/download/${version}/Xray-linux-64.zip.dgst" -o "$tmp/release.zip.dgst"
+          hash=$(awk -F'= ' '/^SHA2-256=/{print $2}' "$tmp/release.zip.dgst")
+          [[ "$hash" =~ ^[0-9a-fA-F]{64}$ ]]
+          printf '%s  %s\n' "$hash" "$tmp/release.zip" | sha256sum -c -
+          unzip -q "$tmp/release.zip" -d "$tmp/core"
+          chmod +x "$tmp/core/xray"
+          shopt -s nullglob
+          fixtures=(app/build/vpn-config-fixtures/*.json)
+          if [[ ${#fixtures[@]} -ne 40 ]]; then
+            printf 'Expected 40 generated VPN config fixtures, found %s. Check test-task output generation/cache restoration.\n' "${#fixtures[@]}" >&2
+            exit 1
+          fi
+          for config in "${fixtures[@]}"; do
+            "$tmp/core/xray" run -test -config "$config"
+          done
+          option_fixtures=(app/build/vpn-config-fixtures/options/*.json)
+          if [[ ${#option_fixtures[@]} -ne 1408 ]]; then
+            printf 'Expected 1408 option-matrix configs, found %s.\n' "${#option_fixtures[@]}" >&2
+            exit 1
+          fi
+          for config in "${option_fixtures[@]}"; do
+            "$tmp/core/xray" run -test -config "$config" > "$tmp/option-check.log" 2>&1 || {
+              printf 'Option config rejected: %s\n' "$config" >&2
+              cat "$tmp/option-check.log" >&2
+              exit 1
+            }
+          done
+          printf 'Validated all %s option-matrix configurations.\n' "${#option_fixtures[@]}"
+      - name: Test release-schema and native-bundle gates
         run: bash ./gradlew -p buildSrc test --no-daemon --console=plain
       - name: Preserve Android test and lint evidence
         if: always()
@@ -73,5 +214,6 @@ jobs:
           path: |
             g2ray_app/app/build/test-results/testDebugUnitTest/*.xml
             g2ray_app/app/build/reports/lint-results-debug.xml
+            g2ray_app/buildSrc/build/test-results/test/*.xml
           if-no-files-found: warn
           retention-days: 14

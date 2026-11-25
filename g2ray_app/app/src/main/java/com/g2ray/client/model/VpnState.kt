@@ -15,7 +15,8 @@ enum class TunnelState {
     Starting,
     Connected,
     Stopping,
-    Error
+    Error,
+    Blocked
 }
 
 data class AppConnectionState(
@@ -31,5 +32,7 @@ data class AppConnectionState(
     val totalRxBytes: Long = 0,
     val totalTxBytes: Long = 0,
     val activeVpnEngine: ActiveVpnEngine? = null,
-    val tunnelTrafficSource: TunnelTrafficSource = TunnelTrafficSource.Unavailable
+    val tunnelTrafficSource: TunnelTrafficSource = TunnelTrafficSource.Unavailable,
+    val alwaysOnVpn: Boolean? = null,
+    val blockConnectionsWithoutVpn: Boolean? = null
 )

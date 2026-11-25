@@ -16,6 +16,13 @@ val libXrayAar = file("libs/libXray.aar")
 val libXrayPropertiesFile = file("libs/libXray.properties")
 val libXrayBuildScript = rootProject.file("scripts/build-libxray-aar.ps1")
 val libXrayControllerPatch = rootProject.file("scripts/patches/libxray-android-controller.patch")
+val libXrayObserverPatch = rootProject.file("scripts/patches/xray-observer-detached-snapshot.patch")
+val libXrayMeasurePatch = rootProject.file("scripts/patches/libxray-measure-status.patch")
+val libXrayXhttpPatch = rootProject.file("scripts/patches/xray-xhttp-upstream-races-5ca.patch")
+val libXrayXhttpClosePatch = rootProject.file("scripts/patches/xray-xhttp-close-error-5ca.patch")
+val libXrayWebSocketPatch = rootProject.file("scripts/patches/xray-websocket-integrity-5ca.patch")
+val libXrayVlessCancelPatch = rootProject.file("scripts/patches/xray-vless-cancel-5ca.patch")
+val libXrayXhttpLifecyclePatch = rootProject.file("scripts/patches/xray-xhttp-lifecycle-5ca.patch")
 val hevMetadataFile = file("libs/hev.properties")
 val hevJniLibsDirectory = file("src/main/jniLibs")
 val releaseRequested = gradle.startParameter.taskNames.any { it.contains("Release", ignoreCase = true) }
@@ -58,6 +65,41 @@ fun verifyLibXrayBundle(required: Boolean) {
     check(!expectedHash.isNullOrBlank()) { "libXray metadata is missing libxray.sha256" }
     check(sha256(libXrayAar) == expectedHash) {
         "app/libs/libXray.aar does not match the pinned SHA-256; rebuild it with scripts/build-libxray-aar.ps1"
+    }
+    check(metadata.getProperty("libxray.ref") == "80263da83e96b2972455b0a94b13ee1a10e51391") {
+        "libXray metadata has an unapproved libXray source revision"
+    }
+    check(metadata.getProperty("libxray.go") == "go1.26.10") {
+        "libXray metadata has an unapproved Go toolchain revision"
+    }
+    check(metadata.getProperty("libxray.xray.ref") == "5ca6f4b7d4dc20a881d4330e498892697627ec0c") {
+        "libXray metadata has an unapproved Xray source revision"
+    }
+    check(!metadata.getProperty("libxray.xray.ref").isNullOrBlank()) {
+        "libXray metadata is missing libxray.xray.ref"
+    }
+    val expectedObserverPatchHash = metadata.getProperty("libxray.xray.observer.patch.sha256")?.trim()?.uppercase()
+    check(!expectedObserverPatchHash.isNullOrBlank()) {
+        "libXray metadata is missing libxray.xray.observer.patch.sha256"
+    }
+    check(sha256(libXrayObserverPatch) == expectedObserverPatchHash) {
+        "The bundled libXray AAR was not built with the current Xray observer patch"
+    }
+    val expectedMeasurePatchHash = metadata.getProperty("libxray.measure.patch.sha256")?.trim()?.uppercase()
+    check(!expectedMeasurePatchHash.isNullOrBlank()) {
+        "libXray metadata is missing libxray.measure.patch.sha256"
+    }
+    check(sha256(libXrayMeasurePatch) == expectedMeasurePatchHash) {
+        "The bundled libXray AAR was not built with the current measurement-status patch"
+    }
+    mapOf("libxray.xray.xhttp.patch.sha256" to libXrayXhttpPatch,
+        "libxray.xray.xhttp.close.patch.sha256" to libXrayXhttpClosePatch,
+        "libxray.xray.websocket.patch.sha256" to libXrayWebSocketPatch,
+        "libxray.xray.vless.cancel.patch.sha256" to libXrayVlessCancelPatch,
+        "libxray.xray.xhttp.lifecycle.patch.sha256" to libXrayXhttpLifecyclePatch).forEach { (key, patch) ->
+        check(sha256(patch) == metadata.getProperty(key)?.trim()?.uppercase()) {
+            "The bundled libXray AAR does not attest the current $key; rebuild the native bundle"
+        }
     }
 }
 
@@ -120,6 +162,7 @@ dependencies {
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
@@ -129,6 +172,8 @@ dependencies {
     implementation(libs.androidx.navigation.compose)
     implementation(libs.androidx.security.crypto)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation(libs.zxing.embedded)
+    implementation(libs.zxing.core)
 
     // Networking
     implementation(libs.retrofit)
@@ -148,12 +193,23 @@ dependencies {
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.runner)
     androidTestImplementation(libs.androidx.core)
+    androidTestImplementation(platform(libs.androidx.compose.bom))
+    androidTestImplementation(libs.androidx.compose.ui.test.junit4)
+    debugImplementation(libs.androidx.compose.ui.test.manifest)
 }
 
 val enabledRobolectricSdks = providers.gradleProperty("robolectricSdks")
+val configFixtureDirectory = providers.systemProperty("g2ray.configFixtureDir").orNull?.let { file(it) }
 tasks.withType<Test>().configureEach {
     // Optional local SDK selection; CI exercises every declared SDK by default.
     enabledRobolectricSdks.orNull?.let { systemProperty("robolectric.enabledSdks", it) }
+    if (name == "testDebugUnitTest") {
+        configFixtureDirectory?.let { directory ->
+            // Cached JUnit results must also restore the pinned-core validator's fixtures.
+            systemProperty("g2ray.configFixtureDir", directory.absolutePath)
+            outputs.dir(directory).withPropertyName("vpnConfigFixtures")
+        }
+    }
 }
 
 val verifyLibXrayBuildContract = tasks.register<VerifyLibXrayBuildContractTask>("verifyLibXrayBuildContract") {
@@ -161,6 +217,13 @@ val verifyLibXrayBuildContract = tasks.register<VerifyLibXrayBuildContractTask>(
     description = "Verifies that the production libXray builder uses a pinned, attested toolchain."
     buildScript.set(libXrayBuildScript)
     controllerPatch.set(libXrayControllerPatch)
+    observerPatch.set(libXrayObserverPatch)
+    measurePatch.set(libXrayMeasurePatch)
+    xhttpPatch.set(libXrayXhttpPatch)
+    xhttpClosePatch.set(libXrayXhttpClosePatch)
+    webSocketPatch.set(libXrayWebSocketPatch)
+    vlessCancelPatch.set(libXrayVlessCancelPatch)
+    xhttpLifecyclePatch.set(libXrayXhttpLifecyclePatch)
 }
 
 val verifyBundledCore = tasks.register<VerifyLibXrayBundleTask>("verifyBundledCore") {
@@ -169,6 +232,13 @@ val verifyBundledCore = tasks.register<VerifyLibXrayBundleTask>("verifyBundledCo
     aarFile.set(libXrayAar)
     metadataFile.set(libXrayPropertiesFile)
     controllerPatch.set(libXrayControllerPatch)
+    observerPatch.set(libXrayObserverPatch)
+    measurePatch.set(libXrayMeasurePatch)
+    xhttpPatch.set(libXrayXhttpPatch)
+    xhttpClosePatch.set(libXrayXhttpClosePatch)
+    webSocketPatch.set(libXrayWebSocketPatch)
+    vlessCancelPatch.set(libXrayVlessCancelPatch)
+    xhttpLifecyclePatch.set(libXrayXhttpLifecyclePatch)
     required.set(true)
 }
 

@@ -2,6 +2,41 @@
 
 set -euo pipefail
 
+# Capture the host before identity discovery fills in local fallback names.
+G2RAY_CODESPACES_HOST=0
+if [[ "${CODESPACES:-}" == "true" || -n "${CODESPACE_NAME:-}" ]]; then
+    G2RAY_CODESPACES_HOST=1
+fi
+readonly G2RAY_CODESPACES_HOST
+
+readonly G2RAY_SETUP_IDLE_MINUTES=89
+
+print_codespace_setup_checklist() {
+    printf '%s\n' \
+        '  Codespace Setup Checklist' \
+        '  [ ] Verify the intended GitHub account and repository.' \
+        "  [ ] Set Default idle timeout to ${G2RAY_SETUP_IDLE_MINUTES} minutes and Save:" \
+        '      https://github.com/settings/codespaces' \
+        "  [ ] Create a new Codespace; with gh, pass --idle-timeout ${G2RAY_SETUP_IDLE_MINUTES}m." \
+        '      The account default applies only to newly created workspaces.' \
+        '  [ ] Verify the effective timeout in Recovery / Waker Setup > Setup Checklist.' \
+        '  [ ] Generate a config once, or reuse the saved config on an existing workspace.' \
+        '  [ ] Check the route in Diagnostics; copy the private link for client testing.' \
+        '  [ ] If needed, configure authenticated on-demand wake and test it separately.' \
+        '  [ ] Stop the workspace after testing; idle running time still counts toward usage.'
+}
+
+if [[ "${G2RAY_SOURCE_ONLY:-}" != 1 && "${1:-}" == --setup-checklist ]]; then
+    print_codespace_setup_checklist
+    exit 0
+fi
+
+if [[ "${G2RAY_SOURCE_ONLY:-}" != 1 && "${1:-}" == --hosting-policy ]]; then
+    printf '{"codespaces_host":%s,"runtime_allowed":true,"provider_approval_verified":false,"synthetic_anti_sleep":false,"scheduled_quota_revival":false}\n' \
+        "$([[ "$G2RAY_CODESPACES_HOST" == 1 ]] && printf true || printf false)"
+    exit 0
+fi
+
 readonly G2RAY_ID="G2ray Panel v1.4.3"
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s/%s' "$BASE_DIR" "$(basename "${BASH_SOURCE[0]}")")"
@@ -62,6 +97,7 @@ BG_TASKS_LOCK_DIR="$DATA_DIR/bg_tasks.lock"
 RUNTIME_LOCK_DIR="$DATA_DIR/runtime.lock"
 BG_TASKS_TOKEN_FILE="$DATA_DIR/bg_tasks.token"
 BG_TASKS_HEARTBEAT_FILE="$DATA_DIR/bg_tasks.heartbeat"
+BG_WATCHDOG_PID_FILE="$DATA_DIR/bg_tasks.watchdog.pid"
 ROUTE_SETTLE_PID_FILE="$DATA_DIR/route_settle.pid"
 ROUTE_SETTLE_TOKEN_FILE="$DATA_DIR/route_settle.token"
 RESUME_GAP_FILE="$DATA_DIR/resume_gap.txt"
@@ -85,6 +121,7 @@ EXPORT_LOCK_FILE="$DATA_DIR/config-exports.lock"
 DNS_CANDIDATE_CACHE_FILE="$DATA_DIR/dns_candidate_cache.tsv"
 BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
 XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
+XHTTP_MODE_CACHE_FILE="$DATA_DIR/xhttp_mode_cache"
 XHTTP_MODE_FILE="$DATA_DIR/xhttp_mode.txt"
 XHTTP_LINK_TUNING_FILE="$DATA_DIR/xhttp_link_tuning.txt"
 ANTI_SLEEP_DISABLED_FILE="$DATA_DIR/anti_sleep_mode_disabled"
@@ -519,10 +556,15 @@ xhttp_link_tuning_enabled() {
     if [[ -z "$value" && -f "$XHTTP_LINK_TUNING_FILE" ]]; then
         value=$(awk 'NF{gsub(/[[:space:]]/,"");print;exit}' "$XHTTP_LINK_TUNING_FILE" 2>/dev/null || true)
     fi
-    value=$(printf '%s' "${value:-on}" | tr '[:upper:]' '[:lower:]')
+    # Keep the measured upload tuning available as an explicit A/B option, but
+    # do not impose xmux/extra on new links by default.  xmux can improve large
+    # uploads on some paths while increasing head-of-line blocking and tail
+    # latency for browsing, feeds, and long-lived AI streams on others.
+    value=$(printf '%s' "${value:-off}" | tr '[:upper:]' '[:lower:]')
     case "$value" in
         0|false|no|off|disabled) return 1 ;;
-        *) return 0 ;;
+        1|true|yes|on|enabled) return 0 ;;
+        *) return 1 ;;
     esac
 }
 
@@ -547,7 +589,7 @@ xhttp_link_tuning_summary() {
     elif xhttp_link_tuning_enabled; then
         printf 'on (60 KB upload POSTs + HTTP/2 health check)'
     else
-        printf 'off (Xray client defaults; ~4x slower uploads through GitHub edge)'
+        printf 'off (unmodified Xray client defaults; lower contention; enable for upload A/B)'
     fi
 }
 
@@ -577,7 +619,7 @@ show_xhttp_mode_manager() {
         echo -e "  ${RED}2)${NC} stream-up  ${YELLOW}Failed every request through the Codespaces edge in tests${NC}"
         echo -e "  ${RED}3)${NC} stream-one ${YELLOW}Failed every request through the Codespaces edge in tests${NC}"
         echo -e "  ${RED}4)${NC} auto       ${DIM}Xray resolves this to packet-up for these TLS links${NC}"
-        echo -e "  ${RED}5)${NC} Toggle upload tuning ${DIM}(turn off only for a client that rejects the extra parameter)${NC}"
+        echo -e "  ${RED}5)${NC} Toggle upload tuning ${DIM}(optional upload A/B; off is the browsing default)${NC}"
         echo -e "  ${RED}0)${NC} Return\n"
         echo -ne "  ${GREEN}Select:${NC} "
         read -r choice
@@ -690,8 +732,20 @@ tcp_fast_open_outbound_enabled() {
     (( (value & 1) == 1 ))
 }
 
+deadline_time_us() {
+    local stamp="${EPOCHREALTIME:-}"
+    if [[ "$stamp" =~ ^([0-9]+)\.([0-9]{6})$ ]]; then
+        printf -v "$1" '%s%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    else
+        stamp=$(date +%s%6N 2>/dev/null) || return 1
+        [[ "$stamp" =~ ^[0-9]{10,18}$ ]] || return 1
+        printf -v "$1" '%s' "$stamp"
+    fi
+}
+
 run_with_deadline() {
     local seconds="${1:-30}" pid waited_ticks=0 max_ticks status=0 status_file command_name monitor_was_enabled=false
+    local start_us now_us completed_us budget_us startup_marker startup_ticks=0 owner_pid="${BASHPID:-$$}"
     shift || return 1
     [[ "$seconds" =~ ^[0-9]+$ && "$seconds" -gt 0 ]] || seconds=30
     max_ticks=$((seconds * 10))
@@ -700,7 +754,12 @@ run_with_deadline() {
         log_event ERROR "deadline_init_failed command=${command_name}"
         return 125
     }
-    rm -f "$status_file" 2>/dev/null || true
+    if ! deadline_time_us start_us; then
+        rm -f "$status_file" 2>/dev/null || true
+        log_event ERROR "deadline_clock_init_failed command=${command_name}"
+        return 125
+    fi
+    budget_us=$((seconds * 1000000))
     [[ "$-" == *m* ]] && monitor_was_enabled=true
     # Job control gives this wrapper a dedicated process group. Descendants
     # keep that identity after their parent exits during TERM handling.
@@ -708,9 +767,24 @@ run_with_deadline() {
     (
         set +m
         set +e
-        "$@"
+        # The startup barrier must also end if its parent dies or stalls.
+        while :; do
+            if ! builtin kill -0 "$owner_pid" 2>/dev/null ||
+                ! deadline_time_us now_us ||
+                (( now_us < start_us || now_us - start_us >= budget_us || startup_ticks >= max_ticks * 10 )); then
+                exit 125
+            fi
+            if IFS= read -r startup_marker 2>/dev/null < "$status_file" && [[ "$startup_marker" == ready ]]; then
+                break
+            fi
+            sleep 0.01
+            startup_ticks=$((startup_ticks + 1))
+        done
+        # Command-local EXIT traps must finish before recording completion.
+        ( "$@" )
         status=$?
-        printf '%s\n' "$status" > "$status_file" 2>/dev/null || true
+        deadline_time_us completed_us || completed_us=0
+        printf '%s\n' "$status" "$completed_us" > "$status_file" 2>/dev/null || true
         exit "$status"
     ) &
     pid=$!
@@ -724,29 +798,58 @@ run_with_deadline() {
         log_event ERROR "deadline_group_init_failed command=${command_name}"
         return 125
     fi
+    if ! builtin printf 'ready\n' > "$status_file"; then
+        kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        rm -f "$status_file" 2>/dev/null || true
+        log_event ERROR "deadline_group_init_failed command=${command_name}"
+        return 125
+    fi
     # Reporting the command's status does not finish the wrapper: EXIT traps
     # and cleanup may still be running. Keep its entire lifetime bounded.
-    while [[ ! -s "$status_file" ]] || kill -0 "$pid" 2>/dev/null; do
-        if (( waited_ticks >= max_ticks )); then
+    while kill -0 "$pid" 2>/dev/null; do
+        if ! deadline_time_us now_us || (( now_us < start_us )); then
+            status=125
+        elif (( now_us - start_us >= budget_us || waited_ticks >= max_ticks )); then
+            status=124
+        else
+            status=0
+        fi
+        if (( status != 0 )); then
+            # The parent can be descheduled after observing a live child.
+            # If it finished meanwhile, validate the actual completion below.
+            if ! kill -0 "$pid" 2>/dev/null; then break; fi
             kill -TERM -- "-$pid" 2>/dev/null || true
             sleep 0.2
             kill -KILL -- "-$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
             rm -f "$status_file" 2>/dev/null || true
-            log_event WARN "deadline_exceeded command=${command_name} timeout_sec=${seconds}"
-            return 124
-        fi
-        if ! kill -0 "$pid" 2>/dev/null; then
-            wait "$pid" 2>/dev/null || status=$?
-            rm -f "$status_file" 2>/dev/null || true
+            if (( status == 124 )); then
+                log_event WARN "deadline_exceeded command=${command_name} timeout_sec=${seconds}"
+            else
+                log_event ERROR "deadline_clock_failed command=${command_name}"
+            fi
             return "$status"
         fi
         sleep 0.1
         waited_ticks=$((waited_ticks + 1))
     done
-    status=$(cat "$status_file" 2>/dev/null || printf '1')
+    if ! { read -r status && read -r completed_us; } 2>/dev/null < "$status_file"; then
+        # A missing/partial result is not a command failure. The observation
+        # time is a conservative completion bound; wait owns the exit status.
+        deadline_time_us completed_us || completed_us=0
+    fi
+    status=0
     wait "$pid" 2>/dev/null || status=$?
     rm -f "$status_file" 2>/dev/null || true
+    if [[ ! "$completed_us" =~ ^[0-9]+$ ]] || (( completed_us < start_us )); then
+        log_event ERROR "deadline_clock_failed command=${command_name}"
+        return 125
+    fi
+    if (( completed_us - start_us >= budget_us )); then
+        log_event WARN "deadline_exceeded command=${command_name} timeout_sec=${seconds}"
+        return 124
+    fi
     [[ "$status" =~ ^[0-9]+$ ]] || status=1
     return "$status"
 }
@@ -1136,6 +1239,10 @@ detect_codespace_name_from_port_stamp() {
 }
 
 _detect_codespace_name() {
+    if [[ -n "${G2RAY_BENCH_PREINIT_TMP:-}" && "$G2RAY_BENCH_WANTS_LIVE" == 0 ]]; then
+        printf 'bench-space'
+        return
+    fi
     valid_codespace_name "${CODESPACE_NAME:-}" && { printf '%s' "$CODESPACE_NAME"; return; }
     local n
     n=$(detect_codespace_name_from_json_file "$CODESPACE_ENV_JSON_FILE" 2>/dev/null || true)
@@ -1448,12 +1555,23 @@ xhttp_config_path() {
 }
 
 xhttp_active_inbound_mode() {
-    local mode=""
-    if [[ -f "$CONFIG_FILE" ]] && command -v jq >/dev/null 2>&1; then
-        mode=$(jq -r '.inbounds[]? | select(.tag=="vless-in") | .streamSettings.xhttpSettings.mode // empty' "$CONFIG_FILE" 2>/dev/null \
-            | awk 'NF {print; exit}')
+    local mode="" cache_key cached_key cached_mode
+    [[ -f "$CONFIG_FILE" ]] && command -v jq >/dev/null 2>&1 || return 0
+    cache_key=$(file_fingerprint "$CONFIG_FILE" 2>/dev/null || true)
+    if [[ -n "$cache_key" && -s "$XHTTP_MODE_CACHE_FILE" ]]; then
+        IFS=$'\t' read -r cached_key cached_mode < "$XHTTP_MODE_CACHE_FILE" || true
+        if [[ "$cached_key" == "$cache_key" ]] && valid_xhttp_mode "${cached_mode:-}"; then
+            printf '%s' "$cached_mode"
+            return 0
+        fi
     fi
+    mode=$(jq -r '.inbounds[]? | select(.tag=="vless-in") | .streamSettings.xhttpSettings.mode // empty' "$CONFIG_FILE" 2>/dev/null \
+        | awk 'NF {print; exit}') || return 0
     if valid_xhttp_mode "$mode"; then
+        # A concurrent config swap must not associate its mode with the old hash.
+        if [[ -n "$cache_key" && "$(file_fingerprint "$CONFIG_FILE" 2>/dev/null || true)" == "$cache_key" ]]; then
+            _atomic_write "$XHTTP_MODE_CACHE_FILE" "${cache_key}"$'\t'"${mode}" || true
+        fi
         printf '%s' "$mode"
     fi
 }
@@ -2122,6 +2240,8 @@ test_cloudflare_waker() {
 show_waker_recovery_guide() {
     refresh_screen
     echo -e "\n  ${RED}Recovery Guide${NC}\n"
+    echo -e "  ${YELLOW}For your on-demand network hobby experiments; respect provider limits.${NC}"
+    echo -e "  Account restrictions require GitHub Support; recovery cannot bypass them.\n"
     echo -e "  If configs suddenly stop working because GitHub stopped the Codespace:"
     echo -e "  1. Open your Worker wake URL in a browser."
     echo -e "  2. Paste your wake secret."
@@ -2147,6 +2267,7 @@ setup_cloudflare_waker() {
 
     refresh_screen
     echo -e "\n  ${RED}Cloudflare Worker Waker Setup${NC}\n"
+    echo -e "  ${YELLOW}Development workspace starts only; never use this to host a daily VPN or rotate free accounts.${NC}"
     echo -e "  ${WHITE}Detected Codespace:${NC} ${GREEN}${CODESPACE_NAME}${NC}"
     echo -e "  ${WHITE}Codespaces app domain:${NC} ${GREEN}${PORT_DOMAIN}${NC}\n"
     echo -e "  ${WHITE}${B}1. Create a GitHub token${NC}"
@@ -2177,6 +2298,8 @@ setup_cloudflare_waker() {
     echo -e "  ${WHITE}CODESPACE_NAME${NC}  Plaintext  ${GREEN}${CODESPACE_NAME}${NC}"
     echo -e "  ${WHITE}GITHUB_TOKEN${NC}    Secret     ${DIM}<your GitHub token>${NC}"
     echo -e "  ${WHITE}WAKE_SECRET${NC}     Secret     ${DIM}<the shared key above>${NC}\n"
+    echo -e "  No additional purpose flag is required for an authenticated on-demand wake."
+    echo -e "  Scheduled quota revival is retired. Remove old Cloudflare Cron Triggers.\n"
     echo -e "  For another Codespace in this same Worker, add only:"
     echo -e "  ${WHITE}CODESPACE_2_NAME${NC}  Plaintext  ${DIM}<second Codespace name>${NC}"
     echo -e "  ${WHITE}GITHUB_TOKEN_2${NC}    Secret     ${DIM}<its account token>${NC}"
@@ -2219,6 +2342,20 @@ reset_waker_metadata() {
     sleep 1
 }
 
+print_codespace_idle_timeout_check() {
+    local minutes
+    if [[ "$G2RAY_CODESPACES_HOST" != 1 ]] || ! valid_codespace_name "$CODESPACE_NAME" ||
+        ! minutes=$(run_gh codespace view -c "$CODESPACE_NAME" --json idleTimeoutMinutes --jq '.idleTimeoutMinutes // empty' 2>/dev/null) ||
+        [[ ! "$minutes" =~ ^[1-9][0-9]{0,2}$ ]]; then
+        printf '\n  Effective idle timeout: unverified. Check this Codespace in GitHub.\n'
+    elif [[ "$minutes" == "$G2RAY_SETUP_IDLE_MINUTES" ]]; then
+        printf '\n  Effective idle timeout: %s minutes (matches checklist).\n' "$minutes"
+    else
+        printf '\n  Effective idle timeout: %s minutes (expected %s).\n' "$minutes" "$G2RAY_SETUP_IDLE_MINUTES"
+        printf '  Check the creation settings or owner policy. Saving a new default will not change this workspace.\n'
+    fi
+}
+
 show_recovery_waker() {
     local choice
     while true; do
@@ -2231,6 +2368,7 @@ show_recovery_waker() {
         echo -e "  ${RED}2)${NC} Show Recovery Instructions"
         echo -e "  ${RED}3)${NC} Test Worker URL"
         echo -e "  ${RED}4)${NC} Reset Saved Waker Metadata"
+        echo -e "  ${RED}5)${NC} Setup Checklist"
         echo -e "  ${RED}0)${NC} Return"
         echo -ne "  ${RED}Select:${NC} "
         read -r choice || return 0
@@ -2242,6 +2380,13 @@ show_recovery_waker() {
                 echo ""; echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
                 ;;
             4) reset_waker_metadata ;;
+            5)
+                refresh_screen
+                print_codespace_setup_checklist
+                print_codespace_idle_timeout_check
+                printf '\n  Press Enter to return...'
+                read -r || return 0
+                ;;
             0) return 0 ;;
             *) echo -e "  ${RED}Invalid option.${NC}"; sleep 1 ;;
         esac
@@ -2480,47 +2625,41 @@ check_for_updates() {
 }
 
 anti_sleep_enabled() {
-    [[ ! -f "$ANTI_SLEEP_DISABLED_FILE" ]]
+    return 1
 }
 
 anti_sleep_running() {
     command -v tmux >/dev/null 2>&1 || return 1
-    tmux has-session -t g2ray_keepalive 2>/dev/null
+    tmux has-session -t '=g2ray_keepalive' 2>/dev/null
 }
 
 enable_anti_sleep() {
-    mkdir -p "$DATA_DIR" 2>/dev/null || true
-    rm -f "$ANTI_SLEEP_DISABLED_FILE" 2>/dev/null || true
-    anti_sleep_running && return 0
-cat > "$DATA_DIR/keepalive.sh" << 'EOF'
-#!/bin/bash
-while true; do
-    curl -s -m 4 https://github.com >/dev/null 2>&1 || true
-    sleep 60
-done
-EOF
-    chmod +x "$DATA_DIR/keepalive.sh"
-    local keepalive_cmd; keepalive_cmd=$(printf 'bash %q' "$DATA_DIR/keepalive.sh")
-    if ! command -v tmux >/dev/null 2>&1 || ! tmux new-session -d -s g2ray_keepalive "$keepalive_cmd" 2>/dev/null; then
-        log_event WARN "anti_sleep runtime_start_failed tmux_unavailable_or_rejected"
-        return 1
-    fi
+    printf 'Synthetic anti-sleep traffic has been retired. Provider idle and quota limits must be respected.\n' >&2
+    return 1
 }
 
 disable_anti_sleep() {
+    local failed=0
     mkdir -p "$DATA_DIR" 2>/dev/null || true
-    _atomic_write "$ANTI_SLEEP_DISABLED_FILE" "1" 2>/dev/null || : > "$ANTI_SLEEP_DISABLED_FILE"
-    if anti_sleep_running; then
-        tmux kill-session -t g2ray_keepalive 2>/dev/null || true
+    if ! _atomic_write "$ANTI_SLEEP_DISABLED_FILE" "1" 2>/dev/null; then
+        if ! { : > "$ANTI_SLEEP_DISABLED_FILE"; } 2>/dev/null; then
+            log_event WARN "anti_sleep cleanup_marker_write_failed" || true
+            failed=1
+        fi
     fi
+    if anti_sleep_running && ! tmux kill-session -t '=g2ray_keepalive' 2>/dev/null; then
+        log_event WARN "anti_sleep legacy_session_stop_failed" || true
+        failed=1
+    fi
+    return "$failed"
 }
 
 sync_anti_sleep_runtime() {
-    if anti_sleep_enabled; then
-        enable_anti_sleep || true
-    elif anti_sleep_running; then
-        tmux kill-session -t g2ray_keepalive 2>/dev/null || true
+    # Legacy cleanup is optional and must not prevent the tunnel from starting.
+    if ! disable_anti_sleep; then
+        log_event WARN "anti_sleep legacy_cleanup_incomplete action=continue" || true
     fi
+    return 0
 }
 
 is_port_open() {
@@ -3191,6 +3330,13 @@ upgrade_config_dns() {
       | (.inbounds[]? | select(.tag == "vless-ws" and .streamSettings.wsSettings?) | .streamSettings.wsSettings.heartbeatPeriod) = $ws_heartbeat
       | (.outbounds[]? | select(.protocol == "blackhole") | .settings.response.type) = "none"
       | (.outbounds[]? | select(.tag == "direct" and .protocol == "freedom") | .streamSettings.sockopt.tcpFastOpen) = $origin_tfo
+      # Migrate the old generated default; leave custom DNS strategies alone.
+      | (.outbounds[]? | select(.tag == "direct" and .protocol == "freedom"
+          and .settings.domainStrategy == "UseIPv4"
+          and (.settings.targetStrategy // "") == ""
+          and (.targetStrategy // "") == ""
+          and (.streamSettings.sockopt.domainStrategy // "") == "")) |=
+          (.streamSettings.sockopt.domainStrategy = .settings.domainStrategy | del(.settings.domainStrategy))
       | (.policy.levels["0"].handshake) |=
           (if . == null or . < 4 then 4 else . end)
     ' "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
@@ -3661,27 +3807,39 @@ release_bg_tasks_lock() {
 }
 
 start_background_tasks() {
-    local token bg_pid version
+    local expected_token="${1:-}" token bg_pid version watchdog_status=0
     if ! acquire_bg_tasks_lock; then
         bg_pid=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
-        if bg_tasks_running "$bg_pid" || background_supervisor_heartbeat_running "$bg_pid"; then
+        if { bg_tasks_running "$bg_pid" || background_supervisor_heartbeat_running "$bg_pid"; } && background_watchdog_running; then
             return 0
         fi
         log_event WARN "background supervisor_start_failed reason=lock_busy no_live_supervisor"
         return 1
     fi
+    # A queued watchdog restart must not undo an explicit stop or a newer start.
+    if [[ -n "$expected_token" && "$(cat "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true)" != "$expected_token" ]]; then
+        release_bg_tasks_lock
+        return 0
+    fi
     if [[ -f "$BG_TASKS_PID" ]]; then
         local p; p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
         if bg_tasks_running "$p" || background_supervisor_heartbeat_running "$p"; then
             if background_supervisor_version_matches; then
+                start_background_watchdog || watchdog_status=$?
                 release_bg_tasks_lock
-                return 0
+                return "$watchdog_status"
             fi
             log_event WARN "background supervisor_stale pid=${p}"
-            stop_background_tasks
+            if ! stop_background_tasks --lock-held; then
+                release_bg_tasks_lock
+                return 1
+            fi
         elif legacy_bg_tasks_running "$p"; then
             log_event WARN "background legacy_supervisor_stale pid=${p}"
-            stop_background_tasks
+            if ! stop_background_tasks --lock-held; then
+                release_bg_tasks_lock
+                return 1
+            fi
         fi
     fi
     token=$(uuidgen 2>/dev/null || printf '%s-%s-%s' "$$" "$RANDOM" "$(date +%s)")
@@ -3697,7 +3855,7 @@ start_background_tasks() {
         release_bg_tasks_lock
         return 1
     fi
-    G2RAY_BG_TASK_TOKEN="$token" nohup bash "$SCRIPT_PATH" --background-supervisor </dev/null >/dev/null 2>&1 &
+    G2RAY_SOURCE_ONLY=0 G2RAY_BG_TASK_TOKEN="$token" nohup bash "$SCRIPT_PATH" --background-supervisor </dev/null >/dev/null 2>&1 &
     bg_pid=$!
     if ! _atomic_write "$BG_TASKS_PID" "$bg_pid"; then
         kill "$bg_pid" >/dev/null 2>&1 || true
@@ -3708,8 +3866,71 @@ start_background_tasks() {
         return 1
     fi
     log_event INFO "background supervisor_started pid=${bg_pid}"
+    start_background_watchdog || watchdog_status=$?
     release_bg_tasks_lock
     disown 2>/dev/null || true
+    return "$watchdog_status"
+}
+
+background_watchdog_running() {
+    local expected="${1:-}" p
+    [[ -n "$expected" ]] || expected=$(cat "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true)
+    p=$(cat "$BG_WATCHDOG_PID_FILE" 2>/dev/null || true)
+    [[ -n "$expected" && "$p" =~ ^[0-9]+$ && -r "/proc/$p/environ" ]] || return 1
+    kill -0 "$p" 2>/dev/null || return 1
+    tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -Fx "G2RAY_BG_WATCHDOG_TOKEN=$expected" >/dev/null
+}
+
+start_background_watchdog() {
+    local token p i
+    token=$(cat "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true)
+    [[ -n "$token" ]] || return 1
+    background_watchdog_running "$token" && return 0
+    # Linux /proc provides ownership proof; never signal a PID based only on a file.
+    if [[ ! -r "/proc/${BASHPID:-$$}/environ" ]]; then
+        log_event WARN "background watchdog_unavailable reason=process_ownership_unavailable"
+        return 1
+    fi
+    G2RAY_SOURCE_ONLY=0 G2RAY_BG_WATCHDOG_TOKEN="$token" nohup bash "$SCRIPT_PATH" --background-watchdog </dev/null >/dev/null 2>&1 &
+    p=$!
+    if ! _atomic_write "$BG_WATCHDOG_PID_FILE" "$p"; then
+        kill "$p" >/dev/null 2>&1 || true
+        wait "$p" 2>/dev/null || true
+        log_event ERROR "background watchdog_start_failed reason=pid_write"
+        return 1
+    fi
+    for ((i=0; i<40; i++)); do
+        if background_watchdog_running "$token"; then
+            log_event INFO "background watchdog_started pid=${p}"
+            return 0
+        fi
+        kill -0 "$p" 2>/dev/null || break
+        sleep 0.05
+    done
+    kill "$p" >/dev/null 2>&1 || true
+    wait "$p" 2>/dev/null || true
+    rm -f "$BG_WATCHDOG_PID_FILE" 2>/dev/null || true
+    log_event ERROR "background watchdog_start_failed reason=ownership_not_confirmed"
+    return 1
+}
+
+_background_watchdog() {
+    set +e
+    local token="${G2RAY_BG_WATCHDOG_TOKEN:-}" p
+    [[ -n "$token" ]] || return 1
+    while [[ "$(cat "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true)" == "$token" ]]; do
+        sleep 30
+        [[ "$(cat "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true)" == "$token" ]] || return 0
+        p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
+        # Slow bounded work can delay heartbeats. Only a dead/unowned process
+        # justifies replacement here; this watcher never restarts Xray itself.
+        if bg_tasks_running "$p" || background_supervisor_heartbeat_running "$p"; then
+            continue
+        fi
+        log_event WARN "background supervisor_missing pid=${p:-none} action=restart"
+        start_background_tasks "$token" \
+            || log_event ERROR "background supervisor_restart_failed"
+    done
 }
 
 background_supervisor_version() {
@@ -3746,14 +3967,27 @@ supervisor_reexec_if_stale() {
 }
 
 stop_background_tasks() {
-    local p
+    local p watchdog_pid="" lock_held=false status=0
+    [[ "${1:-}" == "--lock-held" ]] && lock_held=true
+    if [[ "$lock_held" != true ]] && ! acquire_bg_tasks_lock; then
+        return 1
+    fi
+    if background_watchdog_running; then
+        watchdog_pid=$(cat "$BG_WATCHDOG_PID_FILE" 2>/dev/null || true)
+        kill "$watchdog_pid" >/dev/null 2>&1 || true
+    fi
     p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
     if bg_tasks_running "$p" || background_supervisor_heartbeat_running "$p" || legacy_bg_tasks_running "$p"; then
         kill "$p" >/dev/null 2>&1 || true
         sleep 1
         (bg_tasks_running "$p" || background_supervisor_heartbeat_running "$p" || legacy_bg_tasks_running "$p") && kill -9 "$p" >/dev/null 2>&1 || true
     fi
-    rm -f "$BG_TASKS_PID" "$BG_TASKS_VERSION_FILE" "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true
+    if ! rm -f "$BG_TASKS_PID" "$BG_TASKS_VERSION_FILE" "$BG_TASKS_TOKEN_FILE" "$BG_WATCHDOG_PID_FILE" 2>/dev/null; then
+        log_event ERROR "background supervisor_stop_failed reason=state_cleanup"
+        status=1
+    fi
+    [[ "$lock_held" == true ]] || release_bg_tasks_lock
+    return "$status"
 }
 
 legacy_bg_tasks_running() {
@@ -3772,7 +4006,7 @@ bg_tasks_running() {
     kill -0 "$p" 2>/dev/null || return 1
     expected=$(cat "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true)
     if [[ -n "$expected" && -r "/proc/$p/environ" ]]; then
-        tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -Fxq "G2RAY_BG_TASK_TOKEN=$expected"
+        tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -Fx "G2RAY_BG_TASK_TOKEN=$expected" >/dev/null
         return
     fi
     return 1
@@ -3818,6 +4052,10 @@ background_supervisor_heartbeat_matches() {
     kill -0 "$p" 2>/dev/null || return 1
     expected=$(cat "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true)
     [[ -n "$expected" ]] || return 1
+    # A fresh file cannot overrule visible evidence that this PID was reused.
+    if [[ -r "/proc/$p/environ" ]] && ! bg_tasks_running "$p"; then
+        return 1
+    fi
     raw=$(cat "$BG_TASKS_HEARTBEAT_FILE" 2>/dev/null || true)
     read -r hb_pid hb_token hb_ts _ <<< "$raw"
     [[ "$hb_pid" == "$p" && "$hb_token" == "$expected" && "$hb_ts" =~ ^[0-9]+$ ]] || return 1
@@ -3831,7 +4069,7 @@ background_supervisor_heartbeat_running() {
 }
 
 background_supervisor_status() {
-    local p running="false" token_state="missing" version_state="missing" heartbeat_age="unknown" hb now expected current
+    local p running="false" token_state="missing" version_state="missing" heartbeat_age="unknown" watchdog="missing" hb now expected current
     p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
     if bg_tasks_running "$p"; then
         running="true"
@@ -3851,7 +4089,8 @@ background_supervisor_status() {
         now=$(date +%s)
         heartbeat_age="$((now - hb))s"
     fi
-    printf 'pid=%s running=%s version=%s token=%s heartbeat_age=%s\n' "${p:-none}" "$running" "$version_state" "$token_state" "$heartbeat_age"
+    background_watchdog_running && watchdog="running"
+    printf 'pid=%s running=%s version=%s token=%s heartbeat_age=%s watchdog=%s\n' "${p:-none}" "$running" "$version_state" "$token_state" "$heartbeat_age" "$watchdog"
 }
 
 format_duration_compact() {
@@ -4095,7 +4334,7 @@ _generate_config_impl() {
     xhttp_accept_mode="auto"
     # Keep origin connections warm, with Fast Open only when explicitly enabled.
     local direct_sockopt tfo_state="off" sockopt_inner
-    sockopt_inner="\"tcpKeepAliveInterval\": ${TCP_KEEPALIVE_INTERVAL_SEC}, \"tcpKeepAliveIdle\": ${TCP_KEEPALIVE_IDLE_SEC}"
+    sockopt_inner="\"domainStrategy\": \"UseIPv4\", \"tcpKeepAliveInterval\": ${TCP_KEEPALIVE_INTERVAL_SEC}, \"tcpKeepAliveIdle\": ${TCP_KEEPALIVE_IDLE_SEC}"
     if tcp_fast_open_outbound_enabled; then
         sockopt_inner="\"tcpFastOpen\": true, ${sockopt_inner}"
         tfo_state="on"
@@ -4166,7 +4405,7 @@ JSONEOF
     { "listen": "127.0.0.1", "port": 10085, "protocol": "dokodemo-door", "settings": { "address": "127.0.0.1" }, "tag": "api" }
   ],
   "outbounds": [
-    { "tag": "direct", "protocol": "freedom",   "settings": { "domainStrategy": "UseIPv4" }${direct_sockopt} },
+    { "tag": "direct", "protocol": "freedom"${direct_sockopt} },
     { "tag": "block",  "protocol": "blackhole",  "settings": { "response": { "type": "none" } } }
   ],
   "routing": {
@@ -5622,6 +5861,47 @@ JSON
     _atomic_write "$CONFIG_META_FILE" "$payload"
 }
 
+quota_snapshot_json() {
+    local now cycle stored prev ss elapsed budget
+    now=$(date +%s) || return 1
+    cycle=$(current_quota_cycle) || return 1
+    stored=$(cat "$QUOTA_CYCLE_FILE" 2>/dev/null || true)
+    [[ "$stored" == "$cycle" ]] || { printf 'null'; return 0; }
+    prev=$(cat "$TOTAL_UPTIME_FILE" 2>/dev/null || true)
+    ss=$(cat "$SESSION_START_FILE" 2>/dev/null || true)
+    budget="${G2RAY_QUOTA_SECONDS:-216000}"
+    [[ "$prev" =~ ^[0-9]{1,10}$ && "$ss" =~ ^[0-9]{1,10}$ && "$budget" =~ ^[0-9]{1,7}$ ]] \
+        || { printf 'null'; return 0; }
+    prev=$((10#$prev)); ss=$((10#$ss)); budget=$((10#$budget))
+    (( budget > 0 && budget <= 2678400 )) || budget=216000
+    elapsed=$(( now - ss )); (( elapsed < 0 )) && elapsed=0
+    (( elapsed > 3600 )) && elapsed=3600
+    prev=$(( prev + elapsed )); (( prev > 2678400 )) && prev=2678400
+    # This snapshot runs on a live host; stopping Xray does not stop host billing.
+    printf '{"used_seconds":%s,"budget_seconds":%s,"sampled_at_ms":%s,"cycle":"%s","assumed_running":true}' \
+        "$prev" "$budget" "$((now * 1000))" "$cycle"
+}
+
+write_codespace_bundle_qr() {
+    local bundle="$1" encoded
+    command -v gzip >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 || return 1
+    mkdir -p "$QR_DIR" || return 1
+    encoded=$(printf '%s' "$bundle" | gzip -n -c | base64 | tr '+/' '-_' | tr -d '\r\n=') || return 1
+    # Leave room for error correction. Oversized bundles retain individual QRs.
+    if (( ${#encoded} > 2100 )); then
+        rm -f "$QR_DIR/all-configs.txt" "$QR_DIR/all-configs.png"
+        return 0
+    fi
+    _atomic_write "$QR_DIR/all-configs.txt" "g2ray://import/$encoded" || return 1
+    chmod 600 "$QR_DIR/all-configs.txt" 2>/dev/null || true
+    if command -v qrencode >/dev/null 2>&1; then
+        qrencode -l M -m 4 -s 8 -t PNG -o "$QR_DIR/all-configs.png" "g2ray://import/$encoded" 2>/dev/null || return 1
+        chmod 600 "$QR_DIR/all-configs.png" 2>/dev/null || true
+    else
+        rm -f "$QR_DIR/all-configs.png" || return 1
+    fi
+}
+
 write_codespace_import_bundle() {
     local links="${1:-}" legacy="${2:-false}" generated worker_codespace_id first=true link bundle
     local bundle_file="$CODESPACE_BUNDLE_FILE" schema=2
@@ -5643,6 +5923,9 @@ write_codespace_import_bundle() {
         printf '  "generated_at": "%s",\n' "$(json_escape "$generated")"
         printf '  "codespace_name": "%s",\n' "$(json_escape "$CODESPACE_NAME")"
         printf '  "worker_codespace_id": "%s",\n' "$(json_escape "$worker_codespace_id")"
+        if [[ "$legacy" != true ]]; then
+            printf '  "quota_estimate": %s,\n' "$(quota_snapshot_json || printf 'null')"
+        fi
         printf '  "configs": [\n'
         while IFS= read -r link; do
             [[ -n "$link" ]] || continue
@@ -5658,6 +5941,10 @@ write_codespace_import_bundle() {
     )
     _atomic_write "$bundle_file" "$bundle" || return 1
     chmod 600 "$bundle_file" 2>/dev/null || true
+    if [[ "$legacy" != true ]] && ! write_codespace_bundle_qr "$bundle"; then
+        rm -f "$QR_DIR/all-configs.txt" "$QR_DIR/all-configs.png" 2>/dev/null || true
+        log_event WARN "codespace_bundle all_config_qr_unavailable action=use_individual_qrs" || true
+    fi
     if [[ "$legacy" != true ]] && ! write_codespace_import_bundle "$links" true; then
         # The compatibility artifact must not roll back a valid current export
         # or leave an older UUID available for accidental import.
@@ -5797,12 +6084,23 @@ refresh_config_exports() {
 
 _refresh_config_exports_if_changed_impl() {
     active_vless_uuid >/dev/null 2>&1 || { clear_config_exports "missing_uuid"; return 1; }
-    local new_hash old_hash
+    local new_hash old_hash quota_snapshot quota_cycle
     new_hash=$(export_input_hash)
     old_hash=$(cat "$EXPORT_INPUT_HASH_FILE" 2>/dev/null || true)
     if [[ -n "$new_hash" && "$new_hash" == "$old_hash" ]] && config_export_artifacts_present; then
-        log_event INFO "config_exports unchanged hash=${new_hash}"
-        return 0
+        # Repair an unavailable or previous-month snapshot once the tracker has
+        # current data, without rebuilding the QR for every elapsed minute.
+        if quota_cycle=$(current_quota_cycle) &&
+            jq -e --arg cycle "$quota_cycle" \
+                '.quota_estimate == null or ((.quota_estimate | type) == "object" and .quota_estimate.cycle != $cycle)' \
+                "$CODESPACE_BUNDLE_FILE" >/dev/null 2>&1 &&
+            quota_snapshot=$(quota_snapshot_json) &&
+            jq -e 'type == "object"' >/dev/null 2>&1 <<< "$quota_snapshot"; then
+            log_event INFO "config_exports refresh reason=quota_snapshot_available"
+        else
+            log_event INFO "config_exports unchanged hash=${new_hash}"
+            return 0
+        fi
     fi
     _refresh_config_exports_impl || return 1
 }
@@ -6757,6 +7055,7 @@ bench_rebind_runtime_paths() {
     RUNTIME_LOCK_DIR="$DATA_DIR/runtime.lock"
     BG_TASKS_TOKEN_FILE="$DATA_DIR/bg_tasks.token"
     BG_TASKS_HEARTBEAT_FILE="$DATA_DIR/bg_tasks.heartbeat"
+    BG_WATCHDOG_PID_FILE="$DATA_DIR/bg_tasks.watchdog.pid"
     ROUTE_SETTLE_PID_FILE="$DATA_DIR/route_settle.pid"
     ROUTE_SETTLE_TOKEN_FILE="$DATA_DIR/route_settle.token"
     ROUTE_SETTLE_LOG_FILE="$LOG_DIR/route-settle.log"
@@ -6776,6 +7075,7 @@ bench_rebind_runtime_paths() {
     DNS_CANDIDATE_CACHE_FILE="$DATA_DIR/dns_candidate_cache.tsv"
     BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
     XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
+    XHTTP_MODE_CACHE_FILE="$DATA_DIR/xhttp_mode_cache"
     XHTTP_MODE_FILE="$DATA_DIR/xhttp_mode.txt"
     XHTTP_LINK_TUNING_FILE="$DATA_DIR/xhttp_link_tuning.txt"
     LOW_OVERHEAD_FILE="$DATA_DIR/low_overhead_mode"
@@ -6882,8 +7182,90 @@ bench_json() {
     bench_json_impl "$mock"
 }
 
+server_exit_observation() {
+    local provider="$1" url response ip country
+    case "$provider" in
+        ipinfo) url='https://ipinfo.io/json' ;;
+        country_is) url='https://api.country.is/' ;;
+        *) return 1 ;;
+    esac
+    # Match the generated server freedom outbound's UseIPv4 policy. Ignore
+    # shell proxies/curlrc so this measures this host, not an unrelated proxy.
+    if response=$(curl -q --ipv4 --noproxy '*' --fail --silent --show-error \
+        --proto '=https' --connect-timeout 3 --max-time 5 --max-filesize 16384 \
+        --header 'Cache-Control: no-cache' "$url" 2>/dev/null) && \
+        [[ ${#response} -le 16384 ]] && \
+        jq -e 'type == "object" and (.ip | type == "string") and
+            (.country | type == "string")' <<< "$response" >/dev/null 2>&1; then
+        ip=$(jq -r '.ip' <<< "$response")
+        country=$(jq -r '.country' <<< "$response")
+        if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && valid_ipv4 "$ip" &&
+            [[ "$country" =~ ^[A-Z]{2}$ && "$country" != XX && "$country" != ZZ ]]; then
+            jq -c --arg provider "$provider" '
+                def detail($key): if (.[$key] | type) == "string" then
+                    .[$key][0:120] | gsub("[\u0000-\u001f\u007f]"; " ") else null end;
+                {provider:$provider, available:true, ip:.ip, country:.country,
+                 city:detail("city"), org:detail("org")}' <<< "$response"
+            return
+        fi
+    fi
+    jq -cn --arg provider "$provider" \
+        '{provider:$provider, available:false, ip:null, country:null}'
+}
+
+server_exit_location_json() {
+    command -v jq >/dev/null 2>&1 || { printf 'jq is required for exit diagnostics.\n' >&2; return 1; }
+    local first second
+    first=$(server_exit_observation ipinfo) || return 1
+    second=$(server_exit_observation country_is) || return 1
+    jq -cn --arg checked_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --argjson first "$first" --argjson second "$second" '
+        [$first,$second] as $observations |
+        [$observations[] | select(.available)] as $valid |
+        [$valid[].country] | unique as $countries |
+        [$valid[].ip] | unique as $ips |
+        {checked_at_utc:$checked_at, scope:"server_ipv4_egress", expected_country:"US",
+         status:(if ($valid|length) == 0 then "unavailable"
+             elif ($valid|length) < 2 then "partial"
+             elif ($countries|length) > 1 then "country_disagreement"
+             elif $countries == ["US"] then "us_observed"
+             else "non_us_observed" end),
+         multiple_exit_ips:(($ips|length) > 1), observations:$observations}'
+}
+
+show_server_exit_location() {
+    local report
+    report=$(server_exit_location_json) || return 1
+    printf '  Server IPv4 exit (not the ingress/route IP)\n'
+    jq -r '.observations[] | "  \(.provider): " +
+        (if .available then "\(.ip) country=\(.country)" else "unavailable or invalid response" end)' <<< "$report"
+    jq -r '.observations[] | select(.available and .provider == "ipinfo") |
+        (if .city != null then "  IPinfo city estimate: " + .city else empty end),
+        (if .org != null then "  ISP/host: " + .org else empty end)' <<< "$report"
+    printf '  US country check: %s\n' "$(jq -r '.status' <<< "$report")"
+    if [[ "$(jq -r '.multiple_exit_ips' <<< "$report")" == true ]]; then
+        printf '  Different destinations observed different exit IPs; this is not by itself a phone-IP leak.\n'
+    fi
+    printf '  Country labels are database observations, not a guarantee for every website.\n'
+    printf '  Compare these with a browser IP check through your active VPN.\n'
+}
+
 if [[ "${G2RAY_SOURCE_ONLY:-}" == "1" ]]; then
     return 0 2>/dev/null || exit 0
+fi
+
+if [[ "${1:-}" == "--background-watchdog" ]]; then
+    _background_watchdog
+    exit $?
+fi
+
+if [[ "${1:-}" == "--exit-location" ]]; then
+    case "${2:-}" in
+        --json) server_exit_location_json ;;
+        '') show_server_exit_location ;;
+        *) printf 'Usage: bash ./g2ray.sh --exit-location [--json]\n' >&2; exit 2 ;;
+    esac
+    exit $?
 fi
 
 reset_logs_on_code_change
@@ -7071,6 +7453,8 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     refresh_screen
     echo -e "  ${GREEN}● Welcome to G2ray${NC}"
     echo -e "  ${WHITE}No configuration found. First run setup.${NC}\n"
+    print_codespace_setup_checklist
+    echo ""
     echo -e "  ${RED}1)${NC} Generate Config & Start"
     echo -e "  ${DIM}2)${NC} Exit\n"
     echo -ne "  ${RED}╰─❯${NC} "
@@ -7146,7 +7530,7 @@ while true; do
     echo -e "   ${RED}3)${NC} Start Engine                ${RED}6)${NC} Recover Now"
     echo ""
     echo -e "  ${WHITE}${B}● SYSTEM CONFIGURATION${NC}"
-    echo -e "   ${RED}7)${NC} Toggle Anti-Sleep Mode ($(echo -e "$_KA_LABEL"))"
+    echo -e "   ${DIM}7)${NC} Anti-Sleep (retired)"
     echo -e "   ${DIM}Generated configs stay local; do not publish live links.${NC}"
     echo -e "  ${RED}18)${NC} Toggle Low-Overhead Mode ($(echo -e "$_LOW_LABEL"))"
     echo -e "  ${RED}19)${NC} Toggle WebSocket Fallback ($(echo -e "$_WS_LABEL"))"
@@ -7226,6 +7610,13 @@ while true; do
             echo -e "  ${WHITE}${MOBILE_CONFIG_FILE}${NC}\n"
             _INDEX=1
             _QR_MODE="${G2RAY_QR_MODE:-recommended}"
+            if [[ "$_QR_MODE" != none && -s "$QR_DIR/all-configs.txt" ]]; then
+                printf '  All configs + local usage estimate (scan with G2Ray Android):\n'
+                [[ ! -s "$QR_DIR/all-configs.png" ]] || printf '  PNG: %s/all-configs.png\n' "$QR_DIR"
+                if command -v qrencode >/dev/null 2>&1; then
+                    qrencode -l M -m 2 -t UTF8 "$(cat "$QR_DIR/all-configs.txt")" || true
+                fi
+            fi
             for _LINK in "${_CONFIG_LINKS[@]}"; do
                 _SHOW_QR=false
                 [[ "$_QR_MODE" == "all" || ( "$_QR_MODE" != "none" && $_INDEX -eq 1 ) ]] && _SHOW_QR=true
@@ -7281,15 +7672,10 @@ while true; do
             ;;
         6) recover_now ;;
         7)
-            if anti_sleep_enabled; then
-                disable_anti_sleep
-                echo -e "\n  ${RED}■ Anti-Sleep disabled.${NC}"
+            if disable_anti_sleep; then
+                printf '\n  Anti-sleep is retired. No synthetic traffic will be generated.\n'
             else
-                if enable_anti_sleep; then
-                    echo -e "\n  ${GREEN}▶ Anti-Sleep enabled.${NC}"
-                else
-                    echo -e "\n  ${YELLOW}⚠ Anti-Sleep preference was enabled, but Tmux could not start.${NC}"
-                fi
+                printf '\n  Anti-sleep is retired, but legacy cleanup is incomplete. Check Diagnostics.\n'
             fi
             sleep 2
             ;;
@@ -7321,20 +7707,7 @@ while true; do
         12)
             refresh_screen
             echo -e "\n  ${DIM}Fetching server details...${NC}\n"
-            if command -v jq >/dev/null 2>&1; then
-                _RES=$(curl -sf -m 5 https://ipinfo.io/json 2>/dev/null || echo "{}")
-                _IP=$(printf '%s' "$_RES" | jq -r '.ip // empty' 2>/dev/null || true)
-                if [[ -z "$_IP" ]]; then
-                    echo -e "  ${RED}✖ Could not fetch location.${NC}"
-                else
-                    echo -e "  ${GREEN}● Server Location${NC}"
-                    echo -e "  IP       : ${GREEN}$(printf '%s' "$_RES" | jq -r '.ip')${NC}"
-                    echo -e "  Location : ${WHITE}$(printf '%s' "$_RES" | jq -r '.city'), $(printf '%s' "$_RES" | jq -r '.country')${NC}"
-                    echo -e "  ISP/Host : ${WHITE}$(printf '%s' "$_RES" | jq -r '.org')${NC}"
-                fi
-            else
-                echo -e "  ${RED}✖ jq not installed.${NC}"
-            fi
+            show_server_exit_location || true
             echo ""; echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
             ;;
         13)

@@ -1,5 +1,5 @@
 {
-  "name": "G2ray-Codespace",
+  "name": "G2ray Hobby Lab",
   "build": {
     "dockerfile": "Dockerfile",
     "context": "."

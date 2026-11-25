@@ -1,0 +1,56 @@
+diff --git a/nodep/measure.go b/nodep/measure.go
+index 112fde7..8208f0c 100644
+--- a/nodep/measure.go
++++ b/nodep/measure.go
+@@ -1,9 +1,11 @@
+ package nodep
+ 
+ import (
++	"fmt"
+ 	"math"
+ 	"net/http"
+ 	"net/url"
++	"strings"
+ 	"time"
+ )
+ 
+@@ -44,6 +46,9 @@ func CoreHTTPClient(timeout time.Duration, proxy string) (*http.Client, error) {
+ 	c := &http.Client{
+ 		Transport: tr,
+ 		Timeout:   timeout,
++		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
++			return http.ErrUseLastResponse
++		},
+ 	}
+ 
+ 	return c, nil
+@@ -55,7 +60,11 @@ func PingHTTPRequest(c *http.Client, url string, timeout int) (int64, error) {
+ 	if err != nil {
+ 		return PingDelayError, err
+ 	}
+-	response, err := c.Do(req)
++	probeClient := *c
++	probeClient.CheckRedirect = func(*http.Request, []*http.Request) error {
++		return http.ErrUseLastResponse
++	}
++	response, err := probeClient.Do(req)
+ 	delay := time.Since(start).Milliseconds()
+ 	if err != nil {
+ 		precision := delay - int64(timeout)*1000
+@@ -64,6 +73,16 @@ func PingHTTPRequest(c *http.Client, url string, timeout int) (int64, error) {
+ 		}
+ 		return PingDelayError, err
+ 	}
++	statusOK := response.StatusCode >= http.StatusOK && response.StatusCode < http.StatusMultipleChoices
++	if strings.HasSuffix(req.URL.Path, "/generate_204") {
++		statusOK = response.StatusCode == http.StatusNoContent
++	}
++	if !statusOK {
++		if response.Body != nil {
++			response.Body.Close()
++		}
++		return PingDelayError, fmt.Errorf("unexpected HTTP status: %s", response.Status)
++	}
+ 	response.Body.Close()
+ 	return delay, nil
+ }

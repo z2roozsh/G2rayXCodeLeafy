@@ -1,14 +1,32 @@
 param(
     [string]$OutputDir = "$PSScriptRoot\..\app\libs",
-    [string]$WorkDir = "$PSScriptRoot\..\build\libxray-src",
+    [string]$WorkDir = "$PSScriptRoot\..\build\native-bundle\libxray-src",
     [string]$NdkVersion = "28.2.13676358",
     [string]$LibXrayRef = "80263da83e96b2972455b0a94b13ee1a10e51391",
-    [string]$GoVersion = "go1.26.5",
-    [string]$GomobileVersion = "v0.0.0-20260611195102-4dd8f1dbf5d2"
+    [string]$GoVersion = "go1.26.10",
+    [string]$GomobileVersion = "v0.0.0-20260611195102-4dd8f1dbf5d2",
+    [string]$XrayCoreRef = "5ca6f4b7d4dc20a881d4330e498892697627ec0c"
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "native-build-workspace.ps1")
 $AndroidControllerPatch = Join-Path $PSScriptRoot "patches\libxray-android-controller.patch"
+$XrayObserverPatch = Join-Path $PSScriptRoot "patches\xray-observer-detached-snapshot.patch"
+$XrayXhttpPatch = Join-Path $PSScriptRoot "patches\xray-xhttp-upstream-races-5ca.patch"
+$XrayXhttpClosePatch = Join-Path $PSScriptRoot "patches\xray-xhttp-close-error-5ca.patch"
+$XrayXhttpTests = Join-Path $PSScriptRoot "fixtures\g2ray_xhttp_regression_test.go"
+$XrayXhttpLifecyclePatch = Join-Path $PSScriptRoot "patches\xray-xhttp-lifecycle-5ca.patch"
+$XrayXhttpDialTests = Join-Path $PSScriptRoot "fixtures\g2ray_xhttp_dial_regression_test.go"
+$XrayXhttpRequestTests = Join-Path $PSScriptRoot "fixtures\g2ray_xhttp_request_lifecycle_test.go"
+$XrayVlessXhttpTests = Join-Path $PSScriptRoot "fixtures\g2ray_vless_xhttp_cancel_test.go"
+$XrayWebSocketPatch = Join-Path $PSScriptRoot "patches\xray-websocket-integrity-5ca.patch"
+$XrayWebSocketTests = Join-Path $PSScriptRoot "fixtures\g2ray_ws_regression_test.go"
+$XrayVlessCancelPatch = Join-Path $PSScriptRoot "patches\xray-vless-cancel-5ca.patch"
+$XrayRetryTests = Join-Path $PSScriptRoot "fixtures\g2ray_retry_regression_test.go"
+$XrayVlessCancelTests = Join-Path $PSScriptRoot "fixtures\g2ray_vless_cancel_test.go"
+$LibXrayMeasurePatch = Join-Path $PSScriptRoot "patches\libxray-measure-status.patch"
+$LibXrayMeasureTests = Join-Path $PSScriptRoot "fixtures\libxray_measure_status_test.go"
+$LibXrayBatchTests = Join-Path $PSScriptRoot "fixtures\libxray_batch_policy_test.go"
 
 function Assert-PinnedMobileTool {
     param(
@@ -49,6 +67,34 @@ if (-not (Test-Path $env:ANDROID_NDK_HOME)) {
 if (-not (Test-Path -LiteralPath $AndroidControllerPatch -PathType Leaf)) {
     throw "The required Android controller patch is missing at '$AndroidControllerPatch'."
 }
+if (-not (Test-Path -LiteralPath $XrayObserverPatch -PathType Leaf)) {
+    throw "The required Xray observer patch is missing at '$XrayObserverPatch'."
+}
+foreach ($inputFile in @($XrayXhttpPatch, $XrayXhttpClosePatch, $XrayXhttpTests,
+    $XrayXhttpLifecyclePatch, $XrayXhttpDialTests, $XrayXhttpRequestTests, $XrayVlessXhttpTests)) {
+    if (-not (Test-Path -LiteralPath $inputFile -PathType Leaf)) {
+        throw "A required XHTTP patch or regression fixture is missing: '$inputFile'."
+    }
+}
+foreach ($inputFile in @($XrayWebSocketPatch, $XrayWebSocketTests)) {
+    if (-not (Test-Path -LiteralPath $inputFile -PathType Leaf)) {
+        throw "A required WebSocket patch or regression fixture is missing: '$inputFile'."
+    }
+}
+foreach ($inputFile in @($XrayVlessCancelPatch, $XrayRetryTests, $XrayVlessCancelTests)) {
+    if (-not (Test-Path -LiteralPath $inputFile -PathType Leaf)) {
+        throw "A required VLESS cancellation patch or regression fixture is missing: '$inputFile'."
+    }
+}
+if (-not (Test-Path -LiteralPath $LibXrayMeasurePatch -PathType Leaf)) {
+    throw "The required libXray measurement patch is missing at '$LibXrayMeasurePatch'."
+}
+if (-not (Test-Path -LiteralPath $LibXrayMeasureTests -PathType Leaf)) {
+    throw "The required libXray measurement fixtures are missing at '$LibXrayMeasureTests'."
+}
+if (-not (Test-Path -LiteralPath $LibXrayBatchTests -PathType Leaf)) {
+    throw "The required libXray batch measurement fixtures are missing."
+}
 if (-not (Get-Command go -ErrorAction SilentlyContinue)) {
     throw "Go $GoVersion is required but the go command was not found."
 }
@@ -57,18 +103,35 @@ if ($LASTEXITCODE -ne 0 -or $actualGoVersion -ne $GoVersion) {
     throw "libXray must be built with $GoVersion; found '$actualGoVersion'."
 }
 
+$WorkDir = [IO.Path]::GetFullPath($WorkDir)
+$xrayCoreDir = Join-Path (Split-Path $WorkDir -Parent) "Xray-core"
+if ($WorkDir -eq $xrayCoreDir) { throw "The libXray and Xray-core build directories must be different." }
+$libXrayOrigin = "https://github.com/XTLS/libXray.git"
+$xrayOrigin = "https://github.com/XTLS/Xray-core.git"
+# Validate both before touching either checkout, including their sibling path.
+Assert-NativeSourceCheckout $WorkDir $libXrayOrigin
+Assert-NativeSourceCheckout $xrayCoreDir $xrayOrigin
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 New-Item -ItemType Directory -Force -Path (Split-Path $WorkDir -Parent) | Out-Null
 
-if (-not (Test-Path $WorkDir)) {
-    git clone https://github.com/XTLS/libXray.git $WorkDir
+if (-not (Test-Path (Join-Path $WorkDir ".git"))) {
+    git clone $libXrayOrigin $WorkDir
+    if ($LASTEXITCODE -ne 0) { throw "Could not clone the pinned libXray source." }
+    Register-NativeSourceCheckout $WorkDir $libXrayOrigin
 } else {
     git -C $WorkDir fetch --tags --force origin
+    if ($LASTEXITCODE -ne 0) { throw "Could not refresh the pinned libXray source." }
 }
 
-git -C $WorkDir checkout --force $LibXrayRef
+Assert-NativeSourceCheckout $WorkDir $libXrayOrigin
+git -C $WorkDir -c core.autocrlf=false -c core.eol=lf checkout --force $LibXrayRef
 if ($LASTEXITCODE -ne 0) {
     throw "Could not check out pinned libXray ref $LibXrayRef."
+}
+# Also refresh an unchanged checkout that a previous Windows build wrote as CRLF.
+git -C $WorkDir -c core.autocrlf=false -c core.eol=lf checkout-index --force --all
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not normalize the disposable libXray source checkout."
 }
 git -C $WorkDir clean -ffdx
 if ($LASTEXITCODE -ne 0) {
@@ -79,6 +142,109 @@ if ($LibXrayRef -eq "main") {
     Write-Warning "LibXrayRef is 'main'. For production, rerun with -LibXrayRef <tested-commit-sha> and record that SHA."
 }
 Write-Host "Building libXray ref $LibXrayRef ($resolvedRef)"
+
+if (-not (Test-Path (Join-Path $xrayCoreDir ".git"))) {
+    git clone $xrayOrigin $xrayCoreDir
+    if ($LASTEXITCODE -ne 0) { throw "Could not clone the pinned Xray-core source." }
+    Register-NativeSourceCheckout $xrayCoreDir $xrayOrigin
+} else {
+    git -C $xrayCoreDir fetch --tags --force origin
+    if ($LASTEXITCODE -ne 0) { throw "Could not refresh the pinned Xray-core source." }
+}
+Assert-NativeSourceCheckout $xrayCoreDir $xrayOrigin
+git -C $xrayCoreDir -c core.autocrlf=false -c core.eol=lf checkout --force $XrayCoreRef
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not check out pinned Xray-core ref $XrayCoreRef."
+}
+git -C $xrayCoreDir -c core.autocrlf=false -c core.eol=lf checkout-index --force --all
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not normalize the disposable Xray-core source checkout."
+}
+git -C $xrayCoreDir clean -ffdx
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not clean the disposable Xray-core build checkout."
+}
+$resolvedXrayCoreRef = (git -C $xrayCoreDir rev-parse HEAD).Trim()
+git -C $xrayCoreDir apply --check $XrayObserverPatch
+if ($LASTEXITCODE -ne 0) {
+    throw "The pinned Xray-core source no longer accepts the observer snapshot patch."
+}
+git -C $xrayCoreDir apply $XrayObserverPatch
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not apply the Xray observer snapshot patch."
+}
+$xrayObserverPatchHash = (Get-FileHash $XrayObserverPatch -Algorithm SHA256).Hash
+Write-Host "Applied Xray observer snapshot patch $xrayObserverPatchHash at $resolvedXrayCoreRef"
+
+git -C $xrayCoreDir apply --check $XrayXhttpPatch
+if ($LASTEXITCODE -ne 0) { throw "The pinned Xray source does not accept the XHTTP concurrency patch." }
+git -C $xrayCoreDir apply $XrayXhttpPatch
+if ($LASTEXITCODE -ne 0) { throw "Could not apply the XHTTP concurrency patch." }
+git -C $xrayCoreDir apply --check $XrayXhttpClosePatch
+if ($LASTEXITCODE -ne 0) { throw "The pinned Xray source does not accept the XHTTP close-error patch." }
+git -C $xrayCoreDir apply $XrayXhttpClosePatch
+if ($LASTEXITCODE -ne 0) { throw "Could not apply the XHTTP close-error patch." }
+$xrayXhttpPatchHash = (Get-FileHash $XrayXhttpPatch -Algorithm SHA256).Hash
+$xrayXhttpClosePatchHash = (Get-FileHash $XrayXhttpClosePatch -Algorithm SHA256).Hash
+git -C $xrayCoreDir apply --check $XrayWebSocketPatch
+if ($LASTEXITCODE -ne 0) { throw "The pinned Xray source does not accept the WebSocket integrity patch." }
+git -C $xrayCoreDir apply $XrayWebSocketPatch
+if ($LASTEXITCODE -ne 0) { throw "Could not apply the WebSocket integrity patch." }
+$xrayWebSocketPatchHash = (Get-FileHash $XrayWebSocketPatch -Algorithm SHA256).Hash
+git -C $xrayCoreDir apply --check $XrayVlessCancelPatch
+if ($LASTEXITCODE -ne 0) { throw "The pinned Xray source does not accept the VLESS cancellation patch." }
+git -C $xrayCoreDir apply $XrayVlessCancelPatch
+if ($LASTEXITCODE -ne 0) { throw "Could not apply the VLESS cancellation patch." }
+$xrayVlessCancelPatchHash = (Get-FileHash $XrayVlessCancelPatch -Algorithm SHA256).Hash
+git -C $xrayCoreDir apply --check $XrayXhttpLifecyclePatch
+if ($LASTEXITCODE -ne 0) { throw "The pinned Xray source does not accept the XHTTP lifecycle patch." }
+git -C $xrayCoreDir apply $XrayXhttpLifecyclePatch
+if ($LASTEXITCODE -ne 0) { throw "Could not apply the XHTTP lifecycle patch." }
+$xrayXhttpLifecyclePatchHash = (Get-FileHash $XrayXhttpLifecyclePatch -Algorithm SHA256).Hash
+Copy-Item -LiteralPath $XrayXhttpTests -Destination (Join-Path $xrayCoreDir "transport\internet\splithttp\g2ray_xhttp_regression_test.go")
+Copy-Item -LiteralPath $XrayXhttpDialTests -Destination (Join-Path $xrayCoreDir "transport\internet\splithttp\g2ray_xhttp_dial_regression_test.go")
+Copy-Item -LiteralPath $XrayXhttpRequestTests -Destination (Join-Path $xrayCoreDir "transport\internet\splithttp\g2ray_xhttp_request_lifecycle_test.go")
+Copy-Item -LiteralPath $XrayVlessXhttpTests -Destination (Join-Path $xrayCoreDir "proxy\vless\outbound\g2ray_vless_xhttp_cancel_test.go")
+Copy-Item -LiteralPath $XrayWebSocketTests -Destination (Join-Path $xrayCoreDir "transport\internet\websocket\g2ray_ws_regression_test.go")
+Copy-Item -LiteralPath $XrayRetryTests -Destination (Join-Path $xrayCoreDir "common\retry\g2ray_retry_regression_test.go")
+Copy-Item -LiteralPath $XrayVlessCancelTests -Destination (Join-Path $xrayCoreDir "proxy\vless\outbound\g2ray_vless_cancel_test.go")
+Push-Location $xrayCoreDir
+try {
+    go test ./transport/internet/splithttp -run '^TestG2RayX' -count=1 -timeout=180s
+    if ($LASTEXITCODE -ne 0) { throw "The patched XHTTP byte-integrity, concurrency or close-error fixtures failed." }
+    go test ./transport/internet/websocket -run '^TestG2RayWS' -count=1 -timeout=90s
+    if ($LASTEXITCODE -ne 0) { throw "The patched WebSocket integrity or deadline fixtures failed." }
+    go test ./common/retry ./proxy/vless/outbound -count=1 -timeout=90s
+    if ($LASTEXITCODE -ne 0) { throw "The patched VLESS cancellation or legacy retry fixtures failed." }
+} finally { Pop-Location }
+
+git -C $WorkDir apply --check $LibXrayMeasurePatch
+if ($LASTEXITCODE -ne 0) {
+    throw "The pinned libXray source no longer accepts the measurement-status patch."
+}
+git -C $WorkDir apply $LibXrayMeasurePatch
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not apply the libXray measurement-status patch."
+}
+$libXrayMeasurePatchHash = (Get-FileHash $LibXrayMeasurePatch -Algorithm SHA256).Hash
+Write-Host "Applied libXray measurement-status patch $libXrayMeasurePatchHash at $resolvedRef"
+Copy-Item -LiteralPath $LibXrayMeasureTests -Destination (Join-Path $WorkDir "nodep\g2ray_measure_status_test.go")
+Copy-Item -LiteralPath $LibXrayBatchTests -Destination (Join-Path $WorkDir "xray\g2ray_batch_policy_test.go")
+Push-Location $WorkDir
+try {
+    go mod edit '-replace=github.com/xtls/xray-core=../Xray-core'
+    if ($LASTEXITCODE -ne 0) { throw "Could not select the patched local Xray-core for native fixtures." }
+    $testCoreDir = (go list -m -f '{{if .Replace}}{{.Replace.Dir}}{{end}}' github.com/xtls/xray-core).Trim()
+    if ($LASTEXITCODE -ne 0 -or -not $testCoreDir -or [IO.Path]::GetFullPath($testCoreDir) -ne $xrayCoreDir) {
+        throw "Native fixtures must use this build's patched Xray-core, not a module-cache copy."
+    }
+    go test ./nodep ./xray -run TestG2Ray -count=1
+    if ($LASTEXITCODE -ne 0) {
+        throw "The patched native measurement failed its HTTP status, redirect, timeout or cancellation fixtures."
+    }
+} finally {
+    Pop-Location
+}
 
 git -C $WorkDir apply --check $AndroidControllerPatch
 if ($LASTEXITCODE -ne 0) {
@@ -179,7 +345,7 @@ try {
     Pop-Location
 }
 
-python (Join-Path $WorkDir "build\main.py") android
+python (Join-Path $WorkDir "build\main.py") android local
 if ($LASTEXITCODE -ne 0) {
     throw "libXray Android build failed with exit code $LASTEXITCODE."
 }
@@ -205,6 +371,14 @@ libxray.go=$postBuildGoVersion
 libxray.gomobile=$GomobileVersion
 libxray.gobind=$GomobileVersion
 libxray.android.controller.patch.sha256=$androidControllerPatchHash
+libxray.xray.ref=$resolvedXrayCoreRef
+libxray.xray.observer.patch.sha256=$xrayObserverPatchHash
+libxray.xray.xhttp.patch.sha256=$xrayXhttpPatchHash
+libxray.xray.xhttp.close.patch.sha256=$xrayXhttpClosePatchHash
+libxray.xray.websocket.patch.sha256=$xrayWebSocketPatchHash
+libxray.xray.vless.cancel.patch.sha256=$xrayVlessCancelPatchHash
+libxray.xray.xhttp.lifecycle.patch.sha256=$xrayXhttpLifecyclePatchHash
+libxray.measure.patch.sha256=$libXrayMeasurePatchHash
 "@ | Set-Content (Join-Path $OutputDir "libXray.properties") -Encoding ascii
 Write-Host "Copied libXray.aar to $OutputDir"
 Write-Host "libXray commit: $resolvedRef"

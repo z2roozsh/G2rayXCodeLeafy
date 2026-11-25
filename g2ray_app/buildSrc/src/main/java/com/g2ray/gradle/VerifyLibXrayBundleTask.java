@@ -8,6 +8,7 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.util.Arrays;
 import java.util.HexFormat;
+import java.util.List;
 import java.util.Properties;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
@@ -25,6 +26,20 @@ import org.gradle.work.DisableCachingByDefault;
 
 @DisableCachingByDefault(because = "Native bundle verification must inspect the current local artifact")
 public abstract class VerifyLibXrayBundleTask extends DefaultTask {
+    private static final String APPROVED_LIBXRAY_REF =
+        "80263da83e96b2972455b0a94b13ee1a10e51391";
+    private static final String APPROVED_GO_VERSION = "go1.26.10";
+    private static final String APPROVED_GOMOBILE_VERSION =
+        "v0.0.0-20260611195102-4dd8f1dbf5d2";
+    private static final String APPROVED_XRAY_REF =
+        "5ca6f4b7d4dc20a881d4330e498892697627ec0c";
+    private static final List<String> REQUIRED_NATIVE_LIBS = List.of(
+        "jni/armeabi-v7a/libgojni.so",
+        "jni/arm64-v8a/libgojni.so",
+        "jni/x86/libgojni.so",
+        "jni/x86_64/libgojni.so"
+    );
+
     @Internal
     public abstract RegularFileProperty getAarFile();
 
@@ -34,6 +49,34 @@ public abstract class VerifyLibXrayBundleTask extends DefaultTask {
     @InputFile
     @PathSensitive(PathSensitivity.RELATIVE)
     public abstract RegularFileProperty getControllerPatch();
+
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getObserverPatch();
+
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getMeasurePatch();
+
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getXhttpPatch();
+
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getXhttpClosePatch();
+
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getWebSocketPatch();
+
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getVlessCancelPatch();
+
+    @InputFile
+    @PathSensitive(PathSensitivity.RELATIVE)
+    public abstract RegularFileProperty getXhttpLifecyclePatch();
 
     @Input
     public abstract Property<Boolean> getRequired();
@@ -50,13 +93,26 @@ public abstract class VerifyLibXrayBundleTask extends DefaultTask {
 
     @TaskAction
     public void verifyBundle() throws Exception {
-        Path aar = Path.of(getAarPath());
-        Path metadata = Path.of(getMetadataPath());
+        verifyArtifacts(Path.of(getAarPath()), Path.of(getMetadataPath()),
+            getControllerPatch().getAsFile().get().toPath(),
+            getObserverPatch().getAsFile().get().toPath(),
+            getMeasurePatch().getAsFile().get().toPath(),
+            getXhttpPatch().getAsFile().get().toPath(),
+            getXhttpClosePatch().getAsFile().get().toPath(),
+            getWebSocketPatch().getAsFile().get().toPath(),
+            getVlessCancelPatch().getAsFile().get().toPath(),
+            getXhttpLifecyclePatch().getAsFile().get().toPath(), getRequired().get());
+    }
+
+    static void verifyArtifacts(Path aar, Path metadata, Path controllerPatch, Path observerPatch,
+                                Path measurePatch, Path xhttpPatch, Path xhttpClosePatch, Path webSocketPatch,
+                                Path vlessCancelPatch, Path xhttpLifecyclePatch,
+                                boolean required) throws Exception {
         boolean aarExists = Files.isRegularFile(aar);
         boolean metadataExists = Files.isRegularFile(metadata);
 
         if (!aarExists) {
-            if (getRequired().get()) {
+            if (required) {
                 throw new GradleException("This build requires app/libs/libXray.aar and its metadata");
             }
             return;
@@ -86,14 +142,72 @@ public abstract class VerifyLibXrayBundleTask extends DefaultTask {
         String expectedPatchHash = properties
             .getProperty("libxray.android.controller.patch.sha256", "")
             .trim();
-        String actualPatchHash = sha256(getControllerPatch().getAsFile().get().toPath());
+        String actualPatchHash = sha256(controllerPatch);
         if (!actualPatchHash.equalsIgnoreCase(expectedPatchHash)) {
             throw new GradleException(
                 "The bundled libXray AAR was not built with the current Android controller patch"
             );
         }
 
+        requireProperty(properties, "libxray.ref", APPROVED_LIBXRAY_REF);
+        requireProperty(properties, "libxray.go", APPROVED_GO_VERSION);
+        requireProperty(properties, "libxray.gomobile", APPROVED_GOMOBILE_VERSION);
+        requireProperty(properties, "libxray.gobind", APPROVED_GOMOBILE_VERSION);
+        requireProperty(properties, "libxray.xray.ref", APPROVED_XRAY_REF);
+        String expectedObserverPatchHash = properties
+            .getProperty("libxray.xray.observer.patch.sha256", "")
+            .trim();
+        String actualObserverPatchHash = sha256(observerPatch);
+        if (!actualObserverPatchHash.equalsIgnoreCase(expectedObserverPatchHash)) {
+            throw new GradleException(
+                "The bundled libXray AAR was not built with the current Xray observer patch"
+            );
+        }
+        String expectedMeasurePatchHash = properties
+            .getProperty("libxray.measure.patch.sha256", "")
+            .trim();
+        String actualMeasurePatchHash = sha256(measurePatch);
+        if (!actualMeasurePatchHash.equalsIgnoreCase(expectedMeasurePatchHash)) {
+            throw new GradleException(
+                "The bundled libXray AAR was not built with the current measurement-status patch"
+            );
+        }
+        requirePatchHash(properties, "libxray.xray.xhttp.patch.sha256", xhttpPatch);
+        requirePatchHash(properties, "libxray.xray.xhttp.close.patch.sha256", xhttpClosePatch);
+        requirePatchHash(properties, "libxray.xray.websocket.patch.sha256", webSocketPatch);
+        requirePatchHash(properties, "libxray.xray.vless.cancel.patch.sha256", vlessCancelPatch);
+        requirePatchHash(properties, "libxray.xray.xhttp.lifecycle.patch.sha256", xhttpLifecyclePatch);
+
+        verifyNativeLibraries(aar);
         verifyJavaApi(aar);
+    }
+
+    private static void requirePatchHash(Properties properties, String name, Path patch) throws Exception {
+        if (!sha256(patch).equalsIgnoreCase(properties.getProperty(name, "").trim())) {
+            throw new GradleException("The bundled libXray AAR does not attest the current " + name);
+        }
+    }
+
+    private static void requireProperty(Properties properties, String name, String expected) {
+        String actual = properties.getProperty(name, "").trim();
+        if (!expected.equals(actual)) {
+            throw new GradleException(
+                "libXray metadata " + name + " must be the approved value " + expected
+            );
+        }
+    }
+
+    private static void verifyNativeLibraries(Path aar) throws Exception {
+        try (ZipFile zip = new ZipFile(aar.toFile())) {
+            for (String path : REQUIRED_NATIVE_LIBS) {
+                ZipEntry entry = zip.getEntry(path);
+                if (entry == null || entry.isDirectory() || entry.getSize() <= 0) {
+                    throw new GradleException(
+                        "The bundled libXray AAR is missing a required native library: " + path
+                    );
+                }
+            }
+        }
     }
 
     private static void verifyJavaApi(Path aar) throws Exception {

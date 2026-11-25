@@ -8,11 +8,211 @@ import com.g2ray.client.model.ActiveVpnEngine
 import com.g2ray.client.model.G2RayProfile
 import com.g2ray.client.model.StoredG2RayProfile
 import com.g2ray.client.model.Transport
+import com.g2ray.client.network.interruptibleDnsLookup
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 
 @RunWith(RobolectricTestRunner::class)
 class G2RayVpnServiceTest {
+    @Test
+    fun slowPrimaryDoesNotBlockReadyCompatibleBackup() = runBlocking {
+        val primary = liveProfile("primary.example")
+        val backup = liveProfile("203.0.113.2")
+        val interrupted = java.util.concurrent.atomic.AtomicBoolean(false)
+        val result = withTimeout(2_000) {
+            G2RayVpnService.resolveRuntimeProfilesForStartup(listOf(primary, backup), optionalGraceMs = 150) {
+                interruptibleDnsLookup {
+                    if (it == primary.address) {
+                        try { Thread.sleep(10_000) } catch (error: InterruptedException) {
+                            interrupted.set(true)
+                            throw error
+                        }
+                    }
+                    listOf(it)
+                }
+            }
+        }
+        assertEquals(listOf(backup), result)
+        assertTrue(interrupted.get())
+    }
+
+    @Test
+    fun primaryKeepsPriorityWhenItResolvesWithinBackupGrace() = runBlocking {
+        val primary = liveProfile("primary.example")
+        val backup = liveProfile("203.0.113.2")
+        val result = G2RayVpnService.resolveRuntimeProfilesForStartup(listOf(primary, backup), optionalGraceMs = 500) {
+            if (it == primary.address) delay(50)
+            listOf(it)
+        }
+        assertEquals(listOf(primary, backup), result)
+    }
+
+    @Test
+    fun selectedProfileGetsASeparateGraceBeforeAReadyBackupWins() = runBlocking {
+        val primary = liveProfile("primary.example")
+        val backup = liveProfile("203.0.113.2")
+        val result = withTimeout(2_000) {
+            G2RayVpnService.resolveRuntimeProfilesForStartup(
+                listOf(primary, backup),
+                optionalGraceMs = 50
+            ) {
+                if (it == primary.address) delay(700)
+                listOf(it)
+            }
+        }
+        assertEquals(listOf(primary, backup), result)
+    }
+
+    @Test
+    fun startupDoesNotWaitForSlowOptionalDnsAndKeepsReadyBackup() = runBlocking {
+        val selected = liveProfile("203.0.113.1")
+        val slow = liveProfile("slow.example")
+        val backup = liveProfile("203.0.113.2")
+        var cancelled = false
+        val result = withTimeout(1_500) {
+            G2RayVpnService.resolveRuntimeProfilesForStartup(
+                listOf(selected, slow, backup), optionalGraceMs = 100
+            ) {
+                if (it == slow.address) {
+                    try { delay(10_000) } finally { cancelled = true }
+                }
+                listOf(it)
+            }
+        }
+        assertEquals(listOf(selected, backup), result)
+        assertTrue(cancelled)
+    }
+
+    @Test
+    fun readySelectedEndpointDoesNotSpendTheSlowOptionalDnsBudget() = runBlocking {
+        val selected = liveProfile("203.0.113.1")
+        val slow = liveProfile("slow.example")
+        G2RayVpnService.selectSeamlessRouteProfiles(selected, emptyList())
+        var cancelled = false
+        val started = System.nanoTime()
+        val result = withTimeout(1_000L) {
+            G2RayVpnService.resolveRuntimeProfilesForStartup(listOf(selected, slow), optionalGraceMs = 2_000L) {
+                if (it == slow.address) {
+                    try { delay(10_000L) } finally { cancelled = true }
+                }
+                listOf(it)
+            }
+        }
+        assertTrue("Ready primary waited for optional DNS", (System.nanoTime() - started) / 1_000_000 < 1_000L)
+        assertEquals(listOf(selected), result)
+        assertTrue(cancelled)
+    }
+
+    @Test
+    fun startupUsesCompatibleBackupWhenPrimaryFailsAndBoundsOtherLookups() = runBlocking {
+        val selected = liveProfile("primary.example")
+        val backup = liveProfile("203.0.113.2")
+        val slow = liveProfile("slow.example")
+        val result = withTimeout(1_500) {
+            G2RayVpnService.resolveRuntimeProfilesForStartup(
+                listOf(selected, backup, slow), optionalGraceMs = 50, fallbackWaitMs = 100
+            ) {
+                when (it) {
+                    selected.address -> throw java.net.UnknownHostException("Primary DNS failed")
+                    slow.address -> { delay(10_000); listOf(it) }
+                    else -> listOf(it)
+                }
+            }
+        }
+        assertEquals(listOf(backup), result)
+    }
+
+    @Test
+    fun singleProfileStartupBudgetDoesNotResolveOptionalBackups() = runBlocking {
+        val selected = liveProfile("203.0.113.1")
+        val backup = liveProfile("backup.example")
+        val lookups = mutableListOf<String>()
+        val result = G2RayVpnService.resolveRuntimeProfilesForStartup(
+            profiles = listOf(selected, backup),
+            maxProfiles = 1
+        ) {
+            lookups += it
+            listOf(it)
+        }
+
+        assertEquals(listOf(selected), result)
+        assertEquals(listOf(selected.address), lookups)
+    }
+
+    @Test
+    fun optionalBlockingLookupIsInterruptedWhenItsGraceExpires() = runBlocking {
+        val selected = liveProfile("203.0.113.1")
+        val slow = liveProfile("slow.example")
+        val interrupted = java.util.concurrent.atomic.AtomicBoolean(false)
+        val result = withTimeout(2_000) {
+            G2RayVpnService.resolveRuntimeProfilesForStartup(listOf(selected, slow), optionalGraceMs = 150) {
+                interruptibleDnsLookup {
+                    if (it == slow.address) {
+                        try { Thread.sleep(10_000) } catch (error: InterruptedException) {
+                            interrupted.set(true)
+                            throw error
+                        }
+                    }
+                    listOf(it)
+                }
+            }
+        }
+        assertEquals(listOf(selected), result)
+        assertTrue(interrupted.get())
+    }
+
+    @Test
+    fun allFailedStartupLookupsPreserveThePrimaryError() = runBlocking {
+        val primary = liveProfile("primary.example")
+        val backup = liveProfile("backup.example")
+        val error = runCatching {
+            G2RayVpnService.resolveRuntimeProfilesForStartup(listOf(primary, backup), fallbackWaitMs = 100) {
+                throw java.net.UnknownHostException(if (it == primary.address) "Primary failed" else "Backup failed")
+            }
+        }.exceptionOrNull()
+        assertTrue(error is java.net.UnknownHostException)
+        assertEquals("Primary failed", error?.message)
+    }
+
+    @Test
+    fun startupDoesNotResolveUnrelatedTemplatesAndDeduplicatesHostLookups() = runBlocking {
+        val selected = liveProfile("front.example")
+        val sameHost = selected.copy()
+        val unrelated = liveProfile("other.example").copy(uuid = "00000000-0000-4000-8000-000000000002")
+        val lookups = mutableListOf<String>()
+        val result = G2RayVpnService.resolveRuntimeProfilesForStartup(listOf(selected, sameHost, unrelated)) {
+            lookups += it
+            listOf("203.0.113.1")
+        }
+        assertEquals(listOf("front.example"), lookups)
+        assertEquals(selected.copy(address = "203.0.113.1"), result.first())
+        assertTrue(result.none { it.uuid == unrelated.uuid })
+    }
+
+    @Test
+    fun stoppingStartupCancelsEndpointLookups() = runBlocking {
+        var primaryCancelled = false
+        var backupCancelled = false
+        val job = launch {
+            G2RayVpnService.resolveRuntimeProfilesForStartup(
+                listOf(liveProfile("primary.example"), liveProfile("backup.example"))
+            ) {
+                try { delay(10_000); listOf(it) } finally {
+                    if (it == "primary.example") primaryCancelled = true else backupCancelled = true
+                }
+            }
+        }
+        delay(50)
+        job.cancelAndJoin()
+        assertTrue(primaryCancelled)
+        assertTrue(backupCancelled)
+    }
+
     @Test
     fun legacyTimestampWithoutNetworkProvenanceCannotVerifyAStandbyRoute() {
         val legacy = storedProfile("legacy", "203.0.113.2", 80).copy(
@@ -743,6 +943,20 @@ class G2RayVpnServiceTest {
                 TrafficBytes(rxBytes = 101L, txBytes = 200L, rxTcpPayloadBytes = 51L)
             )
         )
+        assertTrue(
+            G2RayVpnService.measuredResponseTrafficAdvanced(
+                ActiveVpnEngine.XrayNative,
+                TrafficBytes(rxBytes = 10_000L, txBytes = 200L),
+                TrafficBytes(rxBytes = 18_192L, txBytes = 200L)
+            )
+        )
+        assertFalse(
+            G2RayVpnService.measuredResponseTrafficAdvanced(
+                ActiveVpnEngine.XrayNative,
+                TrafficBytes(rxBytes = 10_000L, txBytes = 200L),
+                TrafficBytes(rxBytes = 18_191L, txBytes = 70_000L)
+            )
+        )
         assertFalse(
             G2RayVpnService.measuredResponseTrafficAdvanced(
                 ActiveVpnEngine.Hev,
@@ -793,6 +1007,20 @@ class G2RayVpnServiceTest {
                 currentTraffic = resumed
             )
         )
+    }
+
+    @Test
+    fun nativeUidTrafficCannotVerifyAFailedRoute() {
+        val failed = RunningRouteResult(false, "public probe failed", failureScope = RouteFailureScope.XrayRoute)
+        val before = TrafficBytes(1_000L, 1_000L)
+        val directGithubResponse = TrafficBytes(90_000L, 2_000L)
+        assertFalse(G2RayVpnService.shouldSuppressRouteRecoveryAfterFailedReverification(
+            failed, ActiveVpnEngine.XrayNative, before, directGithubResponse
+        ))
+        assertTrue(G2RayVpnService.shouldAllowRouteActivityGrace(
+            failed, ActiveVpnEngine.XrayNative, before, directGithubResponse
+        ))
+        assertTrue(G2RayVpnService.routeHealthFailureRequiresRecovery(6, true))
     }
 
     @Test
@@ -866,12 +1094,12 @@ class G2RayVpnServiceTest {
                 timeSinceLastReverifyMs = 29_999L
             )
         )
-        assertFalse(
+        assertTrue(
             G2RayVpnService.shouldReverifyAfterIdleTraffic(
                 engine = ActiveVpnEngine.XrayNative,
                 idleDurationMs = 60_000L,
-                rxBps = 0L,
-                txBps = 1L,
+                rxBps = 1L,
+                txBps = 0L,
                 timeSinceLastReverifyMs = 30_000L
             )
         )
@@ -938,6 +1166,15 @@ class G2RayVpnServiceTest {
                 engine = ActiveVpnEngine.XrayNative,
                 txBytesSinceLastRx = 32L * 1024L,
                 txPacketsSinceLastRx = 20L,
+                timeSinceLastRxMs = 10_000L,
+                timeSinceLastReverifyMs = 10_000L
+            )
+        )
+        assertTrue(
+            G2RayVpnService.shouldProbeSuspectedActiveStall(
+                engine = ActiveVpnEngine.XrayNative,
+                txBytesSinceLastRx = 64L * 1024L,
+                txPacketsSinceLastRx = 0L,
                 timeSinceLastRxMs = 10_000L,
                 timeSinceLastReverifyMs = 10_000L
             )
@@ -1155,6 +1392,111 @@ class G2RayVpnServiceTest {
         ))
         assertFalse(G2RayVpnService.persistedRouteMeasurementFresh(
             fresh.copy(lastDelaySuccessfulSamples = 1, lastDelaySampleCount = 1), now, networkKey = "test-network"
+        ))
+    }
+
+    @Test
+    fun liveRoutePoolExploresUnmeasuredPublicIpsWithoutTrustingKnownFailures() {
+        val now = 10_000L
+        val selected = liveProfile("20.0.0.1")
+        val measured = liveProfile("20.0.0.2")
+        val unmeasured = liveProfile("20.0.0.3")
+        val failed = liveProfile("20.0.0.4")
+        val hostname = liveProfile("edge.example")
+        val measuredStored = storedProfile("measured", measured.address, 80, measured.rawUri).copy(
+            lastDelayTestedAt = now - 100L,
+            lastDelaySuccessfulSamples = 2,
+            lastDelaySampleCount = 2,
+            lastDelayNetworkKey = "test-network"
+        )
+        val unmeasuredStored = storedProfile("unmeasured", unmeasured.address, 0, unmeasured.rawUri)
+        val failedStored = storedProfile("failed", failed.address, 20, failed.rawUri).copy(
+            delayFailureCount = 1, lastDelayTestedAt = now, lastDelayNetworkKey = "test-network"
+        )
+        val hostnameStored = storedProfile("hostname", hostname.address, 10, hostname.rawUri)
+
+        val selectedRoutes = G2RayVpnService.selectLiveRouteProfiles(
+            selected = selected,
+            candidates = listOf(
+                unmeasuredStored to unmeasured,
+                failedStored to failed,
+                measuredStored to measured,
+                hostnameStored to hostname
+            ),
+            sessionHealth = emptyMap(),
+            nowMs = now,
+            networkKey = "test-network",
+            maxProfiles = 3
+        )
+
+        assertEquals(
+            listOf(selected.address, measured.address, unmeasured.address),
+            selectedRoutes.map { it.address }
+        )
+        assertFalse(selectedRoutes.any { it.address == failed.address })
+    }
+
+    @Test
+    fun liveRoutePoolKeepsAnUnmeasuredDomainFallbackForBlockedIpPaths() {
+        assertTrue(G2RayVpnService.isExplorableLiveEndpoint("edge.example"))
+        assertFalse(G2RayVpnService.isExplorableLiveEndpoint("2001:db8::1"))
+        assertFalse(G2RayVpnService.isExplorableLiveEndpoint("192.168.1.1"))
+
+        val selected = liveProfile("20.0.0.1")
+        val hostname = liveProfile("edge.example")
+        val failed = liveProfile("20.0.0.4")
+        val hostnameStored = storedProfile("hostname", hostname.address, 10, hostname.rawUri)
+        val failedStored = storedProfile("failed", failed.address, 20, failed.rawUri).copy(
+            delayFailureCount = 1, lastDelayTestedAt = 10_000L, lastDelayNetworkKey = "test-network"
+        )
+
+        val selectedRoutes = G2RayVpnService.selectLiveRouteProfiles(
+            selected = selected,
+            candidates = listOf(failedStored to failed, hostnameStored to hostname),
+            sessionHealth = emptyMap(),
+            nowMs = 10_000L,
+            networkKey = "test-network",
+            maxProfiles = 3
+        )
+
+        assertEquals(listOf(selected.address, hostname.address), selectedRoutes.map { it.address })
+    }
+
+    @Test
+    fun liveRouteExplorationDoesNotCarryFailuresAcrossNetworksOrExpiry() {
+        val now = 100_000_000L
+        val selected = liveProfile("20.0.0.1")
+        val backup = liveProfile("20.0.0.2")
+        val failed = storedProfile("failed", backup.address, 0, backup.rawUri).copy(
+            lastDelayTestedAt = now - 10L, lastDelayNetworkKey = "wifi",
+            lastDelayError = "timeout", delayFailureCount = 2
+        )
+        for (candidate in listOf(
+            failed,
+            failed.copy(lastDelayNetworkKey = "lte", lastDelayTestedAt = now - 6 * 60 * 60 * 1_000L - 1),
+            failed.copy(lastDelayNetworkKey = null)
+        )) {
+            assertEquals(listOf(selected, backup), G2RayVpnService.selectLiveRouteProfiles(
+                selected, listOf(candidate to backup), emptyMap(), now, "lte"
+            ))
+        }
+        assertEquals(listOf(selected), G2RayVpnService.selectLiveRouteProfiles(
+            selected, listOf(failed.copy(lastDelayNetworkKey = "lte") to backup), emptyMap(), now, "lte"
+        ))
+    }
+
+    @Test
+    fun sessionFailureOverridesAnEarlierSuccessfulPersistedMeasurement() {
+        val now = 10_000L
+        val selected = liveProfile("20.0.0.1")
+        val backup = liveProfile("20.0.0.2")
+        val stored = storedProfile("backup", backup.address, 80, backup.rawUri).copy(
+            lastDelayTestedAt = now - 100L, lastDelayNetworkKey = "test-network",
+            lastDelaySuccessfulSamples = 2, lastDelaySampleCount = 2
+        )
+        val failures = mapOf(stored.rawUri to G2RayVpnService.updatedSessionProfileHealth(null, false, null, now))
+        assertEquals(listOf(selected), G2RayVpnService.selectLiveRouteProfiles(
+            selected, listOf(stored to backup), failures, now, "test-network"
         ))
     }
 

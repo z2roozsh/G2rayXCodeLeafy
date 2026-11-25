@@ -7,6 +7,7 @@ on:
   pull_request:
     paths-ignore:
       - "assets/**"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -46,6 +47,7 @@ jobs:
         run: |
           bash -n ./g2ray.sh
           bash -n ./scripts/post-start.sh
+          bash -n ./.devcontainer/build-xray.sh
           bash -n ./tests/g2ray_static_tests.sh
           bash -n ./tests/g2ray_behavior_tests.sh
           python3 ./tests/xray_upload_queue_validation.py --help >/dev/null
@@ -60,8 +62,18 @@ jobs:
       - name: Run static regression tests
         run: bash ./tests/g2ray_static_tests.sh
 
+      - name: Verify hobby tunnel compatibility without synthetic keep-alive
+        run: bash ./tests/hosting_policy_tests.sh
+
       - name: Run behavior regression tests
-        run: bash ./tests/g2ray_behavior_tests.sh
+        run: |
+          # Linux hosts need not provide the legacy python alias.
+          python() { printf 'Unexpected bare python invocation\n' >&2; return 127; }
+          export -f python
+          bash ./tests/g2ray_behavior_tests.sh
+
+      - name: Verify exit-country diagnostics without Internet requests
+        run: bash ./tests/exit_location_tests.sh
 
       - name: Run Worker behavior tests
         working-directory: worker/codespace-waker
@@ -75,6 +87,9 @@ jobs:
           go test -race ./tests/xray_retained_http_check.go ./tests/xray_retained_http_check_test.go
           python3 tests/xray_authenticated_transport_check_test.py
           python3 tests/xray_isolated_server_pair_check_test.py
+          python3 tests/native_checkout_eol_test.py
+          python3 tests/analyze_vpn_load_test.py
+          python3 tests/synthetic_integrity_endpoint_test.py
 
   xray-core-tests:
     runs-on: ubuntu-latest
@@ -106,12 +121,32 @@ jobs:
           chmod +x "$tmp/core/xray"
           python3 tests/xray_upload_queue_validation.py "$tmp/core/xray"
           python3 tests/xray_client_failure_validation.py "$tmp/core/xray"
+          bash tests/g2ray_option_matrix.sh "$tmp/core/xray"
           go build -o "$tmp/retained-http-probe" tests/xray_retained_http_check.go
           python3 tests/xray_isolated_server_pair_check.py "$tmp/core/xray" \
             "$tmp/retained-http-probe" --loopback-baseline --idle-seconds 0
           python3 tests/xray_isolated_server_pair_check.py "$tmp/core/xray" \
             "$tmp/retained-http-probe" --loopback-baseline --idle-seconds 70 \
             --transport ws --ws-early-data-bytes 2560
+
+  maintained-server-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Build and verify the maintained server image
+        run: |
+          docker build --tag g2ray-ws-verified --file .devcontainer/Dockerfile .devcontainer
+          docker run --rm g2ray-ws-verified /usr/local/bin/xray version
+          docker run --rm g2ray-ws-verified sh -eu -c '
+            cd /usr/local/bin
+            expected=$(sed -n "s/^xray.sha256=//p" /usr/local/share/g2ray/xray-build.properties)
+            test -n "$expected"
+            printf "%s  xray\n" "$expected" | sha256sum -c -
+            test -x /usr/local/lib/g2ray/xray-official'
+          docker run --rm --entrypoint python3 -v "$PWD/tests:/audit:ro" g2ray-ws-verified \
+            /audit/xray_xhttp_handshake_check.py /usr/local/bin/xray
 
   extended-tests:
     runs-on: ubuntu-latest
@@ -134,7 +169,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck
-          shellcheck -S error ./g2ray.sh ./scripts/post-start.sh ./tests/*.sh
+          shellcheck -S error ./g2ray.sh ./scripts/post-start.sh ./.devcontainer/build-xray.sh ./tests/*.sh
 
       - name: Wrangler dry-run bundle check
         working-directory: worker/codespace-waker

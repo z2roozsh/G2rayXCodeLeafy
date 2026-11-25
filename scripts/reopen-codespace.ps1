@@ -8,7 +8,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 function Fail($Message, $Code = 1) {
-    Write-Error $Message
+    Write-Error -Message $Message -ErrorAction Continue
     exit $Code
 }
 
@@ -91,9 +91,6 @@ do {
         $view = $viewRaw | ConvertFrom-Json
         $state = $view.state
         Write-Host "State     : $state"
-        if ($view.idleTimeoutMinutes -and [int]$view.idleTimeoutMinutes -lt 240) {
-            Write-Host "Idle time : $($view.idleTimeoutMinutes)m. For fewer sleeps, set GitHub Codespaces Default idle timeout to 240 minutes."
-        }
         if ($state -match "Available|Running") { break }
     } else {
         Write-Warning ($viewRaw -join "`n")
@@ -112,4 +109,4 @@ if (-not $NoOpen) {
     }
 }
 
-Write-Host "Codespace is available. Inside it, postStartCommand should run ./g2ray.sh --silent-start automatically."
+Write-Host "Codespace is available. The post-start hook resumes an existing G2ray config; a new workspace still needs initial setup."

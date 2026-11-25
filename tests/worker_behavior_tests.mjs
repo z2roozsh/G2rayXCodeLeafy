@@ -66,6 +66,43 @@ async function responseJson(response) {
   return JSON.parse(await response.text());
 }
 
+async function testExistingWakeConfigurationRemainsCompatible() {
+  const previousFetch = globalThis.fetch;
+  try {
+    for (const purpose of [undefined, "development"]) {
+      for (const path of ["/wake", "/api/wake"]) {
+        let starts = 0;
+        let calls = 0;
+        globalThis.fetch = async (input) => {
+          calls += 1;
+          const url = String(input);
+          if (url.includes("/start")) {
+            starts += 1;
+            return new Response(JSON.stringify({ state: "Starting" }), { status: 202 });
+          }
+          if (url.includes("api.github.com")) {
+            return new Response(JSON.stringify({ name: "behavior-space", state: "Shutdown", pending_operation: false }), { status: 200 });
+          }
+          if (url.includes("app.github.dev")) return new Response("", { status: 404 });
+          throw new Error(`unexpected fetch ${url}`);
+        };
+        const unauthorized = await worker.fetch(makeRequest(path, "wrong-secret"), baseEnv({ CODESPACE_WAKE_PURPOSE: purpose }), {});
+        assert.equal(unauthorized.status, 401);
+        assert.equal(calls, 0);
+        const response = await worker.fetch(makeRequest(path), baseEnv({ CODESPACE_WAKE_PURPOSE: purpose }), {});
+        const body = await responseJson(response);
+        assert.equal(response.status, 202);
+        assert.equal(body.start_accepted, true);
+        assert.equal(body.codespace, "behavior-space");
+        assert.equal(starts, 1);
+      }
+    }
+    console.log("PASS: existing three-variable Worker setup can wake through both endpoints without a new purpose flag, while rejecting wrong keys");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
+}
+
 async function testGithubBodyTimeoutIsBounded(path = "/api/health") {
   const originalSetTimeout = globalThis.setTimeout;
   const pendingStreams = [];
@@ -556,25 +593,14 @@ async function testGithubHttp429Classification() {
   console.log("PASS: Worker classifies GitHub HTTP 429 rate limits");
 }
 
-async function testGithubStartRetriesTransientServerFailure() {
+async function testGithubStartDoesNotRetryAmbiguousServerFailure() {
   let startCalls = 0;
-  let cancelledResponseBodies = 0;
   globalThis.fetch = async (input) => {
     const url = String(input);
     if (url.includes("/start")) {
       startCalls += 1;
-      if (startCalls === 1) {
-        return new Response(new ReadableStream({
-          cancel() {
-            cancelledResponseBodies += 1;
-          }
-        }), {
-          status: 503,
-          headers: { "content-type": "application/json" }
-        });
-      }
-      return new Response(JSON.stringify({ state: "Available" }), {
-        status: 200,
+      return new Response(JSON.stringify({ message: "upstream temporarily unavailable" }), {
+        status: 503,
         headers: { "content-type": "application/json" }
       });
     }
@@ -596,18 +622,14 @@ async function testGithubStartRetriesTransientServerFailure() {
     throw new Error(`unexpected fetch ${url}`);
   };
 
-  const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({
-    WAKE_FAST_PATH: "0",
-    GITHUB_API_RETRY_BACKOFF_MS: "0"
-  }), {});
+  const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({ WAKE_FAST_PATH: "0" }), {});
   const body = await responseJson(response);
-  assert.equal(response.status, 202);
-  assert.equal(startCalls, 2);
-  assert.equal(cancelledResponseBodies, 1);
-  assert.equal(body.start_accepted, true);
-  assert.equal(body.route_ready, false);
-  assert.equal(body.next_action_code, "wait_codespace_available");
-  console.log("PASS: Worker retries transient GitHub start server failures once");
+  assert.equal(response.status, 502);
+  assert.equal(startCalls, 1);
+  assert.equal(body.start_accepted, undefined);
+  assert.equal(body.reason, "github_start_request_failed");
+  assert.equal(body.route_ready, undefined);
+  console.log("PASS: Worker does not retry an ambiguous GitHub start POST");
 }
 
 async function testQuotaBlockIncludesSurvivalFields() {
@@ -931,271 +953,29 @@ async function testHistoryWorksWithoutGithubToken() {
   console.log("PASS: Worker history works with valid wake secret even when GitHub token is missing");
 }
 
-async function testScheduledQuotaCronIsDisabledAndThrottledBeforeReset() {
-  const kv = makeKv();
-  await kv.put("quota-incident:behavior-space", JSON.stringify({
-    quota_drought_active: true,
-    quota_reset_estimate_utc: "2026-07-01T00:00:00Z"
-  }));
-  let statusCalls = 0;
-  let startCalls = 0;
-  globalThis.fetch = async (input) => {
-    const url = String(input);
-    if (url.includes("/start")) {
-      startCalls += 1;
-      return new Response(JSON.stringify({ message: "should not start before reset window" }), {
-        status: 500,
-        headers: { "content-type": "application/json" }
-      });
-    }
-    if (url.includes("api.github.com")) {
-      statusCalls += 1;
-      return new Response(JSON.stringify({
-        name: "behavior-space",
-        state: "Shutdown",
-        pending_operation: false,
-        retention_period_minutes: 43200,
-        retention_expires_at: "2026-06-25T00:00:00Z"
-      }), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      });
-    }
-    throw new Error(`unexpected fetch ${url}`);
-  };
-
-  const disabledPromises = [];
-  await worker.scheduled(
-    { scheduledTime: Date.parse("2026-06-15T00:00:00Z") },
-    baseEnv({ WAKER_KV: kv }),
-    { waitUntil(promise) { disabledPromises.push(promise); } }
-  );
-  assert.equal(disabledPromises.length, 0);
-  assert.equal(statusCalls, 0);
-
-  const env = baseEnv({
-    WAKER_KV: kv,
-    QUOTA_SURVIVAL_CRON_ENABLED: "true",
-    TEST_NOW_UTC: "2026-06-15T00:00:00Z"
-  });
-  const waitUntilPromises = [];
-  await worker.scheduled(
-    { scheduledTime: Date.parse("2026-06-15T00:00:00Z") },
-    env,
-    { waitUntil(promise) { waitUntilPromises.push(promise); } }
-  );
-  await Promise.all(waitUntilPromises);
-  await worker.scheduled(
-    { scheduledTime: Date.parse("2026-06-15T01:00:00Z") },
-    env,
-    { waitUntil(promise) { waitUntilPromises.push(promise); } }
-  );
-  await Promise.all(waitUntilPromises);
-  assert.equal(statusCalls, 1);
-  assert.equal(startCalls, 0);
-  const incident = JSON.parse(await kv.get("quota-incident:behavior-space"));
-  assert.equal(incident.quota_drought_active, true);
-  assert.equal(incident.last_successful_health_at, "2026-06-15T00:00:00.000Z");
-  assert.equal(kv.writesFor("quota-incident:behavior-space"), 2, "cron must write the incident once after its initial seed");
-  assert.equal(incident.last_cron_check_at, "2026-06-15T00:00:00.000Z");
-  console.log("PASS: Worker scheduled quota survival cron is disabled by default and throttled before reset");
-}
-
-async function testScheduledQuotaCronAttemptsOneNearResetWake() {
-  const kv = makeKv();
-  await kv.put("quota-incident:behavior-space", JSON.stringify({
-    quota_drought_active: true,
-    quota_reset_estimate_utc: "2026-07-01T00:00:00Z"
-  }));
-  let startCalls = 0;
-  let statusCalls = 0;
-  globalThis.fetch = async (input) => {
-    const url = String(input);
-    if (url.includes("/start")) {
-      startCalls += 1;
-      return new Response(JSON.stringify({ message: "Payment required" }), {
-        status: 402,
-        headers: { "content-type": "application/json" }
-      });
-    }
-    if (url.includes("api.github.com")) {
-      statusCalls += 1;
-      return new Response(JSON.stringify({
-        name: "behavior-space",
-        state: "Shutdown",
-        pending_operation: false,
-        retention_period_minutes: 43200,
-        retention_expires_at: "2026-07-20T00:00:00Z"
-      }), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      });
-    }
-    throw new Error(`unexpected fetch ${url}`);
-  };
-
-  const env = baseEnv({
-    WAKER_KV: kv,
-    QUOTA_SURVIVAL_CRON_ENABLED: "true",
-    TEST_NOW_UTC: "2026-06-30T19:00:00Z"
-  });
-  let waitUntilPromises = [];
-  await worker.scheduled(
-    { scheduledTime: Date.parse("2026-06-30T19:00:00Z") },
-    env,
-    { waitUntil(promise) { waitUntilPromises.push(promise); } }
-  );
-  await Promise.all(waitUntilPromises);
-
-  env.TEST_NOW_UTC = "2026-06-30T20:00:00Z";
-  waitUntilPromises = [];
-  await worker.scheduled(
-    { scheduledTime: Date.parse("2026-06-30T20:00:00Z") },
-    env,
-    { waitUntil(promise) { waitUntilPromises.push(promise); } }
-  );
-  await Promise.all(waitUntilPromises);
-
-  assert.equal(startCalls, 1);
-  assert.equal(statusCalls, 1);
-  const incident = JSON.parse(await kv.get("quota-incident:behavior-space"));
-  assert.equal(incident.quota_drought_active, true);
-  assert.equal(incident.last_cron_wake_reset_estimate_utc, "2026-07-01T00:00:00Z");
-  console.log("PASS: Worker scheduled quota survival cron attempts only one near-reset wake");
-}
-
-async function testScheduledQuotaCronRetriesAfterResetIfPreResetWakeStillBlocked() {
-  const kv = makeKv();
-  await kv.put("quota-incident:behavior-space", JSON.stringify({
-    quota_drought_active: true,
-    quota_reset_estimate_utc: "2026-07-01T00:00:00Z"
-  }));
-  let startCalls = 0;
-  let routeCalls = 0;
-  let afterReset = false;
-  globalThis.fetch = async (input) => {
-    const url = String(input);
-    if (url.includes("/start")) {
-      startCalls += 1;
-      if (!afterReset) {
-        return new Response(JSON.stringify({ message: "Payment required" }), {
-          status: 402,
-          headers: { "content-type": "application/json" }
-        });
+async function testScheduledEventsNeverReviveWorkspaces() {
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error("A retired Cron reached GitHub"); };
+  try {
+    for (const enabled of [undefined, "true", "1", "yes", "false"]) {
+      for (const scheduledTime of ["2026-06-15T00:00:00Z", "2026-06-30T23:00:00Z", "2026-07-01T00:00:00Z"]) {
+        let operations = 0;
+        const kv = {
+          async get() { operations += 1; return JSON.stringify({ quota_drought_active: true, quota_reset_estimate_utc: "2026-07-01T00:00:00Z" }); },
+          async put() { operations += 1; }
+        };
+        const queued = [];
+        await worker.scheduled({ scheduledTime: Date.parse(scheduledTime) }, baseEnv({
+          WAKER_KV: kv, QUOTA_SURVIVAL_CRON_ENABLED: enabled
+        }), { waitUntil(task) { queued.push(task); } });
+        assert.equal(operations, 0);
+        assert.equal(queued.length, 0);
       }
-      return new Response(JSON.stringify({ state: "Available" }), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      });
     }
-    if (url.includes("api.github.com")) {
-      return new Response(JSON.stringify({
-        name: "behavior-space",
-        state: afterReset ? "Available" : "Shutdown",
-        pending_operation: false,
-        retention_period_minutes: 43200,
-        retention_expires_at: "2026-07-20T00:00:00Z"
-      }), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      });
-    }
-    if (url.includes("app.github.dev")) {
-      routeCalls += 1;
-      return new Response("", { status: 200 });
-    }
-    throw new Error(`unexpected fetch ${url}`);
-  };
-
-  const env = baseEnv({
-    WAKER_KV: kv,
-    QUOTA_SURVIVAL_CRON_ENABLED: "true",
-    ROUTE_READY_STABLE_SLEEP_MS: "0",
-    TEST_NOW_UTC: "2026-06-30T19:00:00Z"
-  });
-  let waitUntilPromises = [];
-  await worker.scheduled(
-    { scheduledTime: Date.parse("2026-06-30T19:00:00Z") },
-    env,
-    { waitUntil(promise) { waitUntilPromises.push(promise); } }
-  );
-  await Promise.all(waitUntilPromises);
-
-  afterReset = true;
-  env.TEST_NOW_UTC = "2026-07-01T00:05:00Z";
-  waitUntilPromises = [];
-  await worker.scheduled(
-    { scheduledTime: Date.parse("2026-07-01T00:05:00Z") },
-    env,
-    { waitUntil(promise) { waitUntilPromises.push(promise); } }
-  );
-  await Promise.all(waitUntilPromises);
-
-  assert.equal(startCalls, 2);
-  assert.equal(routeCalls, 0);
-  const incident = JSON.parse(await kv.get("quota-incident:behavior-space"));
-  assert.equal(incident.quota_drought_active, false);
-  assert.equal(incident.last_successful_start_at, "2026-07-01T00:05:00.000Z");
-  console.log("PASS: Worker quota cron retries after reset if a pre-reset wake was still quota-blocked");
-}
-
-async function testScheduledQuotaCronKeepsRetryingAfterResetWhileStillBlocked() {
-  const kv = makeKv();
-  await kv.put("quota-incident:behavior-space", JSON.stringify({
-    quota_drought_active: true,
-    quota_reset_estimate_utc: "2026-07-01T00:00:00Z"
-  }));
-  let startCalls = 0;
-  globalThis.fetch = async (input) => {
-    const url = String(input);
-    if (url.includes("/start")) {
-      startCalls += 1;
-      return new Response(JSON.stringify({ message: "Payment required" }), {
-        status: 402,
-        headers: { "content-type": "application/json" }
-      });
-    }
-    if (url.includes("api.github.com")) {
-      return new Response(JSON.stringify({
-        name: "behavior-space",
-        state: "Shutdown",
-        pending_operation: false,
-        retention_period_minutes: 43200,
-        retention_expires_at: "2026-07-20T00:00:00Z"
-      }), {
-        status: 200,
-        headers: { "content-type": "application/json" }
-      });
-    }
-    throw new Error(`unexpected fetch ${url}`);
-  };
-
-  const env = baseEnv({
-    WAKER_KV: kv,
-    QUOTA_SURVIVAL_CRON_ENABLED: "true",
-    TEST_NOW_UTC: "2026-06-30T19:00:00Z"
-  });
-  for (const iso of [
-    "2026-06-30T19:00:00Z",
-    "2026-07-01T00:05:00Z",
-    "2026-07-01T01:10:00Z"
-  ]) {
-    env.TEST_NOW_UTC = iso;
-    const waitUntilPromises = [];
-    await worker.scheduled(
-      { scheduledTime: Date.parse(iso) },
-      env,
-      { waitUntil(promise) { waitUntilPromises.push(promise); } }
-    );
-    await Promise.all(waitUntilPromises);
+    console.log("PASS: Worker scheduled events never read quota storage or revive a workspace, including legacy Cron settings");
+  } finally {
+    globalThis.fetch = previousFetch;
   }
-
-  assert.equal(startCalls, 3);
-  const incident = JSON.parse(await kv.get("quota-incident:behavior-space"));
-  assert.equal(incident.quota_drought_active, true);
-  assert.equal(incident.quota_reset_estimate_utc, "2026-07-01T00:00:00Z");
-  assert.equal(incident.last_cron_post_reset_wake_reset_estimate_utc, "2026-07-01T00:00:00Z");
-  console.log("PASS: Worker quota cron keeps retrying after reset while still blocked");
 }
 
 async function testWakeFailureIncludesNextAction() {
@@ -1332,9 +1112,66 @@ async function testWakeRequiresStableRouteReadiness() {
   const body = await responseJson(response);
   assert.equal(response.status, 200);
   assert.equal(body.route_ready, true);
-  assert.equal(body.route_probe.attempts, 3);
+  assert.equal(body.route_probe.attempts, 4);
+  assert.equal(routeCalls, 4);
   assert.equal(body.route_probe.stable_probes, 2);
   console.log("PASS: Worker rejects transient single route success");
+}
+
+async function testRouteDeadlineNeverShortensRequiredStabilityWindow() {
+  const originalNow = Date.now;
+  const originalSetTimeout = globalThis.setTimeout;
+  const previousFetch = globalThis.fetch;
+  for (const path of ["/api/health", "/api/wake"]) {
+    let now = originalNow();
+    let routeCalls = 0;
+    const shortenedSleeps = [];
+    Date.now = () => now;
+    // A timer may fire just before its requested wall-clock boundary. The
+    // remaining ten milliseconds must not replace the required 25 ms gap.
+    globalThis.setTimeout = (callback, ms, ...args) => {
+      if (ms > 0 && ms < 25) {
+        shortenedSleeps.push(ms);
+        now += ms - 1;
+        return originalSetTimeout(callback, 0, ...args);
+      }
+      return originalSetTimeout(callback, ms, ...args);
+    };
+    globalThis.fetch = async (input) => {
+      const url = String(input);
+      if (url.includes("api.github.com")) {
+        assert.equal(url.includes("/start"), false, "A warm host must not be started again");
+        return new Response(JSON.stringify({ name: "behavior-space", state: "Available", pending_operation: false }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        });
+      }
+      if (url.includes("app.github.dev")) {
+        routeCalls += 1;
+        if (routeCalls === 1) now += 40;
+        return new Response("", { status: 200 });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    };
+    try {
+      const response = await worker.fetch(makeRequest(path), baseEnv({
+        ROUTE_WAIT_MS: "50", ROUTE_READY_STABLE_SLEEP_MS: "25"
+      }), {});
+      const body = await responseJson(response);
+      assert.equal(response.status, path === "/api/wake" ? 202 : 200);
+      assert.equal(body.route_ready, false);
+      assert.equal(body.route_probe.usable, true);
+      assert.equal(body.route_probe.stable_probes, 1);
+      assert.equal(body.route_probe.route_failure_reason, "route_stability_not_confirmed");
+      assert.equal(routeCalls, 1);
+      assert.deepEqual(shortenedSleeps, []);
+      console.log(`PASS: Worker ${path} never shortens the required route-stability gap near its deadline`);
+    } finally {
+      Date.now = originalNow;
+      globalThis.setTimeout = originalSetTimeout;
+      globalThis.fetch = previousFetch;
+    }
+  }
 }
 
 async function testHealthWaitsBetweenStableRouteProbes() {
@@ -1694,7 +1531,9 @@ async function testWakeQueuesNotificationsWithWaitUntil() {
   assert.deepEqual(body.notification_errors, []);
   assert.equal(waitUntilPromises.length, 1);
   await Promise.all(waitUntilPromises);
-  assert.equal(routeCalls >= 2, true);
+  assert.equal(routeCalls, 2);
+  assert.equal(body.route_probe.attempts, 2);
+  assert.equal(body.route_probe.fast_path_precheck_attempts, 1);
   assert.equal(notificationCalls, 1);
   console.log("PASS: Worker queues notifications with waitUntil");
 }
@@ -2209,6 +2048,106 @@ async function testWakeSkipsGithubStartWhenCodespaceIsAvailableButRouteSettling(
   console.log("PASS: Worker wake does not restart an available Codespace just because its route is settling");
 }
 
+async function testWarmWakeReusesOnlyMatchingPortProbes() {
+  for (const primaryStatus of [200, 404]) {
+    const calls = [];
+    globalThis.fetch = async (input, init = {}) => {
+      const url = String(input);
+      if (url.includes("api.github.com")) {
+        assert.notEqual(init.method, "POST", "warm Codespace must not receive a start request");
+        return new Response(JSON.stringify({ name: "behavior-space", state: "Available" }), {
+          status: 200, headers: { "content-type": "application/json" }
+        });
+      }
+      calls.push({ url, at: Date.now() });
+      return new Response("", { status: url.includes("-443.") ? primaryStatus : 200 });
+    };
+    const kv = makeKv();
+    await kv.put("codespace-registry:v1", JSON.stringify({
+      default_codespace_id: "main",
+      codespaces: [{ id: "main", name: "behavior-space", token_binding: "GITHUB_TOKEN", route_ports: [443, 8443] }]
+    }));
+    const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({
+      WAKER_KV: kv,
+      ROUTE_READY_STABLE_SLEEP_MS: "25"
+    }), {});
+    const body = await responseJson(response);
+    const primaryCalls = calls.filter((call) => call.url.includes("-443."));
+    const optionalCalls = calls.filter((call) => call.url.includes("-8443."));
+    assert.equal(body.route_ready, primaryStatus === 200);
+    assert.equal(body.route_probe.port, 443);
+    assert.equal(primaryCalls.length, primaryStatus === 200 ? 2 : 1);
+    assert.equal(optionalCalls.length, 1);
+    if (primaryStatus === 200) {
+      assert.equal(body.route_probe.stable_probes, 2);
+      assert.equal(primaryCalls[1].at - primaryCalls[0].at >= 20, true);
+    } else {
+      assert.equal(body.route_probe.http_status, 404);
+      assert.equal(body.preferred_route_port, 8443);
+    }
+  }
+  console.log("PASS: warm wake reuses same-port probes without borrowing optional-port readiness");
+}
+
+async function testWarmWakeCannotConfirmStabilityPastDeadline() {
+  let routeCalls = 0;
+  globalThis.fetch = async (input) => {
+    if (String(input).includes("api.github.com")) {
+      return new Response(JSON.stringify({ name: "behavior-space", state: "Available" }), {
+        status: 200, headers: { "content-type": "application/json" }
+      });
+    }
+    routeCalls += 1;
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    return new Response("", { status: 200 });
+  };
+  const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({
+    ROUTE_WAIT_MS: "5", ROUTE_READY_STABLE_SLEEP_MS: "25"
+  }), {});
+  const body = await responseJson(response);
+  assert.equal(response.status, 202);
+  assert.equal(body.route_ready, false);
+  assert.equal(body.route_probe.stable_probes, 1);
+  assert.equal(body.route_probe.route_failure_reason, "route_stability_not_confirmed");
+  assert.equal(routeCalls, 1);
+  console.log("PASS: warm precheck cannot claim stable readiness after the route deadline");
+}
+
+async function testWarmOptionalProbeCannotConsumePrimaryStabilityDeadline() {
+  let primaryCalls = 0;
+  let optionalCalls = 0;
+  globalThis.fetch = async (input) => {
+    const url = String(input);
+    if (url.includes("api.github.com")) {
+      return new Response(JSON.stringify({ name: "behavior-space", state: "Available" }), {
+        status: 200, headers: { "content-type": "application/json" }
+      });
+    }
+    if (url.includes("-8443.")) {
+      optionalCalls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    } else {
+      primaryCalls += 1;
+    }
+    return new Response("", { status: 200 });
+  };
+  const kv = makeKv();
+  await kv.put("codespace-registry:v1", JSON.stringify({
+    default_codespace_id: "main",
+    codespaces: [{ id: "main", name: "behavior-space", token_binding: "GITHUB_TOKEN", route_ports: [443, 8443] }]
+  }));
+  const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({
+    WAKER_KV: kv, ROUTE_WAIT_MS: "150", ROUTE_READY_STABLE_SLEEP_MS: "1", ROUTE_FETCH_TIMEOUT_MS: "1000"
+  }), {});
+  const body = await responseJson(response);
+  assert.equal(body.route_ready, true, "optional diagnostic delay consumed the primary route's confirmation deadline");
+  assert.equal(body.route_probe.port, 443);
+  assert.equal(body.route_probe.stable_probes, 2);
+  assert.equal(primaryCalls, 2);
+  assert.equal(optionalCalls, 1);
+  console.log("PASS: slow optional warm diagnostics cannot consume the primary stability deadline");
+}
+
 async function testSimpleDashboardSetupAcceptsRealCodespaceName() {
   const authorizations = [];
   globalThis.fetch = async (input, init = {}) => {
@@ -2291,6 +2230,24 @@ async function testDashboardVariablesSupportMultipleCodespacesWithoutKv() {
   assert.equal(health.codespace_id, "standby-space");
   assert.deepEqual(authorizations, ["Bearer standby-token"]);
   console.log("PASS: Worker dashboard variables support multiple Codespaces without KV");
+}
+
+async function testMissingSecondaryTokenNeverBorrowsThePrimaryToken() {
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    throw new Error("A missing slot token must be rejected before contacting GitHub");
+  };
+  const env = baseEnv({ CODESPACE_2_NAME: "standby-space" });
+  for (const path of ["/api/health?route=false", "/api/wake"]) {
+    const response = await worker.fetch(makeRequest(path, "secret", { codespace_id: "standby-space" }), env, {});
+    const body = await responseJson(response);
+    assert.equal(response.status, 500);
+    assert.equal(body.error, "missing_github_token_binding");
+    assert.equal(body.codespace_id, "standby-space");
+    assert.equal(calls, 0);
+  }
+  console.log("PASS: missing secondary Worker token never falls back to primary credentials");
 }
 
 async function testWorkerRegistrySelectsBoundTokenAndReturnsSafeDirectory() {
@@ -2461,6 +2418,7 @@ async function testStalledOptionalHistoryCannotHoldAHealthyResponse() {
 }
 
 try {
+  await testExistingWakeConfigurationRemainsCompatible();
   await testExplicitRegistryIdWinsOverAnotherNodesName();
   await testOverlappingGithubLimitsRespectTheLaterReset();
   await testStalledKvRegistryCannotSelectAnotherCodespace();
@@ -2485,7 +2443,7 @@ try {
   await testHealthSkipRoutePreservesGithubFailureGuidance();
   await testAuthorizedWakeCooldownIsOptional();
   await testGithubHttp429Classification();
-  await testGithubStartRetriesTransientServerFailure();
+  await testGithubStartDoesNotRetryAmbiguousServerFailure();
   await testQuotaBlockIncludesSurvivalFields();
   await testRetentionMissingFieldsAreUnknown();
   await testMonthlyResetEstimateCrossesYear();
@@ -2494,14 +2452,12 @@ try {
   await testQuotaIncidentRouteReadyHealthBeforeResetDoesNotClearDrought();
   await testRepeatedHealthDoesNotRewriteUnchangedQuotaIncident();
   await testHistoryWorksWithoutGithubToken();
-  await testScheduledQuotaCronIsDisabledAndThrottledBeforeReset();
-  await testScheduledQuotaCronAttemptsOneNearResetWake();
-  await testScheduledQuotaCronRetriesAfterResetIfPreResetWakeStillBlocked();
-  await testScheduledQuotaCronKeepsRetryingAfterResetWhileStillBlocked();
+  await testScheduledEventsNeverReviveWorkspaces();
   await testWakeFailureIncludesNextAction();
   await testHealthRejectsHttp400RouteAsUnusable();
   await testOptionalPortCannotMasqueradeAsPrimaryXhttpReadiness();
   await testWakeRequiresStableRouteReadiness();
+  await testRouteDeadlineNeverShortensRequiredStabilityWindow();
   await testHealthWaitsBetweenStableRouteProbes();
   await testRouteFetchTimeoutOverrideIsApplied();
   await testHealthDoesNotClaimReadyFromSingleDeadlineProbe();
@@ -2522,8 +2478,12 @@ try {
   await testHealthRouteUrlUsesForwardingDomainOverride();
   await testWakeSkipsGithubStartWhenAlreadyAvailableAndRouteReady();
   await testWakeSkipsGithubStartWhenCodespaceIsAvailableButRouteSettling();
+  await testWarmWakeReusesOnlyMatchingPortProbes();
+  await testWarmWakeCannotConfirmStabilityPastDeadline();
+  await testWarmOptionalProbeCannotConsumePrimaryStabilityDeadline();
   await testSimpleDashboardSetupAcceptsRealCodespaceName();
   await testDashboardVariablesSupportMultipleCodespacesWithoutKv();
+  await testMissingSecondaryTokenNeverBorrowsThePrimaryToken();
   await testWorkerRegistrySelectsBoundTokenAndReturnsSafeDirectory();
   await testRegistryAcceptsPrimaryGithubTokenBinding();
 } finally {

@@ -12,7 +12,6 @@ const ROUTE_FETCH_TIMEOUT_MS = 4000;
 const HISTORY_KEY_PREFIX = "history:";
 const QUOTA_INCIDENT_KEY_PREFIX = "quota-incident:";
 const CODESPACE_REGISTRY_KEY = "codespace-registry:v1";
-const QUOTA_CRON_CURSOR_KEY = "quota-cron-cursor:v1";
 const MAX_REGISTERED_CODESPACES = 20;
 const MAX_DASHBOARD_CODESPACES = 10;
 const HISTORY_LIMIT = 50;
@@ -22,23 +21,15 @@ const SUCCESSFUL_WAKE_KEY_PREFIX = "successful-wake:";
 const FAILED_AUTH_WINDOW_SECONDS = 600;
 const FAILED_AUTH_MAX_ATTEMPTS = 10;
 const DEFAULT_ROUTE_POLL_AFTER_SECONDS = 5;
-const QUOTA_CRON_DAILY_INTERVAL_MS = 23 * 60 * 60 * 1000;
-const QUOTA_CRON_NEAR_RESET_INTERVAL_MS = 60 * 60 * 1000;
-const QUOTA_CRON_NEAR_RESET_WINDOW_MS = 6 * 60 * 60 * 1000;
 
 export default {
   async fetch(request, env, ctx) {
     return observedFetch(request, env, ctx);
   },
 
-  async scheduled(controller, env, ctx) {
-    if (!quotaSurvivalCronEnabled(env)) return;
-    const task = handleQuotaSurvivalCron(controller, env);
-    if (ctx && typeof ctx.waitUntil === "function") {
-      ctx.waitUntil(task);
-    } else {
-      await task;
-    }
+  async scheduled() {
+    // Old dashboard Cron Triggers must not revive quota-blocked workspaces.
+    return;
   }
 };
 
@@ -172,17 +163,12 @@ function wakeFastPathEnabled(env = {}) {
 async function alreadyWarmCodespaceData(name, token, env, routePorts = [codespacePort(env)]) {
   const status = await getCodespaceStatus(name, token, env);
   if (!isCodespaceAvailable(status)) return { status, data: null };
-  const firstRouteData = await probeCodespaceRoutes(name, routePorts, env, { stable: false });
-
   // A GitHub start call cannot repair a Codespace that is already Available.
   // Keep that distinction honest: report the existing edge state and let the
   // caller poll rather than issuing a needless /start request.
-  const routeData = firstRouteData.route_probes.some((probe) => probe.usable)
-    ? await probeCodespaceRoutes(name, routePorts, env)
-    : firstRouteData;
-  // Keep the fast-path check visible without folding a probe from one port
-  // into another port's attempt count. `attempts` belongs to the reported
-  // route probe; the precheck is a separate diagnostic field.
+  const routeData = await probeCodespaceRoutes(name, routePorts, env, { warm: true });
+  // The primary precheck is attempt one, not a third redundant request.
+  // An optional port can never seed the primary route's stability check.
   routeData.route_probe.fast_path_precheck_attempts = 1;
   const routeReady = routeData.route_ready;
 
@@ -1451,111 +1437,6 @@ function quotaIncidentKey(codespace) {
   return QUOTA_INCIDENT_KEY_PREFIX + encodeURIComponent(suffix);
 }
 
-function quotaSurvivalCronEnabled(env) {
-  const value = String(env && env.QUOTA_SURVIVAL_CRON_ENABLED || "").trim().toLowerCase();
-  return value === "1" || value === "true" || value === "yes";
-}
-
-async function handleQuotaSurvivalCron(controller, env) {
-  const now = currentDate(env, controller && controller.scheduledTime);
-  if (!env.WAKER_KV) return { ok: false, skipped: "missing_kv" };
-  const registry = await readCodespaceRegistry(env);
-  const selected = await selectDueQuotaCronCodespace(env, registry, now);
-  if (!selected) return { ok: true, skipped: "no_due_quota_drought" };
-
-  const { entry, incident } = selected;
-  const codespaceName = entry.name;
-
-  const nearReset = quotaCronNearReset(incident, now);
-  if (nearReset && !quotaCronWakeAllowed(incident, now)) {
-    if (resultNeedsCronStamp(incident, now)) {
-      incident.last_cron_check_at = now.toISOString();
-      await withKvDeadline(() => env.WAKER_KV.put(quotaIncidentKey(codespaceName), JSON.stringify(incident)));
-    }
-    return { ok: true, skipped: "quota_cron_near_reset_wake_already_attempted" };
-  }
-  const data = withSurvivalFields(
-    nearReset
-      ? await startCodespaceData(codespaceName, String(env[entry.tokenBinding] || ""), env, null, entry.routePorts)
-      : await getCodespaceStatus(codespaceName, String(env[entry.tokenBinding] || ""), env),
-    env
-  );
-  addCodespaceIdentity(data, { codespaceId: entry.id, codespaceLabel: entry.label });
-  const event = eventFromResult(nearReset ? "cron_wake" : "cron_health", codespaceName, data);
-  await recordHistory(env, {
-    ...event,
-    history_recorded_at: now.toISOString()
-  });
-  const cronFields = { last_cron_check_at: now.toISOString() };
-  if (nearReset) {
-    if (quotaCronPostReset(incident, now)) {
-      cronFields.last_cron_post_reset_wake_at = now.toISOString();
-      cronFields.last_cron_post_reset_wake_reset_estimate_utc = incident.quota_reset_estimate_utc || null;
-    } else {
-      cronFields.last_cron_wake_at = now.toISOString();
-      cronFields.last_cron_wake_reset_estimate_utc = incident.quota_reset_estimate_utc || null;
-    }
-  }
-  // Persist the observation and scheduler stamps together: one write per key,
-  // also avoiding KV's one-write-per-second same-key limit.
-  await recordQuotaIncident(env, event, data, cronFields);
-  return { ok: true, near_reset: nearReset, quota_blocked: data.quota_blocked === true };
-}
-
-async function selectDueQuotaCronCodespace(env, registry, now) {
-  const entries = registry.entries.filter((entry) => entry.enabled && String(env[entry.tokenBinding] || "").trim());
-  if (!entries.length) return null;
-  let cursor = 0;
-  try {
-    cursor = Number.parseInt(await withKvDeadline(() => env.WAKER_KV.get(QUOTA_CRON_CURSOR_KEY)) || "0", 10) || 0;
-  } catch {}
-
-  for (let offset = 0; offset < entries.length; offset += 1) {
-    const index = (cursor + offset) % entries.length;
-    const entry = entries[index];
-    const incident = await readQuotaIncident(env, entry.name);
-    if (!incident || incident.quota_drought_active !== true || !quotaCronCheckAllowed(incident, now)) continue;
-    try {
-      await withKvDeadline(() => env.WAKER_KV.put(QUOTA_CRON_CURSOR_KEY, String((index + 1) % entries.length)));
-    } catch {}
-    return { entry, incident };
-  }
-  return null;
-}
-
-function quotaCronCheckAllowed(incident, now) {
-  const last = Date.parse(incident.last_cron_check_at || "");
-  if (!Number.isFinite(last)) return true;
-  const interval = quotaCronNearReset(incident, now)
-    ? QUOTA_CRON_NEAR_RESET_INTERVAL_MS
-    : QUOTA_CRON_DAILY_INTERVAL_MS;
-  return now.getTime() - last >= interval;
-}
-
-function quotaCronNearReset(incident, now) {
-  const reset = Date.parse(incident.quota_reset_estimate_utc || "");
-  if (!Number.isFinite(reset)) return false;
-  return now.getTime() >= reset - QUOTA_CRON_NEAR_RESET_WINDOW_MS;
-}
-
-function quotaCronPostReset(incident, now) {
-  const reset = Date.parse(incident.quota_reset_estimate_utc || "");
-  return Number.isFinite(reset) && now.getTime() >= reset;
-}
-
-function quotaCronWakeAllowed(incident, now) {
-  const resetEstimate = incident.quota_reset_estimate_utc || null;
-  if (quotaCronPostReset(incident, now)) {
-    return true;
-  }
-  return incident.last_cron_wake_reset_estimate_utc !== resetEstimate;
-}
-
-function resultNeedsCronStamp(incident, now) {
-  const last = Date.parse(incident.last_cron_check_at || "");
-  return !Number.isFinite(last) || now.getTime() - last >= QUOTA_CRON_NEAR_RESET_INTERVAL_MS;
-}
-
 async function sendNotifications(env, event) {
   if (!shouldNotify(event)) return [];
   if (!hasNotificationChannels(env)) return [];
@@ -1724,11 +1605,21 @@ function configuredCooldownSeconds(env, name, fallback, max) {
 async function probeCodespaceRoutes(name, routePorts, env, options = {}) {
   const ports = normalizeRoutePorts(routePorts);
   const probes = await Promise.all(ports.map(async (port, index) => {
+    const startedAt = Date.now();
     // Only the primary XHTTP route gates readiness. An optional WS endpoint
     // cannot pass OPTIONS, so do not spend a full settling loop on it.
-    const probe = options.stable === false || index > 0
-      ? await probeXhttpRoute(name, port, 1, Date.now(), env)
-      : await waitForXhttpRoute(name, port, env);
+    let probe;
+    if (index > 0) {
+      probe = await probeXhttpRoute(name, port, 1, startedAt, env);
+    } else if (options.warm === true) {
+      const firstProbe = await probeXhttpRoute(name, port, 1, startedAt, env);
+      // Confirm concurrently with optional diagnostics, on this port's budget.
+      probe = firstProbe.usable
+        ? await waitForXhttpRoute(name, port, env, firstProbe, startedAt)
+        : firstProbe;
+    } else {
+      probe = await waitForXhttpRoute(name, port, env);
+    }
     return { ...probe, port };
   }));
   const primary = probes.find((probe) => probe.port === ports[0]) || probes[0];
@@ -1748,8 +1639,7 @@ async function probeCodespaceRoutes(name, routePorts, env, options = {}) {
   };
 }
 
-async function waitForXhttpRoute(name, port, env) {
-  const startedAt = Date.now();
+async function waitForXhttpRoute(name, port, env, initialProbe = null, startedAt = Date.now()) {
   const routeWaitMs = configuredMs(env, "ROUTE_WAIT_MS", ROUTE_WAIT_MS, 1, 300000);
   const pollIntervalMs = configuredMs(env, "ROUTE_POLL_INTERVAL_MS", ROUTE_POLL_INTERVAL_MS, 1, 60000);
   const stableSleepMs = configuredMs(env, "ROUTE_READY_STABLE_SLEEP_MS", ROUTE_READY_STABLE_SLEEP_MS, 0, 10000);
@@ -1769,14 +1659,17 @@ async function waitForXhttpRoute(name, port, env) {
 
   while (attempts === 0 || Date.now() < deadline) {
     attempts += 1;
-    last = await probeXhttpRoute(name, port, attempts, startedAt, env);
+    last = initialProbe
+      ? { ...initialProbe, attempts, waited_ms: Date.now() - startedAt }
+      : await probeXhttpRoute(name, port, attempts, startedAt, env);
+    initialProbe = null;
     if (last.usable) {
       stableProbes += 1;
       last.stable_probes = stableProbes;
       if (stableProbes >= ROUTE_READY_STABLE_PROBES) return last;
       if (stableSleepMs > 0) {
-        const delay = Math.min(stableSleepMs, Math.max(0, deadline - Date.now()));
-        if (delay > 0) await sleep(delay);
+        if (Date.now() + stableSleepMs >= deadline) break;
+        await sleep(stableSleepMs);
       }
       continue;
     }
@@ -1849,7 +1742,12 @@ async function fetchWithTimeout(input, init = {}, timeoutMs = FETCH_TIMEOUT_MS, 
 }
 
 async function githubFetchWithRetry(input, init = {}, timeoutMs = FETCH_TIMEOUT_MS, env = {}) {
-  const attempts = configuredNumber(env, "GITHUB_API_RETRY_ATTEMPTS", 2, 1, 4);
+  // A failed POST can still have started the Codespace. Only retry reads here;
+  // callers can reconcile an uncertain start using the status endpoint.
+  const method = String(init.method || "GET").toUpperCase();
+  const attempts = method === "GET" || method === "HEAD"
+    ? configuredNumber(env, "GITHUB_API_RETRY_ATTEMPTS", 2, 1, 4)
+    : 1;
   let lastError = null;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {

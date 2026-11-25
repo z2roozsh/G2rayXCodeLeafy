@@ -84,14 +84,15 @@ object VlessUriParser {
         if (input.length > MAX_IMPORT_INPUT_CHARS) {
             return Result.failure(IllegalArgumentException("Config import text is too large"))
         }
-        val candidates = extractVlessLines(input)
+        val source = runCatching { ConfigImportPayload.profileText(input) }.getOrElse { return Result.failure(it) }
+        val candidates = extractVlessLines(source)
 
         for (candidate in candidates) {
             val result = parse(candidate)
             if (result.isSuccess) return result
         }
 
-        val decoded = tryDecodeBase64Subscription(input)
+        val decoded = tryDecodeBase64Subscription(source)
         if (decoded != null) {
             for (candidate in extractVlessLines(decoded)) {
                 val result = parse(candidate)
@@ -106,9 +107,11 @@ object VlessUriParser {
         if (input.length > MAX_IMPORT_INPUT_CHARS) {
             return listOf(Result.failure(IllegalArgumentException("Config import text is too large")))
         }
-        var candidates = extractVlessLines(input, MAX_PROFILE_CANDIDATES + 1)
+        val source = runCatching { ConfigImportPayload.profileText(input) }
+            .getOrElse { return listOf(Result.failure(it)) }
+        var candidates = extractVlessLines(source, MAX_PROFILE_CANDIDATES + 1)
         if (candidates.isEmpty()) {
-            val decoded = tryDecodeBase64Subscription(input)
+            val decoded = tryDecodeBase64Subscription(source)
             if (decoded != null) {
                 candidates = extractVlessLines(decoded, MAX_PROFILE_CANDIDATES + 1)
             }

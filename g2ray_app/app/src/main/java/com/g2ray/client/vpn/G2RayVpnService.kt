@@ -53,10 +53,14 @@ import com.g2ray.client.network.WorkerRouteCoordinator
 import com.g2ray.client.network.awaitWakeRetryDelay
 import com.g2ray.client.network.interruptibleDnsLookup
 import com.g2ray.client.parser.VlessUriParser
+import com.g2ray.client.parser.CodespaceProfileIdentity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.Job
@@ -68,6 +72,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.supervisorScope
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicLong
@@ -133,7 +138,9 @@ internal data class ActiveStallWindow(
 
 class G2RayVpnService : VpnService() {
 
+    @Volatile
     private var vpnInterface: ParcelFileDescriptor? = null
+    private var vpnInterfaceIpv4Only: Boolean? = null
     private val lifecycleGuard = TunnelLifecycleGuard()
     @Volatile
     private var activeLifecycleToken = 0L
@@ -146,6 +153,9 @@ class G2RayVpnService : VpnService() {
     private var pendingCleanupFinalState = TunnelState.Disconnected
     private var pendingCleanupFinalMessage = "Disconnected"
     private var pendingCleanupStopService = false
+    private var pendingCleanupRetainInterface = false
+    @Volatile
+    private var destroyed = false
     @Volatile
     private var clearRememberedProfileAfterCleanup = false
     private var trafficJob: Job? = null
@@ -234,9 +244,11 @@ class G2RayVpnService : VpnService() {
     private var ipv4Only = false
     private var dpiCompatibilityEnabled = false
     private var seamlessFailoverEnabled = true
+    private var routingPolicy = RoutingPolicy()
     private var activeEngine: ActiveVpnEngine? = null
     private var hevTunnelRunning = false
     private val sessionProfileHealth = mutableMapOf<String, SessionProfileHealth>()
+    private val nativeTrafficSource = AndroidUidTrafficByteSource()
 
     companion object {
         const val NOTIFICATION_ID = 101
@@ -244,6 +256,7 @@ class G2RayVpnService : VpnService() {
         const val ACTION_START = "com.g2ray.client.vpn.START"
         const val ACTION_STOP = "com.g2ray.client.vpn.STOP"
         const val ACTION_REVERIFY = "com.g2ray.client.vpn.REVERIFY"
+        const val ACTION_REFRESH_POLICY = "com.g2ray.client.vpn.REFRESH_POLICY"
         const val EXTRA_RAW_PROFILE_URI = "com.g2ray.client.extra.RAW_PROFILE_URI"
         const val EXTRA_ACCOUNT_ID = "com.g2ray.client.extra.ACCOUNT_ID"
         const val EXTRA_VPN_ENGINE_MODE = "com.g2ray.client.extra.VPN_ENGINE_MODE"
@@ -263,7 +276,17 @@ class G2RayVpnService : VpnService() {
         private const val ACTIVE_STALL_MIN_TX_BYTES = 32L * 1024L
         private const val ACTIVE_STALL_INTERACTIVE_MIN_TX_BYTES = 2L * 1024L
         private const val ACTIVE_STALL_INTERACTIVE_MIN_TX_PACKETS = 4L
+        private const val NATIVE_TRAFFIC_PROGRESS_GRACE_BYTES = 8L * 1024L
+        private const val NATIVE_STALL_MIN_TX_BYTES = 64L * 1024L
         private const val MAX_LIVE_ROUTE_PROFILES = 3
+        private const val OPTIONAL_ENDPOINT_DNS_GRACE_MS = 500L
+        private const val READY_PRIMARY_OPTIONAL_DNS_GRACE_MS = 50L
+        // A ready backup may win the first lookup race, but the user-selected
+        // endpoint gets a little longer to arrive before startup commits to a
+        // different route. This bounds cold-start delay without waiting for
+        // unrelated optional backups.
+        private const val PRIMARY_ENDPOINT_DNS_GRACE_MS = 1_000L
+        private const val FALLBACK_ENDPOINT_DNS_WAIT_MS = 10_000L
         // Chunked video commonly pauses its downlink for several seconds while
         // the local buffer drains. Ten seconds still catches a real request
         // stall promptly without probing healthy playback every chunk boundary.
@@ -511,6 +534,51 @@ class G2RayVpnService : VpnService() {
             }
         }
 
+        internal fun selectLiveRouteProfiles(
+            selected: G2RayProfile,
+            candidates: List<Pair<StoredG2RayProfile, G2RayProfile>>,
+            sessionHealth: Map<String, SessionProfileHealth>,
+            nowMs: Long,
+            networkKey: String?,
+            maxProfiles: Int = MAX_LIVE_ROUTE_PROFILES
+        ): List<G2RayProfile> {
+            val verifiedCandidates = candidates.mapNotNull { (stored, parsed) ->
+                val observed = sessionHealth[stored.rawUri]
+                val verified = observed?.lastAttemptSucceeded != false &&
+                    (observed?.lastAttemptSucceeded == true ||
+                        persistedRouteMeasurementFresh(stored, nowMs, networkKey = networkKey))
+                parsed.takeIf { verified }
+            }
+            val verifiedUris = verifiedCandidates.mapTo(hashSetOf()) { it.rawUri }
+            // The observer measures from the phone, which is the only vantage
+            // point that can rank edge IPs for this client. Fill unused bounded
+            // slots with eligible unmeasured IP or hostname profiles. Failures
+            // from another network or expired history must not blacklist them.
+            val exploratoryCandidates = candidates.asSequence()
+                .filter { (stored, parsed) ->
+                    parsed.rawUri !in verifiedUris &&
+                        isExplorableLiveEndpoint(parsed.address) &&
+                        sessionHealth[stored.rawUri]?.lastAttemptSucceeded != false &&
+                        !(persistedRouteHistoryFresh(stored, nowMs, networkKey) &&
+                            (stored.delayFailureCount > 0 || stored.lastDelayError != null))
+                }
+                .map { it.second }
+                .toList()
+            return selectSeamlessRouteProfiles(
+                selected,
+                verifiedCandidates + exploratoryCandidates,
+                maxProfiles
+            )
+        }
+
+        internal fun isExplorableLiveEndpoint(address: String): Boolean {
+            return VlessUriParser.isUsablePublicIpv4(address) ||
+                (!VlessUriParser.isIpv4Literal(address) &&
+                    !address.contains(':') &&
+                    address.isNotBlank() &&
+                    address.length <= 253)
+        }
+
         internal fun resolveRuntimeProfiles(
             profiles: List<G2RayProfile>,
             maxProfiles: Int = MAX_LIVE_ROUTE_PROFILES,
@@ -551,6 +619,90 @@ class G2RayVpnService : VpnService() {
                 groups.forEach { group -> group.drop(1).forEach { addEndpoint(it) } }
             }
         }
+
+        internal suspend fun resolveRuntimeProfilesForStartup(
+            profiles: List<G2RayProfile>,
+            maxProfiles: Int = MAX_LIVE_ROUTE_PROFILES,
+            optionalGraceMs: Long = OPTIONAL_ENDPOINT_DNS_GRACE_MS,
+            primaryGraceMs: Long = PRIMARY_ENDPOINT_DNS_GRACE_MS,
+            fallbackWaitMs: Long = FALLBACK_ENDPOINT_DNS_WAIT_MS,
+            resolve: suspend (String) -> List<String>
+        ): List<G2RayProfile> = withContext(Dispatchers.IO) { supervisorScope {
+            val startedAtNs = System.nanoTime()
+            require(profiles.isNotEmpty()) { "A selected VPN profile is required" }
+            require(maxProfiles > 0) { "At least one runtime profile is required" }
+            require(optionalGraceMs > 0 && primaryGraceMs > 0 && fallbackWaitMs > 0)
+            val template = VlessUriParser.transportTemplateKey(profiles.first())
+            val profileBudget = maxProfiles.coerceAtMost(MAX_LIVE_ROUTE_PROFILES)
+            val eligible = profiles.take(profileBudget).filterIndexed { index, profile ->
+                index == 0 || VlessUriParser.transportTemplateKey(profile) == template
+            }
+            val tasks = eligible.map { it.address }.distinct().associateWith { address ->
+                async {
+                    try {
+                        Result.success(resolve(address))
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: Exception) {
+                        Result.failure(error)
+                    }
+                }
+            }
+            val completed = Channel<Unit>(Channel.UNLIMITED)
+            tasks.values.forEach { task -> task.invokeOnCompletion { completed.trySend(Unit) } }
+            var readyCandidateFound = false
+            try {
+                withTimeoutOrNull(fallbackWaitMs) {
+                    while (true) {
+                        val finished = tasks.values.filter { it.isCompleted }
+                        val usable = finished.any { task ->
+                            task.await().getOrNull()?.any(String::isNotBlank) == true
+                        }
+                        if (usable) {
+                            readyCandidateFound = true
+                            break
+                        }
+                        if (finished.size == tasks.size) break
+                        completed.receive()
+                    }
+                }
+                if (readyCandidateFound) {
+                    // Do not let a fast backup permanently displace the
+                    // selected profile just because its DNS answer was a few
+                    // hundred milliseconds slower.
+                    withTimeoutOrNull(primaryGraceMs) {
+                        tasks.getValue(eligible.first().address).await()
+                    }
+                    val primaryTask = tasks.getValue(eligible.first().address)
+                    val primaryReady = primaryTask.isCompleted &&
+                        primaryTask.await().getOrNull()?.any(String::isNotBlank) == true
+                    val optionalBudget = if (primaryReady) {
+                        minOf(optionalGraceMs, READY_PRIMARY_OPTIONAL_DNS_GRACE_MS)
+                    } else optionalGraceMs
+                    withTimeoutOrNull(optionalBudget) { tasks.values.awaitAll() }
+                }
+            } finally {
+                completed.close()
+            }
+            tasks.values.filterNot { it.isCompleted }.forEach { it.cancel() }
+            val results = tasks.mapValues { (_, task) ->
+                if (task.isCancelled) {
+                    Result.failure<List<String>>(java.net.UnknownHostException("Endpoint lookup timed out"))
+                } else {
+                    task.await()
+                }
+            }
+            val resolved = resolveRuntimeProfiles(eligible, maxProfiles) { address ->
+                results.getValue(address).getOrThrow()
+            }
+            if (BuildConfig.DEBUG) {
+                val primaryAddresses = results.getValue(eligible.first().address).getOrNull().orEmpty()
+                Log.i("G2RayVpnService", "startup_dns requested=${eligible.size} included=${resolved.size} " +
+                    "selected_endpoint_included=${resolved.any { it.address in primaryAddresses }} " +
+                    "elapsed_ms=${(System.nanoTime() - startedAtNs) / 1_000_000L}")
+            }
+            resolved
+        } }
 
         internal fun persistedRouteScore(profile: StoredG2RayProfile, networkKey: String? = null, nowMs: Long = System.currentTimeMillis()): Long {
             if (!persistedRouteHistoryFresh(profile, nowMs, networkKey)) return Long.MAX_VALUE
@@ -661,15 +813,32 @@ class G2RayVpnService : VpnService() {
             previousTraffic: TrafficBytes?,
             currentTraffic: TrafficBytes?
         ): Boolean {
-            return engine == ActiveVpnEngine.Hev &&
-                previousTraffic != null &&
-                currentTraffic != null &&
-                previousTraffic.rxTcpPayloadBytes != null &&
-                currentTraffic.rxTcpPayloadBytes != null &&
-                currentTraffic.rxTcpPayloadBytes > previousTraffic.rxTcpPayloadBytes
+            if (previousTraffic == null || currentTraffic == null) return false
+            return when (engine) {
+                ActiveVpnEngine.Hev -> previousTraffic.rxTcpPayloadBytes != null &&
+                    currentTraffic.rxTcpPayloadBytes != null &&
+                    currentTraffic.rxTcpPayloadBytes > previousTraffic.rxTcpPayloadBytes
+                ActiveVpnEngine.XrayNative -> {
+                    val receivedDelta = currentTraffic.rxBytes - previousTraffic.rxBytes
+                    receivedDelta >= NATIVE_TRAFFIC_PROGRESS_GRACE_BYTES
+                }
+                null -> false
+            }
         }
 
         internal fun shouldSuppressRouteRecoveryAfterFailedReverification(
+            route: RunningRouteResult,
+            engine: ActiveVpnEngine?,
+            previousTraffic: TrafficBytes?,
+            currentTraffic: TrafficBytes?
+        ): Boolean {
+            // Only HEV's upstream TCP payload counter can corroborate a path.
+            // Native UID bytes also include protected Worker/GitHub traffic.
+            return engine == ActiveVpnEngine.Hev &&
+                shouldAllowRouteActivityGrace(route, engine, previousTraffic, currentTraffic)
+        }
+
+        internal fun shouldAllowRouteActivityGrace(
             route: RunningRouteResult,
             engine: ActiveVpnEngine?,
             previousTraffic: TrafficBytes?,
@@ -689,7 +858,7 @@ class G2RayVpnService : VpnService() {
             txBps: Long,
             timeSinceLastReverifyMs: Long
         ): Boolean {
-            return engine == ActiveVpnEngine.Hev &&
+            return (engine == ActiveVpnEngine.Hev || engine == ActiveVpnEngine.XrayNative) &&
                 idleDurationMs >= IDLE_ACTIVITY_REVERIFY_THRESHOLD_MS &&
                 (rxBps > 0L || txBps > 0L) &&
                 timeSinceLastReverifyMs >= PASSIVE_ROUTE_REVERIFY_COOLDOWN_MS
@@ -706,8 +875,11 @@ class G2RayVpnService : VpnService() {
             val interactiveRequestStalled =
                 txBytesSinceLastRx >= ACTIVE_STALL_INTERACTIVE_MIN_TX_BYTES &&
                     txPacketsSinceLastRx >= ACTIVE_STALL_INTERACTIVE_MIN_TX_PACKETS
-            return engine == ActiveVpnEngine.Hev &&
-                (bulkRequestStalled || interactiveRequestStalled) &&
+            val nativeRequestStalled =
+                engine == ActiveVpnEngine.XrayNative &&
+                    txBytesSinceLastRx >= NATIVE_STALL_MIN_TX_BYTES
+            return (engine == ActiveVpnEngine.Hev && (bulkRequestStalled || interactiveRequestStalled) ||
+                nativeRequestStalled) &&
                 timeSinceLastRxMs >= ACTIVE_STALL_NO_RX_THRESHOLD_MS &&
                 timeSinceLastReverifyMs >= ACTIVE_STALL_ROUTE_REVERIFY_COOLDOWN_MS
         }
@@ -805,15 +977,30 @@ class G2RayVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (destroyed) return START_NOT_STICKY
+        refreshSystemProtectionState()
         return when (intent?.action) {
-            ACTION_START -> {
+            ACTION_START, VpnService.SERVICE_INTERFACE -> {
                 desiredConnected = true
                 startTunnel(intent)
                 START_STICKY
             }
             ACTION_STOP -> {
-                stopTunnel()
-                START_NOT_STICKY
+                if (VpnStateRepository.state.value.alwaysOnVpn == true) {
+                    // Always-on lifecycle belongs to Android. Closing TUN here
+                    // would conflict with that policy and discard its profile.
+                    desiredConnected = true
+                    if (vpnInterface == null) {
+                        startTunnel(Intent(VpnService.SERVICE_INTERFACE))
+                    } else {
+                        createNotificationChannel()
+                        updateNotification("Always-on VPN is managed in Android VPN settings")
+                    }
+                    START_STICKY
+                } else {
+                    stopTunnel()
+                    START_NOT_STICKY
+                }
             }
             ACTION_REVERIFY -> {
                 when (
@@ -834,6 +1021,7 @@ class G2RayVpnService : VpnService() {
                 }
                 START_STICKY
             }
+            ACTION_REFRESH_POLICY -> START_STICKY
             null -> {
                 desiredConnected = true
                 startTunnel(null)
@@ -1044,6 +1232,7 @@ class G2RayVpnService : VpnService() {
     }
 
     private fun restartTunnelAfterAppResume() {
+        if (destroyed || !desiredConnected) return
         if (cleanupJob?.isActive == true) {
             pendingStartAfterCleanup = true
             pendingStartIntent = null
@@ -1064,11 +1253,13 @@ class G2RayVpnService : VpnService() {
             finalState = TunnelState.Starting,
             finalMessage = "Restoring VPN after app resume...",
             publishStopping = false,
-            stopService = false
+            stopService = false,
+            retainInterface = true
         )
     }
 
     private fun startTunnel(intent: Intent?) {
+        if (destroyed) return
         if (shouldQueueStartRequest(cleanupJob?.isActive == true)) {
             pendingStartAfterCleanup = true
             pendingStartIntent = intent?.let(::Intent)
@@ -1093,30 +1284,47 @@ class G2RayVpnService : VpnService() {
 
         createNotificationChannel()
         startForegroundCompat(buildNotification("Starting VPN"))
-        publishState(TunnelState.Starting, "Checking config route, then starting full-device VPN...")
+        publishState(TunnelState.Starting, "Starting full-device VPN and verifying its route...")
         val lifecycleToken = lifecycleGuard.begin()
         activeLifecycleToken = lifecycleToken
 
         startJob = scope.launch {
             lifecycleOperationMutex.withLock {
                 try {
+                    val systemStart = intent?.action == VpnService.SERVICE_INTERFACE ||
+                        (intent == null && systemAlwaysOnEnabled() == true)
+                    if (intent == null && secureStore
+                            .getString(PREF_DESIRED_CONNECTED, "true") == "false" && !systemStart
+                    ) {
+                        withContext(Dispatchers.Main) { stopTunnel() }
+                        return@withLock
+                    }
+                    // Hold capture before settings, native ownership or wake
+                    // waits; a failed connection must not select a direct exit.
+                    if (vpnInterface == null) routingPolicy = RoutingPolicy()
+                    val captureExclusions = routingPolicy.excludedPackages
+                    var tun = vpnInterface ?: installTunInterface(lifecycleToken)
+                    registerUnderlyingNetworkMonitor()
+                    val captureWasIpv4Only = vpnInterfaceIpv4Only ?: ipv4Only
+                    if (intent != null) secureStore.putString(PREF_DESIRED_CONNECTED, "true")
                     requestedEngineMode = requestedMode ?: vpnPreferences.getMode()
                     fastDnsEnabled = vpnPreferences.isFastDnsEnabled()
                     ipv4Only = vpnPreferences.isIpv4OnlyEnabled()
                     dpiCompatibilityEnabled = vpnPreferences.isDpiCompatibilityEnabled()
                     seamlessFailoverEnabled = vpnPreferences.isSeamlessFailoverEnabled()
-
-                    val rawProfile = requestedRawProfile ?: restoreLastRawProfile()
+                    routingPolicy = vpnPreferences.getRoutingPolicy()
+                    if (captureWasIpv4Only != ipv4Only || captureExclusions != routingPolicy.excludedPackages) {
+                        tun = installTunInterface(lifecycleToken)
+                    }
+                    // Stop clears the old session cache, not saved profiles.
+                    // Android must still be able to start the current selection
+                    // when always-on is enabled later or after a reboot.
+                    val systemProfile = if (systemStart) selectedProfileForSystemStart() else null
+                    val rawProfile = requestedRawProfile ?: systemProfile?.rawUri ?: restoreLastRawProfile()
                         ?: throw IllegalStateException(
                             "No valid active VLESS profile. Import and select a profile first."
                         )
-                    if (intent == null && secureStore
-                            .getString(PREF_DESIRED_CONNECTED, "true") == "false"
-                    ) {
-                        withContext(Dispatchers.Main) { stopTunnel() }
-                        return@withLock
-                    }
-                    activeAccountId = requestedAccountId ?: restoreLastAccountId()
+                    activeAccountId = requestedAccountId ?: systemProfile?.accountId ?: restoreLastAccountId()
                     val profile = VlessUriParser.parse(rawProfile).getOrElse {
                         throw IllegalStateException(
                             "No valid active VLESS profile. Import and select a profile first.",
@@ -1126,17 +1334,15 @@ class G2RayVpnService : VpnService() {
                     if (!lifecycleGuard.isCurrent(lifecycleToken)) {
                         return@withLock
                     }
+                    profileBindingFailure(profile, activeAccountId)?.let {
+                        throw IllegalStateException(it)
+                    }
                     rememberLastProfileContext(rawProfile, activeAccountId)
 
-                    val tun = establishTunInterface()
-                    ?: throw IllegalStateException("Android refused to create the VPN interface")
                     if (!lifecycleGuard.isCurrent(lifecycleToken)) {
-                        tun.close()
                         return@withLock
                     }
-                    vpnInterface = tun
                     activeProfile = profile
-                    registerUnderlyingNetworkMonitor()
                     if (!awaitUnderlyingNetwork(lifecycleToken, tun)) {
                         return@withLock
                     }
@@ -1178,7 +1384,7 @@ class G2RayVpnService : VpnService() {
                         } else {
                             if (route.retryAllowed) {
                                 schedulePersistentReconnect(route.error ?: core.lastError.value ?: "Tunnel route check failed", route.retryAfterMs)
-                            } else failAndStop(route.error ?: "VPN needs configuration changes")
+                            } else failClosed(route.error ?: "VPN needs configuration changes")
                         }
                     }
                 } catch (e: CancellationException) {
@@ -1189,7 +1395,7 @@ class G2RayVpnService : VpnService() {
                             if (lifecycleGuard.isCurrent(lifecycleToken)) {
                                 if (e is IOException && vpnInterface != null && activeProfile != null) {
                                     schedulePersistentReconnect(e.localizedMessage ?: "Network unavailable")
-                                } else failAndStop(e.localizedMessage ?: e.javaClass.simpleName)
+                                } else failClosed(e.localizedMessage ?: e.javaClass.simpleName)
                             }
                         }
                     }
@@ -1200,6 +1406,9 @@ class G2RayVpnService : VpnService() {
 
     private fun handleExistingTunnelStart(intent: Intent?): Boolean {
         val coreState = core.state.value
+        if (vpnInterface != null && activeProfile == null &&
+            coreState in setOf(TunnelCoreState.Disconnected, TunnelCoreState.Error)
+        ) return false
         val hasExistingRuntime = vpnInterface != null ||
             coreState == TunnelCoreState.Connected ||
             coreState == TunnelCoreState.Starting ||
@@ -1251,7 +1460,8 @@ class G2RayVpnService : VpnService() {
                     finalState = TunnelState.Starting,
                     finalMessage = "Repairing incomplete VPN state...",
                     publishStopping = false,
-                    stopService = false
+                    stopService = false,
+                    retainInterface = true
                 )
             }
         }
@@ -1277,7 +1487,27 @@ class G2RayVpnService : VpnService() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             runCatching { builder.setMetered(false) }
         }
+        routingPolicy.excludedPackages.filter { it != packageName }.forEach { excluded ->
+            try { builder.addDisallowedApplication(excluded) }
+            catch (_: android.content.pm.PackageManager.NameNotFoundException) { /* App was uninstalled. */ }
+        }
         return builder.establish()
+    }
+
+    private fun installTunInterface(lifecycleToken: Long): ParcelFileDescriptor {
+        val tun = establishTunInterface()
+            ?: throw IllegalStateException("Android refused to create the VPN interface")
+        synchronized(this) {
+            if (destroyed || !lifecycleGuard.isCurrent(lifecycleToken)) {
+                tun.close()
+                throw CancellationException("VPN stopped while establishing its interface")
+            }
+            val old = vpnInterface
+            vpnInterface = tun
+            vpnInterfaceIpv4Only = ipv4Only
+            runCatching { old?.close() }
+        }
+        return tun
     }
 
     private fun stopTunnel() {
@@ -1293,27 +1523,39 @@ class G2RayVpnService : VpnService() {
         )
     }
 
-    private fun failAndStop(message: String) {
-        desiredConnected = false
-        updateNotification("VPN failed")
+    private fun failClosed(message: String) {
+        if (vpnInterface == null && desiredConnected && !destroyed && cleanupJob?.isActive != true) {
+            runCatching { installTunInterface(activeLifecycleToken) }
+        }
+        val retainingInterface = vpnInterface != null && !destroyed
+        updateNotification(if (retainingInterface) "VPN error: internet blocked" else "VPN failed: no capture interface")
         cleanupTunnel(
-            finalState = TunnelState.Error,
-            finalMessage = message,
+            finalState = if (retainingInterface) TunnelState.Blocked else TunnelState.Error,
+            finalMessage = if (retainingInterface) {
+                "$message Internet remains blocked. Retry after correcting the settings, or disconnect explicitly."
+            } else {
+                "$message No capture interface is available; enable Android's Block connections without VPN."
+            },
             publishStopping = false,
-            stopService = true
+            stopService = !retainingInterface,
+            retainInterface = retainingInterface
         )
     }
 
+    @Synchronized
     private fun cleanupTunnel(
         finalState: TunnelState,
         finalMessage: String,
         publishStopping: Boolean,
         stopService: Boolean,
-        clearRememberedProfile: Boolean = false
+        clearRememberedProfile: Boolean = false,
+        retainInterface: Boolean = false
     ) {
         pendingCleanupFinalState = finalState
         pendingCleanupFinalMessage = finalMessage
         pendingCleanupStopService = pendingCleanupStopService || stopService
+        pendingCleanupRetainInterface = retainInterface && vpnInterface != null &&
+            !pendingCleanupStopService && !destroyed
         clearRememberedProfileAfterCleanup =
             clearRememberedProfileAfterCleanup || clearRememberedProfile
 
@@ -1338,17 +1580,21 @@ class G2RayVpnService : VpnService() {
         routeReverifyJob = null
         networkHandoffJob?.cancel()
         networkHandoffJob = null
-        unregisterUnderlyingNetworkMonitor()
+        // A retained guard still needs protected physical-network access for
+        // manual wake. Only the packet/core runtime is stopped in that case.
+        if (!pendingCleanupRetainInterface) unregisterUnderlyingNetworkMonitor()
         synchronized(sessionProfileHealth) {
             sessionProfileHealth.clear()
         }
         val tunToClose = vpnInterface
-        vpnInterface = null
+        if (!pendingCleanupRetainInterface) vpnInterface = null
         activeProfile = null
         speedSampler = null
 
         if (publishStopping) {
             publishState(TunnelState.Stopping, "Stopping VPN...")
+        } else if (pendingCleanupRetainInterface) {
+            publishState(finalState, finalMessage, tunnelVerified = false)
         }
 
         cleanupJob = scope.launch {
@@ -1359,8 +1605,11 @@ class G2RayVpnService : VpnService() {
                 runCatching { fullVpnDataPathProbe.reset() }
                 runCatching { stopActivePacketEngine() }
                 runCatching { core.stop() }
-                runCatching {
-                    tunToClose?.close()
+                synchronized(this@G2RayVpnService) {
+                    if (!pendingCleanupRetainInterface) {
+                        if (vpnInterface === tunToClose) vpnInterface = null
+                        runCatching { tunToClose?.close() }
+                    }
                 }
             }
 
@@ -1371,21 +1620,37 @@ class G2RayVpnService : VpnService() {
                         clearRememberedProfileAfterCleanup = false
                     }
                 }
-                val stateAfterCleanup = pendingCleanupFinalState
-                val messageAfterCleanup = pendingCleanupFinalMessage
-                val shouldStopService = pendingCleanupStopService
-                pendingCleanupStopService = false
-                (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).cancel(NOTIFICATION_ID)
-                publishState(stateAfterCleanup, messageAfterCleanup)
-                val restartAfterCleanup = pendingStartAfterCleanup
-                val restartIntent = pendingStartIntent
-                pendingStartAfterCleanup = false
-                pendingStartIntent = null
-                cleanupJob = null
-                if (restartAfterCleanup) {
-                    startTunnel(restartIntent)
-                } else if (shouldStopService) {
-                    stopSelf()
+                synchronized(this@G2RayVpnService) {
+                    // Stop or destruction may arrive after the IO close decision.
+                    if (!pendingCleanupRetainInterface) {
+                        unregisterUnderlyingNetworkMonitor()
+                        val lateTun = vpnInterface
+                        vpnInterface = null
+                        vpnInterfaceIpv4Only = null
+                        runCatching { lateTun?.close() }
+                    }
+                    val stateAfterCleanup = pendingCleanupFinalState
+                    val messageAfterCleanup = pendingCleanupFinalMessage
+                    val shouldStopService = pendingCleanupStopService
+                    pendingCleanupStopService = false
+                    if (canPublishServiceState()) {
+                        if (!pendingCleanupRetainInterface) {
+                            (getSystemService(NOTIFICATION_SERVICE) as NotificationManager).cancel(NOTIFICATION_ID)
+                        } else {
+                            updateNotification(messageAfterCleanup)
+                        }
+                        publishState(stateAfterCleanup, messageAfterCleanup)
+                    }
+                    val restartAfterCleanup = pendingStartAfterCleanup && desiredConnected && !destroyed
+                    val restartIntent = pendingStartIntent
+                    pendingStartAfterCleanup = false
+                    pendingStartIntent = null
+                    cleanupJob = null
+                    if (restartAfterCleanup) {
+                        startTunnel(restartIntent)
+                    } else if (shouldStopService) {
+                        stopSelf()
+                    }
                 }
             }
         }
@@ -1396,15 +1661,20 @@ class G2RayVpnService : VpnService() {
         message: String,
         tunnelVerified: Boolean = tunnelState == TunnelState.Connected
     ) {
+        if (!canPublishServiceState()) return
+        refreshSystemProtectionState()
         val resetSpeed = tunnelState != TunnelState.Connected || !tunnelVerified
         val routeState = when {
-            tunnelState == TunnelState.Error -> RouteState.Error
+            tunnelState == TunnelState.Error || tunnelState == TunnelState.Blocked -> RouteState.Error
             tunnelState == TunnelState.Connected && tunnelVerified -> RouteState.Ready
             tunnelState == TunnelState.Disconnected || tunnelState == TunnelState.Disabled -> RouteState.Unknown
             else -> RouteState.Settling
         }
-        val hasMeasuredTunnelTraffic = tunnelState == TunnelState.Connected &&
-            tunnelVerified && activeEngine == ActiveVpnEngine.Hev && hevTunnelRunning
+        val hasMeasuredTunnelTraffic = tunnelState == TunnelState.Connected && tunnelVerified && when (activeEngine) {
+            ActiveVpnEngine.Hev -> hevTunnelRunning
+            ActiveVpnEngine.XrayNative -> nativeTrafficSource.snapshot() != null
+            null -> false
+        }
         VpnStateRepository.state.update { previous ->
             previous.copy(
                 routeState = routeState,
@@ -1417,13 +1687,14 @@ class G2RayVpnService : VpnService() {
                 totalRxBytes = if (resetSpeed || !hasMeasuredTunnelTraffic) 0 else previous.totalRxBytes,
                 totalTxBytes = if (resetSpeed || !hasMeasuredTunnelTraffic) 0 else previous.totalTxBytes,
                 activeVpnEngine = when (tunnelState) {
-                    TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error -> null
+                    TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error, TunnelState.Blocked -> null
                     else -> activeEngine
                 },
-                tunnelTrafficSource = if (hasMeasuredTunnelTraffic) {
-                    TunnelTrafficSource.HevTun
-                } else {
-                    TunnelTrafficSource.Unavailable
+                tunnelTrafficSource = when {
+                    !hasMeasuredTunnelTraffic -> TunnelTrafficSource.Unavailable
+                    activeEngine == ActiveVpnEngine.Hev -> TunnelTrafficSource.HevTun
+                    activeEngine == ActiveVpnEngine.XrayNative -> TunnelTrafficSource.NativeUid
+                    else -> TunnelTrafficSource.Unavailable
                 }
             )
         }
@@ -1440,9 +1711,11 @@ class G2RayVpnService : VpnService() {
     }
 
     private fun startTrafficUpdates() {
-        if (activeEngine != ActiveVpnEngine.Hev || !hevTunnelRunning) {
+        if (activeEngine == ActiveVpnEngine.XrayNative) {
+            startNativeTrafficUpdates()
             return
         }
+        if (activeEngine != ActiveVpnEngine.Hev || !hevTunnelRunning) return
         if (trafficJob?.isActive == true) {
             return
         }
@@ -1543,6 +1816,91 @@ class G2RayVpnService : VpnService() {
         }
     }
 
+    /**
+     * Native Xray has no exact TUN counter in the bundled API. This monitor
+     * uses coarse per-UID physical counters only to trigger a fresh quorum
+     * probe after a likely idle resume or transmit-only stall. The probe, not
+     * these counters, decides whether the route is healthy or needs recovery.
+     */
+    private fun startNativeTrafficUpdates() {
+        if (trafficJob?.isActive == true) return
+        val sampler = TrafficSpeedSampler(nativeTrafficSource)
+        speedSampler = sampler
+        trafficJob = scope.launch {
+            var previous = nativeTrafficSource.snapshot()
+            sampler.sample()
+            var lastActivityAtMs = SystemClock.elapsedRealtime()
+            var lastRxProgressAtMs = lastActivityAtMs
+            var txBytesSinceLastRx = 0L
+            var notificationTick = 0
+            while (isActive && core.state.value == TunnelCoreState.Connected) {
+                delay(1_000L)
+                val nowMs = SystemClock.elapsedRealtime()
+                val speed = sampler.sample()
+                val current = nativeTrafficSource.snapshot()
+                if (previous == null || current == null || !speed.sampleValid) {
+                    previous = current
+                    lastActivityAtMs = nowMs
+                    lastRxProgressAtMs = nowMs
+                    continue
+                }
+                val rxDelta = (current.rxBytes - previous.rxBytes).coerceAtLeast(0L)
+                val txDelta = (current.txBytes - previous.txBytes).coerceAtLeast(0L)
+                val hasActivity = rxDelta > 0L || txDelta > 0L
+                if (rxDelta > 0L) {
+                    lastRxProgressAtMs = nowMs
+                    txBytesSinceLastRx = 0L
+                } else {
+                    txBytesSinceLastRx = if (Long.MAX_VALUE - txBytesSinceLastRx < txDelta) {
+                        Long.MAX_VALUE
+                    } else {
+                        txBytesSinceLastRx + txDelta
+                    }
+                }
+                if (
+                    hasActivity &&
+                    shouldReverifyAfterIdleTraffic(
+                        engine = ActiveVpnEngine.XrayNative,
+                        idleDurationMs = (nowMs - lastActivityAtMs).coerceAtLeast(0L),
+                        rxBps = rxDelta,
+                        txBps = txDelta,
+                        timeSinceLastReverifyMs = timeSinceLastPromptReverify(
+                            RouteReverifyReason.IdleTraffic,
+                            nowMs
+                        )
+                    )
+                ) {
+                    requestPromptRouteReverification(RouteReverifyReason.IdleTraffic, nowMs)
+                }
+                if (hasActivity) lastActivityAtMs = nowMs
+                if (
+                    !waitingForUnderlyingNetwork &&
+                    shouldProbeSuspectedActiveStall(
+                        engine = ActiveVpnEngine.XrayNative,
+                        txBytesSinceLastRx = txBytesSinceLastRx,
+                        txPacketsSinceLastRx = 0L,
+                        timeSinceLastRxMs = (nowMs - lastRxProgressAtMs).coerceAtLeast(0L),
+                        timeSinceLastReverifyMs = timeSinceLastPromptReverify(
+                            RouteReverifyReason.ActiveStall,
+                            nowMs
+                        )
+                    )
+                ) {
+                    requestPromptRouteReverification(RouteReverifyReason.ActiveStall, nowMs)
+                }
+                previous = current
+                withContext(Dispatchers.Main) {
+                    notificationTick++
+                    if (notificationTick >= 4) {
+                        notificationTick = 0
+                        updateNotification(SpeedFormatter.formatNotification(speed, approximate = true))
+                    }
+                    publishSpeed(speed)
+                }
+            }
+        }
+    }
+
     private fun startCoreHealthMonitor() {
         if (healthJob?.isActive == true) {
             return
@@ -1602,7 +1960,7 @@ class G2RayVpnService : VpnService() {
                             break
                         }
                         val currentMeasuredTraffic = currentMeasuredTrafficSnapshot()
-                        val trafficIsAdvancing = shouldSuppressRouteRecoveryAfterFailedReverification(
+                        val trafficIsAdvancing = shouldAllowRouteActivityGrace(
                             route, activeEngine, previousMeasuredTraffic, currentMeasuredTraffic
                         )
                         previousMeasuredTraffic = currentMeasuredTraffic
@@ -1650,9 +2008,8 @@ class G2RayVpnService : VpnService() {
 
     private fun currentMeasuredTrafficSnapshot(): TrafficBytes? {
         val state = VpnStateRepository.state.value
-        if (activeEngine != ActiveVpnEngine.Hev || state.tunnelTrafficSource != TunnelTrafficSource.HevTun) {
-            return null
-        }
+        if (activeEngine == ActiveVpnEngine.XrayNative) return nativeTrafficSource.snapshot()
+        if (activeEngine != ActiveVpnEngine.Hev || state.tunnelTrafficSource != TunnelTrafficSource.HevTun) return null
         // Keep both sides of a comparison in HEV's absolute counter domain.
         // UI totals are baseline-relative, so mixing them after one transient
         // native read failure could look like traffic advanced when it did not.
@@ -1730,10 +2087,11 @@ class G2RayVpnService : VpnService() {
     }
 
     /**
-     * Starts the requested packet engine and proves the full-device data path,
-     * then lets Auto fall back once to native Xray TUN only when HEV itself
-     * failed to become healthy. A shared upstream route failure is handled by
-     * normal route recovery so exact HEV traffic counters remain available.
+     * Starts the requested packet engine and proves the full-device data path.
+     * Auto prefers native Xray TUN for the lower-overhead data path, then lets
+     * it fall back once to HEV only when the packet engine itself failed to
+     * become healthy. A shared upstream route failure is handled by normal
+     * route recovery instead of wasting time on an engine swap.
      */
     private suspend fun startBestEngineAndVerify(
         profile: G2RayProfile,
@@ -1744,21 +2102,25 @@ class G2RayVpnService : VpnService() {
         if (!isTunnelCurrent(lifecycleToken, tun)) {
             return RunningRouteResult(false, "VPN lifecycle changed before engine startup")
         }
+        val hevAvailable = HevTunController.isAvailable()
         val selectedEngine = preferredEngine ?: VpnEngineSelector.resolve(
             requestedEngineMode,
-            HevTunController.isAvailable()
+            hevAvailable
         )
         val firstResult = startEngineAndVerify(profile, tun, selectedEngine, lifecycleToken)
+        val alternateEngine = VpnEngineSelector.fallbackEngine(
+            mode = requestedEngineMode,
+            active = selectedEngine,
+            hevAvailable = hevAvailable,
+            activePacketEngineReady = hevTunnelRunning
+        )
         if (
             firstResult.success ||
             !firstResult.retryAllowed ||
             firstResult.failureScope == RouteFailureScope.DialerBinding ||
             firstResult.failureScope == RouteFailureScope.EndpointResolution ||
-            !VpnEngineSelector.shouldFallbackToNative(
-                mode = requestedEngineMode,
-                active = selectedEngine,
-                activePacketEngineReady = hevTunnelRunning
-            )
+            firstResult.failureScope !in setOf(RouteFailureScope.PacketEngine, RouteFailureScope.Unknown) ||
+            alternateEngine == null
         ) {
             return firstResult
         }
@@ -1772,7 +2134,7 @@ class G2RayVpnService : VpnService() {
         if (!isTunnelCurrent(lifecycleToken, tun)) {
             return RunningRouteResult(false, "VPN lifecycle changed during engine fallback")
         }
-        return startEngineAndVerify(profile, tun, ActiveVpnEngine.XrayNative, lifecycleToken)
+        return startEngineAndVerify(profile, tun, alternateEngine, lifecycleToken)
     }
 
     private suspend fun startEngineAndVerify(
@@ -1784,16 +2146,20 @@ class G2RayVpnService : VpnService() {
         if (!isTunnelCurrent(lifecycleToken, tun)) {
             return RunningRouteResult(false, "VPN lifecycle changed before engine startup")
         }
+        profileBindingFailure(profile, activeAccountId)?.let {
+            return RunningRouteResult(false, it, retryAllowed = false,
+                failureScope = RouteFailureScope.Configuration)
+        }
         activeEngine = engine
         hevTunnelRunning = false
         val resolutionStartedAt = SystemClock.elapsedRealtime()
         val resolutionNetworkGeneration = underlyingNetworkGeneration.get()
         val runtimeProfiles = try {
-            interruptibleDnsLookup {
-                resolveRuntimeProfiles(
-                    liveRouteProfilesFor(profile),
-                    maxProfiles = if (seamlessFailoverEnabled) MAX_LIVE_ROUTE_PROFILES else 1
-                ) { address -> SocketProtector.resolveTunnelEndpoints(address, MAX_LIVE_ROUTE_PROFILES) }
+            resolveRuntimeProfilesForStartup(
+                liveRouteProfilesFor(profile),
+                maxProfiles = if (seamlessFailoverEnabled) MAX_LIVE_ROUTE_PROFILES else 1
+            ) { address ->
+                interruptibleDnsLookup { SocketProtector.resolveTunnelEndpoints(address, MAX_LIVE_ROUTE_PROFILES) }
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -1835,7 +2201,8 @@ class G2RayVpnService : VpnService() {
             fakeDnsEnabled = fastDnsEnabled,
             ipv4Only = ipv4Only,
             dpiCompatibilityEnabled = dpiCompatibilityEnabled,
-            fallbackProfiles = runtimeProfiles.drop(1)
+            fallbackProfiles = runtimeProfiles.drop(1),
+            routingPolicy = routingPolicy
         )
         logStartupPhase("core_start", engine, coreStartedAt, core.state.value == TunnelCoreState.Connected)
         if (!isTunnelCurrent(lifecycleToken, tun)) {
@@ -1968,7 +2335,7 @@ class G2RayVpnService : VpnService() {
         val nowMs = System.currentTimeMillis()
         val networkKey = (application as G2RayApplication).routeMeasurementContext.keyFor(underlyingNetwork)
         val storedCandidates = selectAlternativeProfiles(
-            profiles = accountRepository.profiles.value,
+            profiles = profileCandidatesForAccount(accountId),
             accountId = accountId,
             currentRawUri = selected.rawUri,
             maxCandidates = 10,
@@ -1976,14 +2343,17 @@ class G2RayVpnService : VpnService() {
             networkKey = networkKey,
             nowMs = nowMs
         )
-        val verifiedCandidates = storedCandidates.mapNotNull { stored ->
-            val observed = sessionHealth[stored.rawUri]
-            val verified = observed?.lastAttemptSucceeded == true ||
-                persistedRouteMeasurementFresh(stored, nowMs, networkKey = networkKey)
-            if (!verified) return@mapNotNull null
-            VlessUriParser.parse(stored.rawUri).getOrNull()
+        val parsedCandidates = storedCandidates.mapNotNull { stored ->
+            VlessUriParser.parse(stored.rawUri).getOrNull()?.let { parsed -> stored to parsed }
         }
-        return selectSeamlessRouteProfiles(selected, verifiedCandidates)
+        return selectLiveRouteProfiles(
+            selected,
+            parsedCandidates,
+            sessionHealth,
+            nowMs,
+            networkKey,
+            maxProfiles = MAX_LIVE_ROUTE_PROFILES
+        )
     }
 
     private fun stopActivePacketEngine() {
@@ -2175,7 +2545,7 @@ class G2RayVpnService : VpnService() {
         if (attemptLimit == 0) return null
         val accountId = activeAccountId ?: accountRepository.activeSelection.value.accountId
         val candidates = selectAlternativeProfiles(
-            profiles = accountRepository.profiles.value,
+            profiles = profileCandidatesForAccount(accountId),
             accountId = accountId,
             currentRawUri = currentProfile.rawUri,
             maxCandidates = MAX_BACKUP_ROUTE_CANDIDATES,
@@ -2361,6 +2731,9 @@ class G2RayVpnService : VpnService() {
         }
         when (outcome) {
             is CodespaceWakeOutcome.Ready -> {
+                activeAccountId?.let { id ->
+                    runCatching { com.g2ray.client.data.QuotaEstimateStore(secureStore).clearConfirmedBlock(id) }
+                }
                 val keyId = when (outcome.backend) {
                     WakeControlBackend.WORKER -> wake.workerApiKeyId
                     WakeControlBackend.GITHUB_DIRECT -> wake.githubApiKeyId
@@ -2380,6 +2753,11 @@ class G2RayVpnService : VpnService() {
                 }
             }
             is CodespaceWakeOutcome.Failed -> {
+                if (outcome.httpCode == 402 || outcome.workerResponse?.quota_blocked == true) {
+                    activeAccountId?.let { id ->
+                        runCatching { com.g2ray.client.data.QuotaEstimateStore(secureStore).recordConfirmedBlock(id) }
+                    }
+                }
                 if (outcome.retryAllowed) retryCooldown.record(outcome.retryAfterMs)
                 if (outcome.controlPlaneUnavailable) {
                     val alternative = tryAlternativeStoredProfiles(profile, tun, lifecycleToken)
@@ -2453,7 +2831,7 @@ class G2RayVpnService : VpnService() {
         val tun = vpnInterface
         if (profile == null || tun == null) {
             routeRecoveryInProgress = false
-            failAndStop("Tunnel recovery could not access the active VPN interface")
+            failClosed("Tunnel recovery could not access the active VPN interface")
             return
         }
 
@@ -2485,7 +2863,7 @@ class G2RayVpnService : VpnService() {
                             if (route.success) {
                                 markTunnelVerified("VPN reconnected and route verified", route.verifiedNetworkGeneration)
                             } else if (!route.retryAllowed) {
-                                failAndStop(route.error ?: "VPN needs configuration changes")
+                                failClosed(route.error ?: "VPN needs configuration changes")
                             } else if (waitingForUnderlyingNetwork && route.retryAfterMs == null) {
                                 markTunnelUnverified("No underlying network. Waiting to reconnect...")
                             } else {
@@ -2515,18 +2893,28 @@ class G2RayVpnService : VpnService() {
         if (!isTunnelCurrent(token, tun)) return
         healthJob?.cancel()
         healthJob = null
+        // Capture before dispatch: a network callback can arrive while the
+        // retry coroutine is queued, before it begins its first backoff wait.
+        val scheduledNetworkGeneration = underlyingNetworkGeneration.get()
         markTunnelUnverified("$reason Retrying automatically...")
         reconnectRetryJob = scope.launch {
             var attempt = 0
             var retryWaitMs = retryAfterMs
             var retryReason = reason
+            var retryNetworkGeneration = scheduledNetworkGeneration
             while (isActive && desiredConnected && isTunnelCurrent(token, tun)) {
                 val backoff = reconnectBackoffMs(attempt)
                 val retryDelay = reconnectDelayMs(attempt, retryWaitMs)
                 attempt = (attempt + 1).coerceAtMost(4)
                 markTunnelUnverified("$retryReason Retrying automatically in ${(retryDelay + 999L) / 1000L}s...")
                 awaitWakeRetryDelay(
-                    retryDelay + Random.nextLong(0L, backoff / 5L + 1L), SystemClock::elapsedRealtime
+                    retryDelay + Random.nextLong(0L, backoff / 5L + 1L), SystemClock::elapsedRealtime,
+                    minimumDelayMs = retryWaitMs?.coerceIn(0L, MAX_WAKE_RETRY_DELAY_MS) ?: 0L,
+                    shouldRetryEarly = {
+                        !waitingForUnderlyingNetwork &&
+                            underlyingNetworkGeneration.get() != retryNetworkGeneration &&
+                            core.state.value in setOf(TunnelCoreState.Error, TunnelCoreState.Disconnected)
+                    }
                 )
                 if (!desiredConnected || !isTunnelCurrent(token, tun)) break
                 lifecycleOperationMutex.withLock {
@@ -2540,6 +2928,7 @@ class G2RayVpnService : VpnService() {
                     }
                     retryWaitMs = route.retryAfterMs
                     retryReason = route.error ?: reason
+                    retryNetworkGeneration = underlyingNetworkGeneration.get()
                     withContext(Dispatchers.Main) {
                         if (!desiredConnected || !isTunnelCurrent(token, tun)) return@withContext
                         if (route.success) {
@@ -2548,7 +2937,7 @@ class G2RayVpnService : VpnService() {
                                 markTunnelVerified("VPN automatically reconnected and route verified", route.verifiedNetworkGeneration)
                             }
                         } else if (!route.retryAllowed) {
-                            failAndStop(route.error ?: "VPN needs configuration changes")
+                            failClosed(route.error ?: "VPN needs configuration changes")
                         } else {
                             markTunnelUnverified("${route.error ?: reason} Retrying automatically...")
                         }
@@ -2755,6 +3144,7 @@ class G2RayVpnService : VpnService() {
 
     @Synchronized
     private fun applyUnderlyingNetwork(network: Network?, triggerVerification: Boolean) {
+        if (destroyed) return
         val previous = underlyingNetwork
         val wasWaiting = waitingForUnderlyingNetwork
         if (previous == network) {
@@ -2781,6 +3171,19 @@ class G2RayVpnService : VpnService() {
             // mutex instead of delaying the replacement network's verification.
             routeReverifyJob?.cancel()
             routeReverifyJob = null
+            // A periodic probe owns the same mutex and clients as handoff
+            // verification. Cancel its obsolete wait too; otherwise the new
+            // physical path can sit behind both old full-path/SOCKS deadlines.
+            if (healthJob?.isActive == true) {
+                healthJob?.cancel()
+                healthJob = null
+                if (core.state.value == TunnelCoreState.Connected && activeProfile != null &&
+                    !routeRecoveryInProgress && routeRecoveryJob?.isActive != true &&
+                    reconnectRetryJob?.isActive != true
+                ) {
+                    startCoreHealthMonitor()
+                }
+            }
         }
         val underlyingNetworksAccepted = runCatching {
             setUnderlyingNetworks(network?.let { arrayOf(it) } ?: emptyArray())
@@ -2792,7 +3195,9 @@ class G2RayVpnService : VpnService() {
             Log.w("G2RayVpnService", "Android rejected the selected underlying network metadata")
         }
 
-        if (!triggerVerification) {
+        // Keep wake sockets bound while an error guard is held, but do not
+        // turn a terminal configuration failure into an implicit reconnect.
+        if (!triggerVerification || activeProfile == null || cleanupJob?.isActive == true) {
             return
         }
         if (network == null) {
@@ -2894,13 +3299,15 @@ class G2RayVpnService : VpnService() {
             availableUnderlyingNetworks.clear()
             lostUnderlyingNetworks.clear()
         }
-        SocketProtector.updateUnderlyingNetwork(null)
         waitingForUnderlyingNetwork = false
         val connectivityManager = getSystemService(ConnectivityManager::class.java)
         if (callback != null && connectivityManager != null) {
             runCatching { connectivityManager.unregisterNetworkCallback(callback) }
         }
-        runCatching { setUnderlyingNetworks(null) }
+        if (canPublishServiceState()) {
+            SocketProtector.updateUnderlyingNetwork(null)
+            runCatching { setUnderlyingNetworks(null) }
+        }
     }
 
     private fun rememberLastProfileContext(rawProfile: String, accountId: String?) {
@@ -2925,6 +3332,66 @@ class G2RayVpnService : VpnService() {
         return runCatching {
             secureStore.getString(PREF_LAST_ACCOUNT_ID, null)
         }.getOrNull()
+    }
+
+    private fun selectedProfileForSystemStart(): StoredG2RayProfile {
+        check(accountRepository.savedDataReady.value) {
+            "Saved VPN settings are unavailable. Open the app to recover them."
+        }
+        val selection = accountRepository.activeSelection.value
+        return accountRepository.profiles.value.firstOrNull {
+            it.id == selection.profileId && it.accountId == selection.accountId
+        } ?: throw IllegalStateException(
+            "No valid active VLESS profile. Import and select a profile first."
+        )
+    }
+
+    private fun profileBindingFailure(profile: G2RayProfile, accountId: String?): String? {
+        if (accountId.isNullOrBlank()) return null
+        if (!accountRepository.savedDataReady.value) {
+            return "Saved VPN settings are unavailable. Open the app to recover them."
+        }
+        val account = accountRepository.accounts.value.firstOrNull { it.id == accountId }
+            ?: return "The selected Codespace is unavailable. Choose a saved Codespace and retry."
+        val expected = account.codespaceName?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        return "This VPN config belongs to a different Codespace. Select a matching config and retry."
+            .takeIf { CodespaceProfileIdentity.conflictsWith(profile, expected) }
+    }
+
+    private fun profileCandidatesForAccount(accountId: String?): List<StoredG2RayProfile> {
+        if (accountId.isNullOrBlank()) return emptyList()
+        // Existing links can predate import validation or a later account edit.
+        // Filter before ranking/limiting so stale bindings cannot crowd out
+        // valid backups or spend a route attempt on another host.
+        return accountRepository.profiles.value.filter { stored ->
+            stored.accountId == accountId && VlessUriParser.parse(stored.rawUri).getOrNull()?.let {
+                profileBindingFailure(it, accountId) == null
+            } == true
+        }
+    }
+
+    private fun systemAlwaysOnEnabled(): Boolean? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        runCatching { isAlwaysOn }.getOrNull()
+    } else null
+
+    private fun canPublishServiceState(): Boolean {
+        val owner = SocketProtector.vpnService
+        return owner == null || owner === this
+    }
+
+    private fun refreshSystemProtectionState() {
+        if (!canPublishServiceState()) return
+        if (destroyed) {
+            VpnStateRepository.state.update { it.copy(alwaysOnVpn = null, blockConnectionsWithoutVpn = null) }
+            return
+        }
+        val alwaysOn = systemAlwaysOnEnabled()
+        val lockdown = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            runCatching { isLockdownEnabled }.getOrNull()
+        } else null
+        VpnStateRepository.state.update {
+            it.copy(alwaysOnVpn = alwaysOn, blockConnectionsWithoutVpn = lockdown)
+        }
     }
 
     private fun clearLastRawProfile() {
@@ -2960,16 +3427,20 @@ class G2RayVpnService : VpnService() {
         val pendingIntent = PendingIntent.getActivity(
             this,
             0,
-            Intent(this, MainActivity::class.java),
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
 
+        val stopIntent = if (systemAlwaysOnEnabled() == true) pendingIntent else PendingIntent.getService(
+            this, 1, Intent(this, G2RayVpnService::class.java).setAction(ACTION_STOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_menu_compass)
+            .setSmallIcon(com.g2ray.client.R.drawable.ic_vpn_notification)
             .setContentTitle("G2Ray VPN")
             .setContentText(status)
             .setStyle(NotificationCompat.BigTextStyle().bigText(status))
             .setContentIntent(pendingIntent)
+            .addAction(0, if (systemAlwaysOnEnabled() == true) "Manage VPN" else "Disconnect", stopIntent)
             .setOngoing(true)
             .build()
     }
@@ -2989,6 +3460,12 @@ class G2RayVpnService : VpnService() {
     }
 
     override fun onDestroy() {
+        destroyed = true
+        pendingStartAfterCleanup = false
+        pendingStartIntent = null
+        if (canPublishServiceState()) {
+            VpnStateRepository.state.update { it.copy(alwaysOnVpn = null, blockConnectionsWithoutVpn = null) }
+        }
         val state = VpnStateRepository.state.value.tunnelState
         val shouldCleanup = state == TunnelState.Starting ||
             state == TunnelState.Connected ||
@@ -3013,7 +3490,7 @@ class G2RayVpnService : VpnService() {
         if (cleanupJob?.isActive != true) {
             scope.cancel()
         }
-        SocketProtector.vpnService = null
+        if (SocketProtector.vpnService === this) SocketProtector.vpnService = null
         super.onDestroy()
     }
 }

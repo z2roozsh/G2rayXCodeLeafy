@@ -1,7 +1,15 @@
 # G2Ray Client
 
+**Compatibility update, 13 November 2026:** the Codespaces tunnel's normal
+start, config and recovery paths are available; the temporary blanket startup
+block has been withdrawn. Existing authenticated Worker/direct-GitHub wake and
+Android profiles remain compatible. This is a network hobby project, not a
+full-time VPN service or free-account rotation tool. A local source edit does
+not change an installed app or restore a suspended GitHub account. See the
+[current compatibility status](../README.md#compatibility-status).
+
 This is the Android Studio project under `g2ray_app/` in the
-`z2roozsh/G2rayXCodeLeafy` repository. Open this directory as the project root.
+`G2rayXCodeLeafy` repository or your fork. Open this directory as the project root.
 
 An Android full-device VPN client for personal testing with G2Ray instances running on GitHub Codespaces.
 
@@ -21,16 +29,80 @@ backed by the official XTLS `libXray` Android wrapper.
    - **GitHub**: use no Worker. Paste a GitHub token with Codespaces read and
      Codespaces lifecycle admin write permission.
 4. Import your G2ray VLESS config by pasting the `vless://...` URI.
-5. Return to the Home screen and leave the VPN engine on **Auto** unless you
-   are comparing engines.
+5. Keep **Settings > Connection settings > Engine** on **Auto** unless you are
+   comparing engines, then return to Home.
 6. Tap **Start VPN**. The app probes the selected route before waking the
    Codespace, so an already-working route does not wait on a control plane.
 7. Approve Android's VPN permission prompt.
+
+Connection options and their information buttons are under **Settings > Connection
+settings**. Each config's **Share** button offers Copy link and an offline QR.
+The import screen also scans individual or all-config QRs. See the
+[daily-use workflows and options](WORKFLOWS_AND_OPTIONS_2026-10-18.md) for account
+switching, local usage estimates, Quick Settings, bypass routing, and protocol
+tradeoffs.
 
 Wake setup is optional for an imported profile whose server is already running.
 Start VPN tries that profile directly even when no Worker or GitHub token is
 configured. Automatic server wake requires a configured wake method only when
 the server actually needs recovery.
+
+### Importing multiple Codespaces
+
+The import screen has its own Codespace destination selector. Choosing a target
+there does not switch the active VPN account or move its credentials. Import
+only the selected destination's configs; a mixed selection is rejected without
+partial writes, and the error stays beside the import action.
+
+Canonical `app.github.dev` SNI/Host values must identify the exact Codespace, not
+merely contain its name. The hostname identifies a Codespace, not its GitHub
+owner. Custom fronts with no recognizable GitHub origin require explicit
+binding confirmation. That confirmation cannot override an identified,
+different Codespace. After a successful import, Settings shows the destination's
+profile list; Home keeps its previous active selection until you change it.
+
+Changing an account's Codespace name does not rewrite its existing VLESS links.
+Startup and automatic backup selection recheck recognized Codespace identities
+against the account's current name. A conflicting selected profile remains
+Blocked with a configuration error. Import or select a matching config, then
+use Retry VPN. Old links remain saved for repair; explicitly bound custom
+fronts without a recognized origin remain compatible, not authenticated.
+
+### Blocking traffic outside the VPN
+
+Start VPN hands connection ownership to the service immediately, without a
+UI-side ping/wake preflight. Capture is installed before settings/native/wake
+waits. Repairs retain the capture interface; terminal errors stop forwarding
+and show **Blocked** with **Retry VPN** and **Disconnect VPN** controls. They
+must not silently restore the phone's direct Internet exit. OS blocking remains
+necessary if the process dies or Android cannot create/retain the interface.
+
+Open **Settings > Connection settings > Android VPN protection**, select G2Ray in Android's VPN settings,
+then enable **Always-on VPN** and **Block connections without VPN**. Both are
+system-controlled settings: the app cannot silently enable them. Without OS
+blocking, traffic may use the normal network after the VPN stops or its process
+dies. On Android 10+, Home displays the OS-reported blocking state while the
+service is running or retaining a Blocked guard; older versions show **Check Android settings**, not an
+unverified protection claim.
+
+A successful manual Codespace wake does not start VPN or verify its data path.
+While Blocked, wake updates preserve the service warning until an actual VPN retry.
+Network transitions cancel obsolete prompt and periodic health requests.
+A surviving core is verified before replacement; a stopped core can retry
+early on a usable new network without bypassing a server Retry-After.
+
+Android's always-on start restores the currently selected saved profile, including
+after a normal app Stop cleared the previous session cache. On Android 10+, the
+app defers an always-on Stop request to the system settings rather than closing
+the interface behind Android's policy. Change or disable always-on in those
+settings when you intentionally want to disconnect.
+
+Full-device routing is different from being undetectable: a datacenter exit,
+accounts, cookies, browser characteristics, and granted location permissions can
+still identify you or suggest VPN use. See the [leak-protection review and
+acceptance checklist](../IP_LEAK_PROTECTION_2026-10-16.md) for Android, Windows,
+WebRTC, IPv6, and failure-case checks. These checks have not yet been accepted on
+your phone with OS blocking enabled.
 
 ### Direct GitHub wake
 
@@ -52,17 +124,21 @@ portable rather than simpler.
 
 ## VPN Engine
 
-- **Auto** is the default. It uses the bundled HEV TUN forwarding engine when
-  available, verifies the Xray route, and falls back once to Xray's native TUN
-  engine if HEV cannot carry that profile.
+- **Auto** is the default. It tries Xray's native TUN path first to avoid the
+  extra HEV userspace forwarding hop, verifies the full route, and falls back
+  once to HEV if the native packet path cannot become healthy.
 - **HEV** keeps the choice explicit for testing. It uses loopback SOCKS between
   HEV and Xray and exposes true VPN TUN upload/download counters.
-- **Native** uses Xray's Android TUN inbound directly. It is the compatibility
-  fallback; the app does not invent device-wide throughput figures for it.
+- **Native** uses Xray's Android TUN inbound directly. It is the default Auto
+  data path. When Android exposes per-UID counters, the app shows an explicitly
+  approximate rate for it; those counters can include small control-plane bytes
+  and are not a tunnel-only benchmark. If the counters are unavailable, the UI
+  says so instead of inventing a number.
 
 Physical-device tests found retained-connection idle stalls in Native and a
-HEV screen-off case. Fresh connections still worked. Auto/HEV remains the normal
-path, not a guarantee of stall-free idle resume. See the
+HEV screen-off case. Fresh connections still worked. Both engines now use
+bounded wake/reverification, and Native also has a coarse physical-byte stall
+hint; neither is a guarantee of stall-free idle resume. See the
 [verification record](DEVICE_VERIFICATION_2026-10-12.md).
 
 Both engines use a 1500-byte Android VPN MTU. The physical network and the
@@ -108,10 +184,12 @@ By default the VPN captures the IPv4 and IPv6 default routes, intercepts ordinar
 traffic sent to port 53, and sends the built-in DNS-over-HTTPS requests through
 the VLESS route. This prevents the common DNS leak where an ISP resolver sees
 the domain names you look up outside the encrypted tunnel. It is strong
-protection, not an absolute guarantee: an app can use a hard-coded resolver,
-its own VPN/bypass API, or a device-specific private-DNS implementation that
-Android does not expose to this VPN. The app does not claim DNS protection is a
-replacement for a trusted network or a security audit.
+protection, not an absolute guarantee. Hard-coded DNS-over-HTTPS and DNS-over-TLS
+destinations are still subject to full-device routing; selecting another resolver
+does not by itself bypass the VPN. This app does not enable Android's bypass API
+or exclude other apps. Device/OEM behavior, boot, process death, Private DNS, and
+network transitions still require packet-level acceptance with OS blocking enabled.
+The app does not claim DNS protection is a replacement for a security audit.
 
 Home **Quick scan** uses one bounded real route sample per saved config and is
 intentionally fast. Modern libXray builds test up to five tagged configs in one
@@ -190,7 +268,7 @@ config tests run on any development machine. Installable debug and release
 builds require the official Android AAR and matching
 `app/libs/libXray.properties`:
 
-1. Install Go 1.26.5, Python, Android command-line tools, and Android NDK
+1. Install Go 1.26.10, Python, Android command-line tools, and Android NDK
    28.2.13676358. The build script pins `gomobile` and `gobind` to the same
    tested `x/mobile` revision, prevents upstream `@latest` replacement, and
    attests both tools again after the build. It also removes local source paths
@@ -211,7 +289,16 @@ the real-device production matrix:
 
 3. Confirm `app/libs/libXray.aar` and `app/libs/libXray.properties` exist. The
    build script records the exact commit, Go version, mobile-tool revisions,
-   controller-patch hash, and AAR SHA-256. Functional-debug and release builds
+   controller-, observer-, measurement-, XHTTP-concurrency-, XHTTP-close-error,
+   WebSocket-integrity-, and VLESS-cancellation
+   patch hashes, plus the AAR SHA-256. The XHTTP backport fixes upload buffer
+   ownership and concurrent response-body ownership without changing the core
+   version or transport tuning. The builder runs focused byte-integrity and
+   lifecycle fixtures; CI repeats them under Go's race detector.
+   The WebSocket patch preserves final-frame bytes, honors the existing handshake
+   deadline and closes failed TLS sockets. The VLESS patch interrupts canceled
+   retries without changing the live retry schedule for uncanceled requests.
+   Functional-debug and release builds
    reject a missing, stale, mismatched, or Java-API-incompatible core, and
    release builds also verify every bundled HEV ABI against its pinned metadata.
 4. Configure a real release keystore outside the repository. Release tasks

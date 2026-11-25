@@ -139,6 +139,12 @@ class SocksRunningRouteProbe : RunningRouteProbe {
             current?.let(::closeClient)
             return OkHttpClient.Builder()
                 .proxy(Proxy(Proxy.Type.SOCKS, InetSocketAddress.createUnresolved("127.0.0.1", socksPort)))
+                // A stale pooled socket should fail this bounded health probe
+                // once, then let the quorum/recovery loop decide. OkHttp's
+                // transparent retry can otherwise hide a mobile-NAT reset.
+                .retryOnConnectionFailure(false)
+                .followRedirects(false)
+                .followSslRedirects(false)
                 .connectTimeout(3, TimeUnit.SECONDS)
                 .readTimeout(3, TimeUnit.SECONDS)
                 .callTimeout(4, TimeUnit.SECONDS)
@@ -547,6 +553,50 @@ class XrayCoreManager : TunnelCore {
         }
     }
 
+    /** Three independent response samples per finalist, batched without overlapping native runtimes. */
+    fun measureDelaySummaryBatch(
+        profiles: List<G2RayProfile>,
+        datDir: String,
+        timeoutSeconds: Int = 3,
+        testUrls: List<String> = SocksRunningRouteProbe.HEALTH_URLS,
+        dpiCompatibilityEnabled: Boolean = false,
+        checkActive: () -> Unit = {}
+    ): List<XrayDelaySummary> {
+        require(profiles.size <= 5) { "At most five profiles can be confirmed together" }
+        if (profiles.isEmpty()) return emptyList()
+        val urls = testUrls.filter { it.isNotBlank() }.distinct().ifEmpty { SocksRunningRouteProbe.HEALTH_URLS }
+        val delays = profiles.map { mutableListOf<Long>() }
+        val errors = profiles.map { mutableListOf<String>() }
+        var batchSupported = true
+        repeat(3) { round ->
+            ensureOptionalProbeActive(checkActive)
+            val url = urls[round % urls.size]
+            val batch = if (batchSupported) measureDelayQuickBatch(
+                profiles, datDir, timeoutSeconds, url,
+                retryTestUrl = null, finalTestUrl = null,
+                dpiCompatibilityEnabled = dpiCompatibilityEnabled,
+                checkActive = checkActive
+            ) else null
+            ensureOptionalProbeActive(checkActive)
+            if (batch == null) batchSupported = false
+            val results = batch ?: profiles.map { profile ->
+                ensureOptionalProbeActive(checkActive)
+                measureDelayQuick(
+                    profile, datDir, timeoutSeconds, url, dpiCompatibilityEnabled, checkActive
+                )
+            }
+            ensureOptionalProbeActive(checkActive)
+            results.forEachIndexed { index, result ->
+                val delay = result.medianMs?.takeIf { result.success && it in 1..9999 }
+                if (delay != null) delays[index] += delay
+                else errors[index] += "$url: ${result.error ?: "no response"}"
+            }
+        }
+        return profiles.indices.map { index ->
+            summarizeDelayValues(delays[index], 3, errors[index].joinToString("; ").takeIf { it.isNotBlank() })
+        }
+    }
+
     /**
      * Measures up to five profiles in one modern libXray temporary instance.
      *
@@ -809,7 +859,8 @@ class XrayCoreManager : TunnelCore {
         fakeDnsEnabled: Boolean = false,
         ipv4Only: Boolean = false,
         dpiCompatibilityEnabled: Boolean = false,
-        fallbackProfiles: List<G2RayProfile> = emptyList()
+        fallbackProfiles: List<G2RayProfile> = emptyList(),
+        routingPolicy: RoutingPolicy = RoutingPolicy()
     ) {
         startupRetryAllowed = true
         if (!bridge.isAvailable()) {
@@ -861,7 +912,8 @@ class XrayCoreManager : TunnelCore {
                     ipv4Only = ipv4Only,
                     dpiCompatibilityEnabled = dpiCompatibilityEnabled,
                     tunFd = tunFd.takeIf { engine == ActiveVpnEngine.XrayNative },
-                    fallbackProfiles = fallbackProfiles
+                    fallbackProfiles = fallbackProfiles,
+                    routingPolicy = routingPolicy
                 )
                 val request = bridge.newRunFromJsonRequest(datDir, configJson)
                 val nativeStartedAt = SystemClock.elapsedRealtime()

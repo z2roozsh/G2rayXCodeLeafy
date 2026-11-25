@@ -26,6 +26,7 @@ import com.g2ray.client.network.WorkerRouteEndpoint
 import com.g2ray.client.network.WorkerUrlNormalizer
 import com.g2ray.client.network.WorkerWakeResponse
 import com.g2ray.client.parser.VlessUriParser
+import com.g2ray.client.parser.CodespaceProfileIdentity
 import com.g2ray.client.vpn.G2RayVpnService
 import com.g2ray.client.vpn.SocketProtector
 import com.g2ray.client.vpn.RoutePerformanceSummary
@@ -37,6 +38,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.*
@@ -86,17 +88,6 @@ class G2RayViewModel internal constructor(
         { XrayCoreManager() },
         VpnEnginePreferences((application as G2RayApplication).secureStore)
     )
-
-    enum class VpnStartPlan {
-        DirectProbeThenWake,
-        StartDirect,
-        Block
-    }
-
-    enum class WorkerNetworkFailureAction {
-        DirectVpnFallback,
-        ReportFailure
-    }
 
     val repository = (application as G2RayApplication).accountRepository
     private val _preferenceLoadError = MutableStateFlow<String?>(null)
@@ -187,6 +178,82 @@ class G2RayViewModel internal constructor(
         initialSettings.seamlessFailoverEnabled
     )
     val seamlessFailoverEnabled: StateFlow<Boolean> = _seamlessFailoverEnabled.asStateFlow()
+    private val _routingPolicy = MutableStateFlow(initialSettings.routingPolicy)
+    val routingPolicy = _routingPolicy.asStateFlow()
+    private val _diagnosticsEnabled = MutableStateFlow(initialSettings.diagnosticsEnabled)
+    val diagnosticsEnabled = _diagnosticsEnabled.asStateFlow()
+    internal val quotaEstimates = com.g2ray.client.data.QuotaEstimateStore((application as G2RayApplication).secureStore)
+    private var accountSwitchJob: Job? = null
+    internal fun saveQuotaFromBundle(accountId: String, input: String) =
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val bundle = org.json.JSONObject(com.g2ray.client.parser.ConfigImportPayload.expand(input))
+                if (bundle.optInt("schema_version") !in 1..2) return@runCatching
+                val expected = accounts.value.firstOrNull { it.id == accountId }?.codespaceName ?: return@runCatching
+                if (bundle.optString("codespace_name") != expected) return@runCatching
+                val quota = bundle.optJSONObject("quota_estimate") ?: return@runCatching
+                quotaEstimates.save(accountId, com.g2ray.client.data.QuotaEstimateStore.fromJson(quota))
+            }
+        }
+
+    fun saveRoutingPolicy(policy: com.g2ray.client.vpn.RoutingPolicy, onResult: (Result<Unit>) -> Unit) {
+        if (!configurationMutationAllowedNow()) {
+            onResult(Result.failure(IllegalStateException("Disconnect VPN and wait for route tests before changing bypass rules.")))
+            return
+        }
+        require(policy.excludedPackages.none { it == getApplication<Application>().packageName }) { "The VPN app cannot exclude itself" }
+        launchConfigurationMutation("save routing", { vpnEnginePreferences.setRoutingPolicy(policy) }) { result ->
+            result.onSuccess { _routingPolicy.value = policy; _statusMessage.value = "Routing saved for the next connection." }
+            onResult(result)
+        }
+    }
+
+    fun setDiagnosticsEnabled(enabled: Boolean) {
+        launchConfigurationMutation("save diagnostics", { vpnEnginePreferences.setDiagnosticsEnabled(enabled) }) { result ->
+            result.onSuccess {
+                _diagnosticsEnabled.value = enabled
+                com.g2ray.client.vpn.DiagnosticEvents.setEnabled(enabled)
+                _statusMessage.value = if (enabled) "Bounded diagnostics enabled." else "Diagnostics disabled and cleared."
+            }
+        }
+    }
+
+    fun connectToAccount(accountId: String) {
+        if (accountSwitchJob?.isActive == true || !requireSavedData()) return
+        val account = accounts.value.firstOrNull { it.id == accountId && it.enabled } ?: return
+        if (profiles.value.none { it.accountId == accountId }) {
+            _statusMessage.value = "Import at least one config for ${account.displayName} first."
+            return
+        }
+        if (VpnStateRepository.state.value.alwaysOnVpn == true) {
+            _statusMessage.value = "Turn off Android always-on before switching Codespaces. Your current VPN was not changed."
+            return
+        }
+        accountSwitchJob = viewModelScope.launch {
+            routeOptimizationJob?.cancelAndJoin()
+            currentDelayProbeJob?.cancelAndJoin()
+            currentWakeJob?.cancelAndJoin()
+            if (configurationMutationJob?.isActive == true) {
+                _statusMessage.value = "Wait for the current settings change to finish."
+                return@launch
+            }
+            try {
+                if (VpnStateRepository.state.value.tunnelState !in setOf(TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error)) {
+                    getApplication<Application>().startService(Intent(getApplication(), G2RayVpnService::class.java).apply {
+                        action = G2RayVpnService.ACTION_STOP
+                    })
+                    kotlinx.coroutines.withTimeout(20_000L) {
+                        VpnStateRepository.state.first { it.tunnelState in setOf(TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error) }
+                    }
+                }
+                withContext(Dispatchers.IO) { repository.selectAccount(accountId) }
+                startVpnForSelection(getApplication())
+            } catch (cancelled: CancellationException) {
+                if (cancelled is kotlinx.coroutines.TimeoutCancellationException) _statusMessage.value = "Previous VPN is still stopping. No account was switched."
+                else throw cancelled
+            } catch (error: Exception) { _statusMessage.value = "Could not switch Codespace: ${error.localizedMessage}" }
+        }
+    }
 
     private val _isRouteOptimizing = MutableStateFlow(false)
     val isRouteOptimizing: StateFlow<Boolean> = _isRouteOptimizing.asStateFlow()
@@ -287,6 +354,28 @@ class G2RayViewModel internal constructor(
             ranked.firstOrNull { it.transport != selected.transport }.let(::listOfNotNull) + ranked)
             .distinctBy(VlessUriParser::semanticRouteKey).take(3)
 
+        internal fun optimizationConfirmationCandidates(
+            selected: G2RayProfile?,
+            measured: List<Pair<G2RayProfile, XrayDelaySummary>>
+        ): List<G2RayProfile> {
+            val ranked = measured.filter { (_, summary) ->
+                summary.success && summary.medianMs?.let { it in 1..9999 } == true
+            }.sortedBy { (profile, summary) -> routeOptimizationScore(summary, profile.transport) }
+                .map { it.first }
+            val first = selected?.takeIf { current ->
+                ranked.any { VlessUriParser.semanticRouteKey(it) == VlessUriParser.semanticRouteKey(current) }
+            } ?: ranked.firstOrNull() ?: return emptyList()
+            return optimizationGuardCandidates(first, ranked)
+        }
+
+        internal fun optionalRouteTestsAllowed(tunnelState: TunnelState): Boolean =
+            tunnelState in setOf(TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error)
+
+        private fun routeIsConfirmed(summary: XrayDelaySummary): Boolean =
+            summary.success && summary.medianMs?.let { it in 1..9999 } == true &&
+                summary.totalSamples >= 3 &&
+                summary.successfulSamples in (summary.totalSamples / 2 + 1)..summary.totalSamples
+
         internal fun hasOptimizationReadinessEvidence(
             availableWakeAt: Long?,
             profiles: List<StoredG2RayProfile>,
@@ -332,34 +421,11 @@ class G2RayViewModel internal constructor(
             return vpnStartAllowed(tunnelState)
         }
 
-        fun vpnStartRequestBusyVisibleForTesting(routeProbeActive: Boolean): Boolean {
-            return vpnStartRequestBusy(routeProbeActive)
-        }
-
         fun configurationMutationAllowedVisibleForTesting(
             tunnelState: TunnelState,
             startupBusy: Boolean = false
         ): Boolean {
             return configurationMutationAllowed(tunnelState, startupBusy)
-        }
-
-        fun vpnStartPlanVisibleForTesting(workerConfigured: Boolean, routeReady: Boolean): VpnStartPlan {
-            return vpnStartPlan(workerConfigured, routeReady)
-        }
-
-        fun workerNetworkFailureActionVisibleForTesting(
-            pendingVpnStart: Boolean,
-            throwable: Throwable
-        ): WorkerNetworkFailureAction {
-            return workerNetworkFailureAction(pendingVpnStart, throwable)
-        }
-
-        fun workerHttpFailureActionVisibleForTesting(
-            pendingVpnStart: Boolean,
-            httpCode: Int,
-            body: WorkerWakeResponse?
-        ): WorkerNetworkFailureAction {
-            return workerHttpFailureAction(pendingVpnStart, httpCode, body)
         }
 
         fun delayScanCompletionMessageVisibleForTesting(
@@ -488,6 +554,7 @@ class G2RayViewModel internal constructor(
             performance: RoutePerformanceSummary?,
             hasPerformanceEvidence: Boolean
         ): Long {
+            if (!routeIsConfirmed(summary)) return Long.MAX_VALUE
             val score = routeOptimizationScore(summary, transport, performance)
             if (score == Long.MAX_VALUE) return score
             return score + if (hasPerformanceEvidence && performance?.success != true) {
@@ -512,7 +579,7 @@ class G2RayViewModel internal constructor(
             busy: Boolean,
             availableWakeAt: Long? = null
         ): Boolean {
-            val stopped = tunnelState in setOf(TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error)
+            val stopped = optionalRouteTestsAllowed(tunnelState)
             val elapsed = now - lastAttemptAt
             val freshWakeAfterAttempt = availableWakeAt?.let {
                 it > lastAttemptAt && now - it in 0..OPTIMIZATION_WAKE_FRESHNESS_MS
@@ -540,6 +607,9 @@ class G2RayViewModel internal constructor(
             activeProfileId: String?,
             routeReady: Boolean
         ): AppConnectionState {
+            // A wake/discovery update cannot verify or release a retained TUN.
+            // Keep the service's blocked status visible until an actual retry.
+            if (previous.tunnelState == TunnelState.Blocked) return previous
             return previous.copy(
                 routeState = routeState,
                 message = message,
@@ -555,47 +625,8 @@ class G2RayViewModel internal constructor(
                 tunnelState != TunnelState.Stopping
         }
 
-        private fun vpnStartRequestBusy(routeProbeActive: Boolean): Boolean = routeProbeActive
-
         private fun configurationMutationAllowed(tunnelState: TunnelState, startupBusy: Boolean): Boolean {
             return vpnStartAllowed(tunnelState) && !startupBusy
-        }
-
-        private fun vpnStartPlan(workerConfigured: Boolean, routeReady: Boolean): VpnStartPlan {
-            return when {
-                workerConfigured -> VpnStartPlan.DirectProbeThenWake
-                else -> VpnStartPlan.StartDirect
-            }
-        }
-
-        private fun workerNetworkFailureAction(
-            pendingVpnStart: Boolean,
-            throwable: Throwable
-        ): WorkerNetworkFailureAction {
-            return if (pendingVpnStart && throwable is IOException) {
-                WorkerNetworkFailureAction.DirectVpnFallback
-            } else {
-                WorkerNetworkFailureAction.ReportFailure
-            }
-        }
-
-        /**
-         * A Worker 5xx is a control-plane failure, not proof that an already
-         * running VLESS route is down. When a VPN start is pending, let the
-         * service make the authoritative route check directly. Never use this
-         * escape hatch for quota, authentication, rate-limit, or not-found
-         * responses because those describe a meaningful configuration state.
-         */
-        private fun workerHttpFailureAction(
-            pendingVpnStart: Boolean,
-            httpCode: Int,
-            body: WorkerWakeResponse?
-        ): WorkerNetworkFailureAction {
-            return if (pendingVpnStart && body?.quota_blocked != true && httpCode in 500..599) {
-                WorkerNetworkFailureAction.DirectVpnFallback
-            } else {
-                WorkerNetworkFailureAction.ReportFailure
-            }
         }
 
         private fun buildWorkerHttpClient(loggingEnabled: Boolean): OkHttpClient {
@@ -631,14 +662,13 @@ class G2RayViewModel internal constructor(
     }
 
     private var currentWakeJob: Job? = null
-    private var currentVpnStartJob: Job? = null
     private var configurationMutationJob: Job? = null
+    private val _isSavingSettings = MutableStateFlow(false)
+    val isSavingSettings = _isSavingSettings.asStateFlow()
     private var currentDelayProbeJob: Job? = null
     private var routeOptimizationJob: Job? = null
     @Volatile
     private var routeOptimizationProbeStarted = false
-    private var pendingVpnProfileUri: String? = null
-    private var pendingVpnAccountId: String? = null
 
     private fun savedDataUnavailableNow(): String? = when {
         !repository.savedDataReady.value -> repository.loadError.value ?: "Saved settings are being reloaded."
@@ -673,8 +703,8 @@ class G2RayViewModel internal constructor(
     }
 
     private fun configurationMutationAllowedNow(): Boolean {
-        val startupBusy = currentVpnStartJob?.isActive == true ||
-            currentWakeJob?.isActive == true ||
+        val startupBusy = currentWakeJob?.isActive == true ||
+            accountSwitchJob?.isActive == true ||
             currentDelayProbeJob?.isActive == true ||
             routeOptimizationJob?.isActive == true
         return configurationMutationAllowed(VpnStateRepository.state.value.tunnelState, startupBusy)
@@ -718,9 +748,11 @@ class G2RayViewModel internal constructor(
             onResult(result)
         }
         configurationMutationJob = job
+        _isSavingSettings.value = true
         job.invokeOnCompletion {
             if (configurationMutationJob === job) {
                 configurationMutationJob = null
+                _isSavingSettings.value = false
             }
         }
         job.start()
@@ -752,6 +784,9 @@ class G2RayViewModel internal constructor(
                 _dpiCompatibilityEnabled.value = settings.dpiCompatibilityEnabled
                 _autoRouteOptimizationEnabled.value = settings.autoRouteOptimizationEnabled
                 _seamlessFailoverEnabled.value = settings.seamlessFailoverEnabled
+                _routingPolicy.value = settings.routingPolicy
+                _diagnosticsEnabled.value = settings.diagnosticsEnabled
+                com.g2ray.client.vpn.DiagnosticEvents.setEnabled(settings.diagnosticsEnabled)
                 _preferenceLoadError.value = null
                 _statusMessage.value = repository.loadError.value ?: "Saved settings reloaded."
             }
@@ -832,7 +867,6 @@ class G2RayViewModel internal constructor(
 
             if (account == null) {
                 _statusMessage.value = "No active account selected."
-                clearPendingVpnStart()
                 return@launch
             }
 
@@ -843,7 +877,6 @@ class G2RayViewModel internal constructor(
                     CodespaceWakeMode.WORKER -> "Worker mode is selected, but the shared Worker is not configured."
                     CodespaceWakeMode.GITHUB_DIRECT -> "Direct GitHub mode is selected, but this Codespace has no GitHub token."
                 }
-                clearPendingVpnStart()
                 return@launch
             }
 
@@ -874,6 +907,7 @@ class G2RayViewModel internal constructor(
                 }
                 when (outcome) {
                     is CodespaceWakeOutcome.Ready -> {
+                        withContext(Dispatchers.IO) { runCatching { quotaEstimates.clearConfirmedBlock(account.id) } }
                         availableWakeAt[account.id] = System.currentTimeMillis()
                         withContext(Dispatchers.IO) {
                             outcome.workerResponse?.let { response ->
@@ -904,7 +938,7 @@ class G2RayViewModel internal constructor(
                             }
                         }
                         if (outcome.routeReady) {
-                            _statusMessage.value = "Codespace route is ready. Starting VPN..."
+                            _statusMessage.value = "Codespace route is ready."
                             publishRouteState(
                                 routeState = RouteState.Ready,
                                 message = "Codespace route ready",
@@ -913,11 +947,7 @@ class G2RayViewModel internal constructor(
                                 routeReady = true
                             )
                         } else {
-                            _statusMessage.value = if (pendingVpnProfileUri != null) {
-                                "Codespace is available. Starting VPN to verify the selected route..."
-                            } else {
-                                "Codespace is available. Start VPN to verify the selected route."
-                            }
+                            _statusMessage.value = "Codespace is available. Start VPN to verify the selected route."
                             publishRouteState(
                                 routeState = RouteState.Settling,
                                 message = "Codespace available; route verification pending",
@@ -926,9 +956,11 @@ class G2RayViewModel internal constructor(
                                 routeReady = false
                             )
                         }
-                        startPendingVpnIfRequested()
                     }
                     is CodespaceWakeOutcome.Failed -> {
+                        if (outcome.httpCode == 402 || outcome.workerResponse?.quota_blocked == true) {
+                            withContext(Dispatchers.IO) { quotaEstimates.recordConfirmedBlock(account.id) }
+                        }
                         withContext(Dispatchers.IO) {
                             outcome.workerResponse?.let { response ->
                                 repository.recordCodespaceHealth(
@@ -940,71 +972,39 @@ class G2RayViewModel internal constructor(
                                 )
                             }
                         }
-                        if (pendingVpnProfileUri != null && outcome.controlPlaneUnavailable) {
-                            val msg = "Wake control is unreachable. Trying the selected VPN route directly..."
-                            _statusMessage.value = msg
-                            publishRouteState(
-                                routeState = RouteState.Unknown,
-                                message = msg,
-                                activeAccountId = account.id,
-                                routeReady = false
-                            )
-                            startPendingVpnIfRequested()
-                        } else {
-                            _statusMessage.value = "Error: ${outcome.message}"
-                            publishRouteState(
-                                routeState = RouteState.Error,
-                                message = outcome.message,
-                                activeAccountId = account.id,
-                                routeReady = false
-                            )
-                            clearPendingVpnStart()
-                        }
+                        _statusMessage.value = "Error: ${outcome.message}"
+                        publishRouteState(
+                            routeState = RouteState.Error,
+                            message = outcome.message,
+                            activeAccountId = account.id,
+                            routeReady = false
+                        )
                     }
                     is CodespaceWakeOutcome.TimedOut -> {
-                        if (pendingVpnProfileUri != null) {
-                            val msg = "${outcome.message} Trying the selected VPN route directly..."
-                            _statusMessage.value = msg
-                            publishRouteState(
-                                routeState = RouteState.Settling,
-                                message = msg,
-                                activeAccountId = account.id,
-                                routeReady = false
-                            )
-                            startPendingVpnIfRequested()
-                        } else {
-                            _statusMessage.value = outcome.message
-                            publishRouteState(
-                                routeState = RouteState.Error,
-                                message = outcome.message,
-                                activeAccountId = account.id,
-                                routeReady = false
-                            )
-                        }
+                        _statusMessage.value = outcome.message
+                        publishRouteState(
+                            routeState = RouteState.Error,
+                            message = outcome.message,
+                            activeAccountId = account.id,
+                            routeReady = false
+                        )
                     }
                 }
             } catch (e: kotlinx.coroutines.CancellationException) {
-                _statusMessage.value = "Wake cancelled."
-                publishRouteState(
-                    routeState = RouteState.Unknown,
-                    message = "Wake cancelled",
-                    activeAccountId = account.id,
-                    routeReady = false
-                )
-                clearPendingVpnStart()
-            } catch (e: Exception) {
-                if (pendingVpnProfileUri != null && e is IOException) {
-                    val msg = "Wake control is unreachable. Starting the selected VPN directly to verify its route..."
-                    _statusMessage.value = msg
+                if (VpnStateRepository.state.value.tunnelState in setOf(
+                        TunnelState.Disabled, TunnelState.Disconnected, TunnelState.Error
+                    )
+                ) {
+                    _statusMessage.value = "Wake cancelled."
                     publishRouteState(
                         routeState = RouteState.Unknown,
-                        message = msg,
+                        message = "Wake cancelled",
                         activeAccountId = account.id,
                         routeReady = false
                     )
-                    startPendingVpnIfRequested()
-                    return@launch
                 }
+                throw e
+            } catch (e: Exception) {
                 val err = "Failed: ${e.localizedMessage ?: e.javaClass.simpleName}"
                 _statusMessage.value = err
                 publishRouteState(
@@ -1013,7 +1013,6 @@ class G2RayViewModel internal constructor(
                     activeAccountId = account.id,
                     routeReady = false
                 )
-                clearPendingVpnStart()
             } finally {
                 _isWakingUp.value = false
             }
@@ -1024,9 +1023,7 @@ class G2RayViewModel internal constructor(
     }
 
     fun cancelWakeUp() {
-        currentVpnStartJob?.cancel()
         currentWakeJob?.cancel()
-        clearPendingVpnStart()
         _isWakingUp.value = false
         _statusMessage.value = "Wake cancelled."
         val activeAccId = selectedCodespaceContext().account?.id
@@ -1039,24 +1036,21 @@ class G2RayViewModel internal constructor(
     }
 
     fun startVpn(context: Context = getApplication()) {
+        if (accountSwitchJob?.isActive == true) {
+            _statusMessage.value = "Wait for the Codespace switch to finish."
+            return
+        }
+        startVpnForSelection(context)
+    }
+
+    private fun startVpnForSelection(context: Context) {
         savedDataUnavailableNow()?.let { error ->
             _statusMessage.value = error
             if (vpnStartAllowed(VpnStateRepository.state.value.tunnelState)) reportVpnStartBlocked(error)
             return
         }
-        if (vpnStartRequestBusy(currentVpnStartJob?.isActive == true)) {
-            _statusMessage.value = "VPN startup is already in progress."
-            return
-        }
-        val probesToDrain = listOfNotNull(routeOptimizationJob, currentDelayProbeJob).filter { it.isActive }
-        if (probesToDrain.isNotEmpty()) {
-            _statusMessage.value = "Finishing the current bounded probe, then starting VPN..."
-            currentVpnStartJob = viewModelScope.launch {
-                probesToDrain.forEach { it.cancel() }
-                probesToDrain.forEach { it.join() }
-                currentVpnStartJob = null
-                startVpn(context)
-            }
+        if (!vpnStartAllowed(VpnStateRepository.state.value.tunnelState)) {
+            _statusMessage.value = "VPN is already running or stopping."
             return
         }
         if (!isVpnCoreAvailable.value) {
@@ -1068,46 +1062,32 @@ class G2RayViewModel internal constructor(
             return
         }
 
-        if (!vpnStartAllowed(VpnStateRepository.state.value.tunnelState)) {
-            _statusMessage.value = "VPN is already running or stopping."
-            return
-        }
-
         val selected = selectedCodespaceContext()
         val profile = selected.profile
         if (profile == null) {
             _statusMessage.value = "No active VLESS config selected."
             VpnStateRepository.state.update { previous ->
                 previous.copy(
-                    tunnelState = TunnelState.Error,
+                    tunnelState = if (previous.tunnelState == TunnelState.Blocked) TunnelState.Blocked else TunnelState.Error,
                     message = "No active VLESS config selected."
                 )
             }
             return
         }
 
-        val account = selected.account
-        val wakeConfigured = account?.let(::wakeControlConfigured) == true
-        when (vpnStartPlan(wakeConfigured, VpnStateRepository.state.value.routeReady)) {
-            VpnStartPlan.DirectProbeThenWake -> {
-                pendingVpnProfileUri = profile.rawUri
-                pendingVpnAccountId = account?.id
-                startVpnWithDirectRouteProbe(profile, account)
-            }
-            VpnStartPlan.StartDirect -> startVpnService(profile.rawUri, context, account?.id)
-            VpnStartPlan.Block -> {
-                reportVpnStartBlocked(
-                    "Codespace route is not ready and no wake method is configured. Set up the shared Worker or a direct GitHub token."
-                )
-            }
-        }
+        // The service captures traffic before any DNS/native probe or wake.
+        // Its existing recovery coordinator owns direct-route and wake retries.
+        routeOptimizationJob?.cancel()
+        currentDelayProbeJob?.cancel()
+        currentWakeJob?.cancel()
+        startVpnService(profile.rawUri, context, selected.account?.id)
     }
 
     fun reportVpnStartBlocked(message: String) {
         _statusMessage.value = message
         VpnStateRepository.state.update { previous ->
             previous.copy(
-                tunnelState = TunnelState.Error,
+                tunnelState = if (previous.tunnelState == TunnelState.Blocked) TunnelState.Blocked else TunnelState.Error,
                 message = message
             )
         }
@@ -1251,107 +1231,46 @@ class G2RayViewModel internal constructor(
     }
 
     fun stopVpn(context: Context = getApplication()) {
-        currentVpnStartJob?.cancel()
-        clearPendingVpnStart()
+        accountSwitchJob?.cancel()
+        if (VpnStateRepository.state.value.alwaysOnVpn == true) {
+            _statusMessage.value = "Always-on VPN is controlled in Android VPN settings."
+            return
+        }
         val intent = Intent(context, G2RayVpnService::class.java).apply {
             action = G2RayVpnService.ACTION_STOP
         }
         context.startService(intent)
-        _statusMessage.value = "Stopping VPN..."
-    }
-
-    private fun startPendingVpnIfRequested() {
-        if (!requireSavedData()) {
-            clearPendingVpnStart()
-            return
-        }
-        val profileUri = pendingVpnProfileUri ?: return
-        val accountId = pendingVpnAccountId
-        pendingVpnProfileUri = null
-        pendingVpnAccountId = null
-        if (!vpnStartAllowed(VpnStateRepository.state.value.tunnelState)) {
-            return
-        }
-        startVpnService(profileUri, getApplication<Application>().applicationContext, accountId)
-    }
-
-    private fun startVpnWithDirectRouteProbe(
-        profile: StoredG2RayProfile,
-        account: G2RayAccount?
-    ) {
-        if (currentVpnStartJob?.isActive == true) {
-            _statusMessage.value = "VPN startup is already in progress."
-            return
-        }
-        if (currentWakeJob?.isActive == true) {
-            _statusMessage.value = "Codespace wake is already in progress."
-            return
-        }
-
-        currentVpnStartJob = viewModelScope.launch {
-            try {
-                _statusMessage.value = "Checking the selected profile before waking the Codespace..."
-                publishRouteState(
-                    routeState = RouteState.Settling,
-                    message = "Checking active VPN route",
-                    activeAccountId = account?.id,
-                    routeReady = false
-                )
-                val parsedProfile = VlessUriParser.parse(profile.rawUri).getOrThrow()
-                val result = withContext(Dispatchers.IO) {
-                    XrayCoreManager().measureDelayAny(
-                        profile = parsedProfile,
-                        datDir = getApplication<Application>().filesDir.absolutePath,
-                        // A viable distant Codespaces edge can exceed two
-                        // seconds. Prefer a short accurate direct check over
-                        // needlessly waking an already-running Codespace.
-                        timeoutSeconds = 4,
-                        dpiCompatibilityEnabled = dpiCompatibilityEnabled.value,
-                        checkActive = { coroutineContext.ensureActive() }
-                    )
-                }
-                if (result.success) {
-                    _statusMessage.value = "Active VPN route is ready. Starting VPN..."
-                    publishRouteState(
-                        routeState = RouteState.Ready,
-                        message = "Active VPN route ready",
-                        activeAccountId = account?.id,
-                        routeReady = true
-                    )
-                    startPendingVpnIfRequested()
-                } else {
-                    _statusMessage.value = "Direct profile check failed. Waking the Codespace..."
-                    wakeUpCodespace()
-                }
-            } catch (e: kotlinx.coroutines.CancellationException) {
-                throw e
-            } catch (_: Exception) {
-                _statusMessage.value = "Direct profile check could not complete. Waking the Codespace..."
-                wakeUpCodespace()
-            } finally {
-                currentVpnStartJob = null
-            }
-        }
-    }
-
-    private fun clearPendingVpnStart() {
-        pendingVpnProfileUri = null
-        pendingVpnAccountId = null
+        _statusMessage.value = "VPN stop requested."
     }
 
     private fun startVpnService(profileUri: String, context: Context, accountId: String?) {
-        if (!requireSavedData()) {
-            clearPendingVpnStart()
-            return
-        }
+        if (!requireSavedData()) return
         val intent = Intent(context.applicationContext, G2RayVpnService::class.java).apply {
             action = G2RayVpnService.ACTION_START
             putExtra(G2RayVpnService.EXTRA_RAW_PROFILE_URI, profileUri)
             putExtra(G2RayVpnService.EXTRA_ACCOUNT_ID, accountId)
             putExtra(G2RayVpnService.EXTRA_VPN_ENGINE_MODE, vpnEngineMode.value.storageValue)
         }
-        ContextCompat.startForegroundService(context.applicationContext, intent)
-        _statusMessage.value = "Starting VPN..."
+        val previous = VpnStateRepository.state.value
+        VpnStateRepository.state.update {
+            it.copy(tunnelState = TunnelState.Starting, tunnelVerified = false,
+                routeReady = false, message = "Starting VPN...")
+        }
+        try {
+            ContextCompat.startForegroundService(context.applicationContext, intent)
+            _statusMessage.value = "VPN start requested."
+        } catch (error: Exception) {
+            val message = "Could not start VPN: ${error.localizedMessage ?: error.javaClass.simpleName}"
+            VpnStateRepository.state.update {
+                if (it.tunnelState == TunnelState.Starting) {
+                    it.copy(
+                        tunnelState = if (previous.tunnelState == TunnelState.Blocked) TunnelState.Blocked else TunnelState.Error,
+                        tunnelVerified = false, routeReady = false, message = message
+                    )
+                } else it
+            }
+            _statusMessage.value = message
+        }
     }
 
     // Account logic
@@ -1583,6 +1502,7 @@ class G2RayViewModel internal constructor(
     fun importProfilesText(
         accountId: String,
         input: String,
+        allowUnidentifiedOrigins: Boolean = false,
         onResult: (Result<Int>) -> Unit = {}
     ) {
         if (!configurationMutationAllowedNow()) {
@@ -1606,19 +1526,14 @@ class G2RayViewModel internal constructor(
                     ?.codespaceName
                     ?.trim()
                     ?.takeIf { it.isNotEmpty() }
-                val compatibleProfiles = if (expectedCodespace == null) {
-                    successes
-                } else {
-                    successes.filter { profile ->
-                        profile.sni?.contains(expectedCodespace, ignoreCase = true) == true ||
-                            profile.hostHeader?.contains(expectedCodespace, ignoreCase = true) == true
-                    }
+                require(expectedCodespace == null || successes.all {
+                    CodespaceProfileIdentity.matches(it, expectedCodespace) ||
+                        (allowUnidentifiedOrigins && !CodespaceProfileIdentity.hasKnownOrigin(it))
+                }) {
+                    "Some selected configs do not match this Codespace. Choose the matching Codespace or deselect those configs. Nothing was imported."
                 }
-                require(compatibleProfiles.isNotEmpty()) {
-                    "None of the imported configs belongs to the selected Codespace. Choose the matching Codespace before importing."
-                }
-                repository.importProfiles(accountId, compatibleProfiles)
-                compatibleProfiles.size
+                repository.importProfiles(accountId, successes)
+                successes.size
             },
             onResult = onResult
         )
@@ -1701,8 +1616,8 @@ class G2RayViewModel internal constructor(
         val account = repository.accounts.value.firstOrNull { it.id == accountId } ?: return
         val accountProfileCount = repository.profiles.value.count { it.accountId == accountId }
         val now = System.currentTimeMillis()
-        val busy = currentVpnStartJob?.isActive == true ||
-            currentWakeJob?.isActive == true ||
+        val busy = currentWakeJob?.isActive == true ||
+            accountSwitchJob?.isActive == true ||
             configurationMutationJob?.isActive == true ||
             currentDelayProbeJob?.isActive == true ||
             routeOptimizationJob?.isActive == true
@@ -1740,12 +1655,7 @@ class G2RayViewModel internal constructor(
             _statusMessage.value = XrayCoreManager.MISSING_CORE_MESSAGE
             return
         }
-        if (VpnStateRepository.state.value.tunnelState !in setOf(
-                TunnelState.Disabled,
-                TunnelState.Disconnected,
-                TunnelState.Error
-            )
-        ) {
+        if (!optionalRouteTestsAllowed(VpnStateRepository.state.value.tunnelState)) {
             _statusMessage.value = "Stop VPN before optimizing routes."
             return
         }
@@ -1770,12 +1680,7 @@ class G2RayViewModel internal constructor(
         job = viewModelScope.launch(start = CoroutineStart.LAZY) {
             if (!manual) delay(AUTO_ROUTE_OPTIMIZATION_START_DELAY_MS)
             if (repository.activeSelection.value.accountId != accountId) return@launch
-            if (VpnStateRepository.state.value.tunnelState !in setOf(
-                    TunnelState.Disabled,
-                    TunnelState.Disconnected,
-                    TunnelState.Error
-                )
-            ) {
+            if (!optionalRouteTestsAllowed(VpnStateRepository.state.value.tunnelState)) {
                 return@launch
             }
 
@@ -1890,7 +1795,27 @@ class G2RayViewModel internal constructor(
             _profileDelayStates.value = _profileDelayStates.value + (id to ProfileDelayState(testing = true))
         }
         _statusMessage.value = "Verifying ${probes.size} routes through libXray from this phone..."
-        val summaries = measureQuickProfiles(probes.map { it.profile }, measurement = measurement)
+        val quickSummaries = measureQuickProfiles(probes.map { it.profile }, measurement = measurement)
+        val finalists = optimizationConfirmationCandidates(
+            parsedProfiles.firstOrNull { it.first.id == selection.profileId }?.second,
+            probes.map { it.profile }.zip(quickSummaries)
+        )
+        val confirmationByRoute = if (finalists.isNotEmpty()) {
+            _statusMessage.value = "Confirming response consistency on ${finalists.size} route finalists..."
+            val confirmed = withContext(Dispatchers.IO) {
+                routeProbeManagerFactory().measureDelaySummaryBatch(
+                    profiles = finalists,
+                    datDir = getApplication<Application>().filesDir.absolutePath,
+                    dpiCompatibilityEnabled = dpiCompatibilityEnabled.value,
+                    checkActive = { coroutineContext.ensureActive(); checkMeasurementNetwork(measurement) }
+                )
+            }
+            checkMeasurementNetwork(measurement)
+            finalists.map(VlessUriParser::semanticRouteKey).zip(confirmed).toMap()
+        } else emptyMap()
+        val summaries = probes.zip(quickSummaries).map { (probe, quick) ->
+            confirmationByRoute[VlessUriParser.semanticRouteKey(probe.profile)] ?: quick
+        }
         val delayMeasuredAt = System.currentTimeMillis()
         val measured = probes.zip(summaries)
         val successful = measured.filter { (_, summary) ->
@@ -1953,9 +1878,7 @@ class G2RayViewModel internal constructor(
             MAX_AUTO_THROUGHPUT_PROBES
         }
         val performanceTargets = measuredStored.asSequence()
-            .filter { (_, _, summary) ->
-                summary.success && summary.medianMs?.let { it in 1..9999 } == true
-            }
+            .filter { (_, _, summary) -> routeIsConfirmed(summary) }
             .sortedWith(
                 compareBy<Triple<StoredG2RayProfile, G2RayProfile, XrayDelaySummary>> {
                     if (it.first.id == selection.profileId) 0 else 1
@@ -1999,7 +1922,7 @@ class G2RayViewModel internal constructor(
         val updates = measuredStored.mapNotNull { (stored, _, summary) ->
             val delayMs = summary.medianMs?.takeIf { summary.success && it in 1..9999 }
             val performance = measuredPerformance[stored.id]
-            val preserveFreshAccurateHistory = delayMs != null &&
+            val preserveFreshAccurateHistory = summary.totalSamples < 3 && delayMs != null &&
                 stored.lastDelaySampleCount >= 3 &&
                 stored.lastDelaySuccessfulSamples * 2 >= stored.lastDelaySampleCount &&
                 ProfileHealth.isDelayFresh(stored, networkKey = networkKey)
@@ -2059,12 +1982,12 @@ class G2RayViewModel internal constructor(
             hasPerformanceEvidence = hasPerformanceEvidence
         )
         val best = measuredStored.asSequence()
-            .filter { (_, _, summary) -> summary.success && summary.medianMs?.let { it in 1..9999 } == true }
+            .filter { (_, _, summary) -> routeIsConfirmed(summary) }
             .minByOrNull { (stored, profile, summary) ->
                 comparisonScore(stored, profile, summary)
             }
         val current = measuredStored.firstOrNull { it.first.id == selection.profileId }
-            ?.takeIf { (_, _, summary) -> summary.success && summary.medianMs?.let { it in 1..9999 } == true }
+            ?.takeIf { (_, _, summary) -> routeIsConfirmed(summary) }
         val chosen = when {
             best == null -> current
             current == null || current.first.id == best.first.id -> best
@@ -2089,6 +2012,7 @@ class G2RayViewModel internal constructor(
         val selectedDelay = chosen?.third?.medianMs
         _statusMessage.value = buildString {
             append("Route optimization verified ${successful.size}/${probes.size} configs")
+            append(", consistency-confirmed ${confirmationByRoute.values.count(::routeIsConfirmed)}/${finalists.size}")
             if (addedCount > 0) append(", added $addedCount")
             if (measuredPerformance.isNotEmpty()) {
                 append(", transfer-tested ${measuredPerformance.values.count { it.success }}/${measuredPerformance.size}")
@@ -2097,6 +2021,8 @@ class G2RayViewModel internal constructor(
                 append(if (chosen.first.id == selection.profileId) ", kept " else ", selected ")
                 append(chosen.first.displayName)
                 selectedDelay?.let { append(" (${it} ms)") }
+            } else {
+                append(", selection unchanged: no route passed repeated checks")
             }
             append('.')
         }
@@ -2176,7 +2102,7 @@ class G2RayViewModel internal constructor(
             _statusMessage.value = "Wait for the current route test to finish."
             return
         }
-        if (VpnStateRepository.state.value.tunnelState in setOf(TunnelState.Starting, TunnelState.Connected, TunnelState.Stopping)) {
+        if (!optionalRouteTestsAllowed(VpnStateRepository.state.value.tunnelState)) {
             _profileDelayStates.value = _profileDelayStates.value + (
                 profileId to ProfileDelayState(
                     error = "Stop VPN before running real-delay test.",
@@ -2299,7 +2225,7 @@ class G2RayViewModel internal constructor(
             _statusMessage.value = "Wait for the current route test to finish."
             return
         }
-        if (VpnStateRepository.state.value.tunnelState in setOf(TunnelState.Starting, TunnelState.Connected, TunnelState.Stopping)) {
+        if (!optionalRouteTestsAllowed(VpnStateRepository.state.value.tunnelState)) {
             _statusMessage.value = "Stop VPN before refreshing real delays."
             return
         }

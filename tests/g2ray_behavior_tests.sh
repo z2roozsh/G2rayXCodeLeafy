@@ -20,6 +20,30 @@ pass() {
     echo "PASS: $*"
 }
 
+deadline_fixture_process_running() {
+    local pid="$1" stat state
+    builtin kill -0 "$pid" 2>/dev/null || return 1
+    # Git Bash exposes zombie state in procfs, but not via ps -o stat=.
+    if IFS= read -r stat 2>/dev/null < "/proc/$pid/stat"; then
+        state="${stat##*) }"
+        case "$state" in
+            [ZzXx]\ *) return 1 ;;
+            [A-Za-z]\ *) return 0 ;;
+        esac
+    fi
+    [[ "$(command ps -o stat= -p "$pid" 2>/dev/null)" != Z* ]]
+}
+
+TEST_PYTHON=""
+for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 &&
+        "$candidate" -c 'import sys; sys.exit(sys.version_info.major != 3)' >/dev/null 2>&1; then
+        TEST_PYTHON="$candidate"
+        break
+    fi
+done
+[[ -n "$TEST_PYTHON" ]] || fail "Python 3 is required; install python3 or a Python 3 python command"
+
 reset_runtime_paths() {
     DATA_DIR="$TMP_ROOT/data"
     LOG_DIR="$TMP_ROOT/logs"
@@ -41,6 +65,7 @@ reset_runtime_paths() {
     DNS_CANDIDATE_CACHE_FILE="$DATA_DIR/dns_candidate_cache.tsv"
     BOOT_STATUS_FILE="$DATA_DIR/boot_status.json"
     XHTTP_PATH_CACHE_FILE="$DATA_DIR/xhttp_path_cache"
+    XHTTP_MODE_CACHE_FILE="$DATA_DIR/xhttp_mode_cache"
     XHTTP_MODE_FILE="$DATA_DIR/xhttp_mode.txt"
     XHTTP_LINK_TUNING_FILE="$DATA_DIR/xhttp_link_tuning.txt"
     ANTI_SLEEP_DISABLED_FILE="$DATA_DIR/anti_sleep_mode_disabled"
@@ -85,6 +110,7 @@ reset_runtime_paths() {
     BG_TASKS_LOCK_DIR="$DATA_DIR/bg_tasks.lock"
     BG_TASKS_TOKEN_FILE="$DATA_DIR/bg_tasks.token"
     BG_TASKS_HEARTBEAT_FILE="$DATA_DIR/bg_tasks.heartbeat"
+    BG_WATCHDOG_PID_FILE="$DATA_DIR/bg_tasks.watchdog.pid"
     ROUTE_SETTLE_PID_FILE="$DATA_DIR/route_settle.pid"
     ROUTE_SETTLE_TOKEN_FILE="$DATA_DIR/route_settle.token"
     ROUTE_SETTLE_LOG_FILE="$LOG_DIR/route-settle.log"
@@ -172,21 +198,33 @@ test_existing_config_upgrade_disables_unrequested_origin_tfo() {
     (
         reset_runtime_paths
         write_test_vless_config
-        jq '.outbounds = [{"protocol":"freedom","tag":"direct","streamSettings":{"sockopt":{"tcpFastOpen":true,"tcpKeepAliveIdle":30,"tcpKeepAliveInterval":15}}},
-                          {"protocol":"freedom","tag":"custom","streamSettings":{"sockopt":{"tcpFastOpen":true}}}]' \
+        jq '.outbounds = [{"protocol":"freedom","tag":"direct","settings":{"domainStrategy":"UseIPv4","userLevel":1},"streamSettings":{"sockopt":{"tcpFastOpen":true,"tcpKeepAliveIdle":30,"tcpKeepAliveInterval":15}}},
+                          {"protocol":"freedom","tag":"custom","settings":{"domainStrategy":"UseIPv6"},"streamSettings":{"sockopt":{"tcpFastOpen":true}}}]' \
             "$CONFIG_FILE" > "$TMP_ROOT/tfo-fixture.json"
         mv "$TMP_ROOT/tfo-fixture.json" "$CONFIG_FILE"
         upgrade_config_dns
         jq -e '.outbounds[0].streamSettings.sockopt.tcpFastOpen == false and
+               .outbounds[0].streamSettings.sockopt.domainStrategy == "UseIPv4" and
+               .outbounds[0].settings == {"userLevel":1} and
                .outbounds[0].streamSettings.sockopt.tcpKeepAliveIdle == 30 and
                .outbounds[0].streamSettings.sockopt.tcpKeepAliveInterval == 15 and
+               .outbounds[1].settings.domainStrategy == "UseIPv6" and
                .outbounds[1].streamSettings.sockopt.tcpFastOpen == true and
                .inbounds[0].settings.clients[0].id == "11111111-2222-4333-8444-555555555555"' \
             "$CONFIG_FILE" >/dev/null || fail 'TFO migration changed identity/socket settings or retained unsafe default'
         G2RAY_TCP_FAST_OPEN=1 upgrade_config_dns
         jq -e '.outbounds[0].streamSettings.sockopt.tcpFastOpen == true' "$CONFIG_FILE" >/dev/null \
             || fail 'migration ignored an explicit TFO override'
-        pass 'TFO migration preserves UUID, keepalive, custom outbounds, and explicit overrides'
+        jq '.outbounds[0].settings += {domainStrategy:"UseIPv4", targetStrategy:"UseIPv6"}
+            | del(.outbounds[0].streamSettings.sockopt.domainStrategy)' \
+            "$CONFIG_FILE" > "$TMP_ROOT/tfo-fixture.json"
+        mv "$TMP_ROOT/tfo-fixture.json" "$CONFIG_FILE"
+        upgrade_config_dns || fail 'upgrade rejected a config with a custom strategy'
+        jq -e '.outbounds[0].settings.targetStrategy == "UseIPv6" and
+               .outbounds[0].settings.domainStrategy == "UseIPv4" and
+               (.outbounds[0].streamSettings.sockopt | has("domainStrategy") | not)' "$CONFIG_FILE" >/dev/null \
+            || fail 'upgrade rewrote a custom freedom DNS strategy'
+        pass 'IPv4 DNS and TFO migration preserves UUID, keepalive, custom outbounds, and explicit overrides'
     )
 }
 
@@ -650,6 +688,16 @@ test_xhttp_upload_tuning_is_reversible_and_bundle_compatible() {
     printf '11111111-2222-4333-8444-555555555555\n' > "$UUID_FILE"
     write_test_vless_config
     jq -e '.scMaxEachPostBytes == 60000 and .scMinPostsIntervalMs == 10 and .xmux.maxConnections >= 1 and .xmux.maxConnections <= 6 and .xmux.hKeepAlivePeriod > 0' <<< "$XHTTP_TUNED_EXTRA_JSON" >/dev/null || fail 'measured tuning is invalid or unbounded'
+
+    unset G2RAY_XHTTP_LINK_TUNING
+    link=$(generate_link_for_address 20.0.0.1)
+    [[ "$link" != *'&extra='* ]] || fail 'XHTTP tuning unexpectedly enabled by default'
+
+    G2RAY_XHTTP_LINK_TUNING=unexpected-value
+    link=$(generate_link_for_address 20.0.0.1)
+    [[ "$link" != *'&extra='* ]] || fail 'invalid XHTTP tuning preference enabled tuning'
+
+    G2RAY_XHTTP_LINK_TUNING=on
     link=$(generate_link_for_address 20.0.0.1)
     [[ "$link" == *"extra=$(url_encode_query_value "$XHTTP_TUNED_EXTRA_JSON")"* ]] || fail 'tuned links lost their extra object'
     write_codespace_import_bundle "$link"
@@ -1021,6 +1069,161 @@ test_background_heartbeat_reports_atomic_write_failure() {
         fi
     )
     pass "background heartbeat reports atomic state write failures"
+}
+
+test_background_restart_cannot_revive_a_stopped_generation() {
+    (
+        reset_runtime_paths
+        start_background_tasks "obsolete-token" || fail "superseded restart did not exit cleanly"
+        [[ ! -e "$BG_TASKS_PID" && ! -e "$BG_TASKS_TOKEN_FILE" && ! -e "$BG_WATCHDOG_PID_FILE" ]] \
+            || fail "queued watchdog restart recreated explicitly stopped state"
+        [[ ! -d "$BG_TASKS_LOCK_DIR" ]] || fail "superseded restart retained its lock"
+    )
+    pass "queued watchdog restart cannot revive an explicitly stopped generation"
+}
+
+test_background_watchdog_recovers_dead_owned_supervisors() {
+    (
+        reset_runtime_paths
+        local fixture="$TMP_ROOT/watchdog-fixture.sh" first_bg first_watchdog token p foreign_pid="" i
+        local -a starters=()
+        export G2RAY_TEST_SUPERVISOR_SOURCE="$SCRIPT"
+        export G2RAY_DATA_DIR="$DATA_DIR" G2RAY_LOG_DIR="$LOG_DIR"
+        cat > "$fixture" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+export G2RAY_SOURCE_ONLY=1
+source "$G2RAY_TEST_SUPERVISOR_SOURCE"
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+sleep() {
+    if [[ "${1:-}" == 30 ]]; then command sleep 0.1; else command sleep "$@"; fi
+}
+_background_tasks() {
+    write_background_supervisor_heartbeat
+    while background_supervisor_token_current; do command sleep 0.1; done
+}
+case "${1:-}" in
+    --background-supervisor) _background_tasks ;;
+    --background-watchdog) _background_watchdog ;;
+    *) exit 2 ;;
+esac
+SH
+        SCRIPT_PATH="$fixture"
+        trap 'stop_background_tasks >/dev/null 2>&1 || true; if [[ -n "$foreign_pid" ]]; then kill "$foreign_pid" 2>/dev/null || true; fi' EXIT
+        start_background_tasks || fail "fixture supervisor/watchdog failed to start"
+        first_bg=$(cat "$BG_TASKS_PID")
+        first_watchdog=$(cat "$BG_WATCHDOG_PID_FILE")
+        token=$(cat "$BG_TASKS_TOKEN_FILE")
+        for ((i=0; i<100; i++)); do
+            bg_tasks_running "$first_bg" && background_watchdog_running && break
+            sleep 0.05
+        done
+        bg_tasks_running "$first_bg" && background_watchdog_running || fail "fixture ownership was not verified"
+        start_background_tasks || fail "idempotent supervisor startup failed"
+        for ((i=0; i<4; i++)); do
+            (start_background_tasks) &
+            starters+=("$!")
+        done
+        for p in "${starters[@]}"; do
+            wait "$p" || fail "concurrent supervisor startup failed"
+        done
+        [[ "$(cat "$BG_TASKS_PID")" == "$first_bg" && "$(cat "$BG_WATCHDOG_PID_FILE")" == "$first_watchdog" ]] \
+            || fail "idempotent startup replaced a healthy process"
+        _atomic_write "$BG_TASKS_HEARTBEAT_FILE" "$first_bg $token 1"
+        sleep 0.4
+        [[ "$(cat "$BG_TASKS_PID")" == "$first_bg" ]] \
+            || fail "old heartbeat caused the watchdog to replace a live owned supervisor"
+        kill -KILL "$first_watchdog"
+        start_background_tasks || fail "healthy supervisor could not regain its missing watchdog"
+        [[ "$(cat "$BG_TASKS_PID")" == "$first_bg" ]] \
+            || fail "rearming the watchdog replaced a healthy supervisor"
+        background_watchdog_running || fail "replacement watchdog ownership was not confirmed"
+
+        kill -KILL "$first_bg"
+        for ((i=0; i<200; i++)); do
+            p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
+            if [[ "$p" != "$first_bg" ]] && bg_tasks_running "$p" && background_watchdog_running; then break; fi
+            sleep 0.05
+        done
+        [[ "$p" != "$first_bg" ]] && bg_tasks_running "$p" && background_watchdog_running \
+            || fail "watchdog did not restore the supervisor after unexpected death"
+        [[ "$(cat "$BG_TASKS_TOKEN_FILE")" != "$token" ]] || fail "replacement reused the dead generation token"
+        grep -Fq 'action=restart' "$LOG_FILE" || fail "watchdog restart was not observable"
+
+        command sleep 30 &
+        foreign_pid=$!
+        _atomic_write "$BG_TASKS_PID" "$foreign_pid"
+        _atomic_write "$BG_TASKS_HEARTBEAT_FILE" "$foreign_pid $(cat "$BG_TASKS_TOKEN_FILE") $(date +%s)"
+        for ((i=0; i<200; i++)); do
+            p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
+            if [[ "$p" != "$foreign_pid" ]] && bg_tasks_running "$p" && background_watchdog_running; then break; fi
+            sleep 0.05
+        done
+        [[ "$p" != "$foreign_pid" ]] && bg_tasks_running "$p" && background_watchdog_running \
+            || fail "watchdog did not replace an unowned stale PID record"
+        kill -0 "$foreign_pid" || fail "watchdog signalled a foreign process"
+        token=$(cat "$BG_TASKS_TOKEN_FILE")
+        stop_background_tasks || fail "explicit supervisor shutdown failed"
+        start_background_tasks "$token" || fail "obsolete queued restart failed to exit cleanly"
+        sleep 0.4
+        [[ ! -e "$BG_TASKS_PID" && ! -e "$BG_TASKS_TOKEN_FILE" && ! -e "$BG_WATCHDOG_PID_FILE" ]] \
+            || fail "watchdog resurrected an explicitly stopped supervisor"
+    )
+    pass "watchdog deduplicates healthy starts, restores dead supervisors, and respects ownership and shutdown"
+}
+
+test_background_watchdog_reports_pid_commit_failure() {
+    (
+        reset_runtime_paths
+        local original_atomic rc=0
+        original_atomic=$(declare -f _atomic_write)
+        printf 'watchdog-test-token\n' > "$BG_TASKS_TOKEN_FILE"
+        SCRIPT_PATH="$TMP_ROOT/watchdog-failed-state-fixture.sh"
+        printf '#!/usr/bin/env bash\nexec sleep 30\n' > "$SCRIPT_PATH"
+        _atomic_write() { return 1; }
+        start_background_watchdog >/dev/null 2>&1 || rc=$?
+        eval "$original_atomic"
+        [[ "$rc" -ne 0 && ! -e "$BG_WATCHDOG_PID_FILE" ]] \
+            || fail "watchdog startup masked its PID commit failure"
+    )
+    pass "watchdog startup reports state-commit failure"
+}
+
+test_background_stop_reports_failed_state_cleanup() {
+    (
+        reset_runtime_paths
+        printf 'stop-test-token\n' > "$BG_TASKS_TOKEN_FILE"
+        rm() {
+            [[ "$*" != *"$BG_TASKS_TOKEN_FILE"* ]] || return 1
+            command rm "$@"
+        }
+        if stop_background_tasks; then
+            fail "background shutdown reported success while its intent token could not be removed"
+        fi
+        [[ -f "$BG_TASKS_TOKEN_FILE" && ! -d "$BG_TASKS_LOCK_DIR" ]] \
+            || fail "failed shutdown did not preserve state and release its startup lock"
+    )
+    pass "background shutdown reports failed intent-state cleanup without retaining its lock"
+}
+
+test_background_heartbeat_cannot_override_visible_process_ownership() {
+    (
+        reset_runtime_paths
+        local p
+        command sleep 30 &
+        p=$!
+        trap 'kill "$p" 2>/dev/null || true; wait "$p" 2>/dev/null || true' EXIT
+        printf 'reused-pid-token\n' > "$BG_TASKS_TOKEN_FILE"
+        printf '%s\n' "$p" > "$BG_TASKS_PID"
+        printf '%s reused-pid-token %s\n' "$p" "$(date +%s)" > "$BG_TASKS_HEARTBEAT_FILE"
+        [[ -r "/proc/$p/environ" ]] || fail "fixture process environment is not readable"
+        if background_supervisor_heartbeat_running "$p"; then
+            fail "a fresh persisted heartbeat overruled the foreign process's actual ownership"
+        fi
+        stop_background_tasks || fail "stale supervisor state could not be cleared"
+        kill -0 "$p" || fail "background shutdown signalled a recycled foreign PID"
+    )
+    pass "fresh heartbeat cannot validate or signal a visibly foreign recycled PID"
 }
 
 test_stale_temp_sweep_removes_only_old_owned_artifacts() {
@@ -1972,7 +2175,7 @@ JSON
 test_boot_status_helpers_record_silent_start_result() {
     reset_runtime_paths
     write_boot_status "route_settling" "silent_start" "Route still settling" "404" "33"
-    python -m json.tool "$BOOT_STATUS_FILE" >/dev/null || fail "boot status is not valid JSON"
+    "$TEST_PYTHON" -m json.tool "$BOOT_STATUS_FILE" >/dev/null || fail "boot status is not valid JSON"
     grep -Fq '"status": "route_settling"' "$BOOT_STATUS_FILE" || fail "boot status missing status"
     boot_status_summary | grep -Fq 'route_settling' || fail "boot status summary missing status"
     pass "boot status helpers persist readable startup state"
@@ -2003,7 +2206,7 @@ test_generate_config_replaces_stale_no_config_boot_status() {
         xray_validate_config_file() { return 0; }
         xhttp_probe_metrics() { printf '200 12 ready\n'; }
         generate_config >/dev/null
-        python -m json.tool "$BOOT_STATUS_FILE" >/dev/null || fail "generated boot status is not valid JSON"
+        "$TEST_PYTHON" -m json.tool "$BOOT_STATUS_FILE" >/dev/null || fail "generated boot status is not valid JSON"
         grep -Fq '"status": "ready"' "$BOOT_STATUS_FILE" || fail "generate_config did not mark boot status ready"
         grep -Fq '"reason": "generate_config"' "$BOOT_STATUS_FILE" || fail "generate_config did not replace stale silent_start reason"
         ! boot_status_summary | grep -Fq 'no_config' || fail "diagnostics would still show stale no_config boot status"
@@ -2403,8 +2606,8 @@ test_config_exports_write_local_only_metadata() {
     GITHUB_USER="tester"
     write_config_exports_from_links "vless://example-one" "vless://example-two" >/dev/null
 
-    python -m json.tool "$CONFIG_META_FILE" >/dev/null || fail "config metadata is not valid JSON"
-    python -m json.tool "$CODESPACE_BUNDLE_FILE" >/dev/null || fail "Codespace import bundle is not valid JSON"
+    "$TEST_PYTHON" -m json.tool "$CONFIG_META_FILE" >/dev/null || fail "config metadata is not valid JSON"
+    "$TEST_PYTHON" -m json.tool "$CODESPACE_BUNDLE_FILE" >/dev/null || fail "Codespace import bundle is not valid JSON"
     grep -Fq '"codespace_name": "behavior-space"' "$CODESPACE_BUNDLE_FILE" \
         || fail "Codespace import bundle is missing its Codespace name"
     grep -Fq '"configs": [' "$CODESPACE_BUNDLE_FILE" \
@@ -2481,7 +2684,7 @@ test_config_exports_are_stable_client_artifacts() {
     mapfile -t mobile_lines < "$MOBILE_CONFIG_FILE"
     [[ "${mobile_lines[0]:-}" == "$link1" && "${mobile_lines[1]:-}" == "$link2" ]] \
         || fail "mobile export did not preserve generated link ordering"
-    python - "$SUBSCRIPTION_FILE" "$link1" "$link2" <<'PY' || fail "subscription export does not decode to expected VLESS links"
+    "$TEST_PYTHON" - "$SUBSCRIPTION_FILE" "$link1" "$link2" <<'PY' || fail "subscription export does not decode to expected VLESS links"
 import base64, pathlib, sys
 decoded = base64.b64decode(pathlib.Path(sys.argv[1]).read_text()).decode().splitlines()
 if decoded != [sys.argv[2], sys.argv[3]]:
@@ -2835,6 +3038,65 @@ JSON
     pass "generated links use the active XHTTP config mode"
 }
 
+test_xhttp_mode_cache_avoids_reparsing_and_tracks_config_changes() {
+    (
+        reset_runtime_paths
+        local calls="$TMP_ROOT/mode-jq-count" i
+        : > "$calls"
+        write_test_vless_config
+        jq() { printf 'call\n' >> "$calls"; command jq "$@"; }
+        for ((i=0; i<20; i++)); do
+            [[ "$(xhttp_active_inbound_mode)" == packet-up ]] || fail "cached mode changed"
+        done
+        [[ "$(wc -l < "$calls")" -eq 1 ]] || fail "mode cache reparsed unchanged config"
+        command jq '.inbounds[0].streamSettings.xhttpSettings.mode = "stream-one"' "$CONFIG_FILE" > "${CONFIG_FILE}.new"
+        mv "${CONFIG_FILE}.new" "$CONFIG_FILE"
+        [[ "$(xhttp_active_inbound_mode)" == stream-one ]] || fail "mode cache survived a config replacement"
+        [[ "$(wc -l < "$calls")" -eq 2 ]] || fail "replacement config was not parsed exactly once"
+        printf 'invalid json\n' > "$CONFIG_FILE"
+        [[ -z "$(xhttp_active_inbound_mode)" ]] || fail "corrupt config reused the old mode"
+        rm "$CONFIG_FILE"
+        [[ -z "$(xhttp_active_inbound_mode)" ]] || fail "missing config reused the old mode"
+    )
+    pass "XHTTP mode cache parses unchanged config once and invalidates on replacement, corruption, and deletion"
+}
+
+test_xhttp_mode_cache_preserves_preferences_and_write_failure_fallback() {
+    (
+        reset_runtime_paths
+        write_test_vless_config
+        command jq '.inbounds[0].streamSettings.xhttpSettings.mode = "auto"' "$CONFIG_FILE" > "${CONFIG_FILE}.new"
+        mv "${CONFIG_FILE}.new" "$CONFIG_FILE"
+        G2RAY_XHTTP_MODE=packet-up
+        [[ "$(xhttp_config_mode)" == packet-up ]] || fail "auto inbound ignored the link preference"
+        G2RAY_XHTTP_MODE=stream-up
+        [[ "$(xhttp_config_mode)" == stream-up ]] || fail "mode cache froze the link preference"
+        printf '%s\tinvalid-mode\n' "$(file_fingerprint "$CONFIG_FILE")" > "$XHTTP_MODE_CACHE_FILE"
+        [[ "$(xhttp_active_inbound_mode)" == auto ]] || fail "invalid cached mode was trusted"
+        rm "$XHTTP_MODE_CACHE_FILE"
+        _atomic_write() { return 1; }
+        [[ "$(xhttp_active_inbound_mode)" == auto ]] || fail "cache write failure blocked a valid mode lookup"
+    )
+    pass "XHTTP mode cache preserves auto-mode preferences and falls back after invalid cache or failed writes"
+}
+
+test_xhttp_mode_cache_does_not_commit_a_concurrent_config_swap() {
+    (
+        reset_runtime_paths
+        write_test_vless_config
+        jq() {
+            command jq "$@"
+            command jq '.inbounds[0].streamSettings.xhttpSettings.mode = "stream-up"' "$CONFIG_FILE" > "${CONFIG_FILE}.new"
+            mv "${CONFIG_FILE}.new" "$CONFIG_FILE"
+        }
+        [[ "$(xhttp_active_inbound_mode)" == packet-up ]] || fail "original parsed mode was not returned"
+        [[ ! -e "$XHTTP_MODE_CACHE_FILE" ]] || fail "concurrent replacement was cached under the old fingerprint"
+        unset -f jq
+        [[ "$(xhttp_active_inbound_mode)" == stream-up ]] || fail "concurrent replacement mode was lost"
+    )
+    pass "XHTTP mode cache cannot associate a concurrent replacement with the old config hash"
+}
+
 test_xhttp_mode_reports_export_failure() {
     (
         reset_runtime_paths
@@ -3075,7 +3337,7 @@ test_websocket_fallback_adds_config_and_public_port() {
             return 0
         }
         generate_config >/dev/null
-        python -m json.tool "$CONFIG_FILE" >/dev/null || fail "generated WS fallback config is not valid JSON"
+        "$TEST_PYTHON" -m json.tool "$CONFIG_FILE" >/dev/null || fail "generated WS fallback config is not valid JSON"
         grep -Fq '"tag": "vless-ws"' "$CONFIG_FILE" || fail "WS fallback did not add vless-ws inbound"
         grep -Fq '"network": "ws"' "$CONFIG_FILE" || fail "WS fallback inbound is not WebSocket"
         grep -Fq '"path": "/ws"' "$CONFIG_FILE" || fail "WS fallback inbound does not use /ws path"
@@ -3098,7 +3360,7 @@ test_config_metadata_sanitizes_invalid_max_fallback_links() {
     GITHUB_USER="tester"
 
     write_config_metadata 1 "abc123"
-    python -m json.tool "$CONFIG_META_FILE" >/dev/null || fail "metadata JSON broke when max fallback links was invalid"
+    "$TEST_PYTHON" -m json.tool "$CONFIG_META_FILE" >/dev/null || fail "metadata JSON broke when max fallback links was invalid"
     grep -Fq '"max_fallback_links": 20' "$CONFIG_META_FILE" \
         || fail "invalid max fallback link setting was not sanitized to default 20"
     pass "config metadata sanitizes invalid max fallback link settings"
@@ -3141,7 +3403,7 @@ test_bench_json_reports_deterministic_budgets() {
     fi
     bench_file="$TMP_ROOT/bench.json"
     printf '%s\n' "$output" > "$bench_file"
-    python - "$bench_file" <<'PY' || fail "bench_json did not return valid budget JSON"
+    "$TEST_PYTHON" - "$bench_file" <<'PY' || fail "bench_json did not return valid budget JSON"
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     data = json.load(handle)
@@ -3177,7 +3439,7 @@ PY
     fi
     [[ ! -e "$bench_root/data" && ! -e "$bench_root/logs" ]] \
         || fail "bench --json --mock created runtime dirs in the command working tree"
-    python - "$command_output" <<'PY' || fail "bench --json --mock command did not return valid passing JSON"
+    "$TEST_PYTHON" - "$command_output" <<'PY' || fail "bench --json --mock command did not return valid passing JSON"
 import json, sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     data = json.load(handle)
@@ -3213,12 +3475,13 @@ test_low_overhead_env_can_be_overridden_by_toggle() {
     pass "low-overhead mode can be explicitly toggled even when env default is enabled"
 }
 
-test_anti_sleep_preference_persists_across_headless_reconciliation() {
+test_anti_sleep_is_retired_and_legacy_runtime_is_stopped() {
     (
         reset_runtime_paths
         local tmux_state="$TMP_ROOT/mock-tmux-state" new_session_calls="$TMP_ROOT/mock-tmux-starts"
         : > "$new_session_calls"
         tmux() {
+            [[ "${2:-}" == -t && "${3:-}" == '=g2ray_keepalive' ]] || fail "anti-sleep cleanup used a non-exact Tmux target"
             case "${1:-}" in
                 has-session) [[ -f "$tmux_state" ]] ;;
                 new-session)
@@ -3230,24 +3493,16 @@ test_anti_sleep_preference_persists_across_headless_reconciliation() {
             esac
         }
 
-        anti_sleep_enabled || fail "anti-sleep should default to enabled"
+        anti_sleep_enabled && fail "retired anti-sleep was enabled by default"
+        : > "$tmux_state"
         sync_anti_sleep_runtime
-        [[ -f "$tmux_state" ]] || fail "headless reconciliation did not start enabled anti-sleep"
-
-        disable_anti_sleep
-        anti_sleep_enabled && fail "anti-sleep disable preference was not persisted"
-        [[ ! -f "$tmux_state" ]] || fail "disabling anti-sleep left its runtime alive"
-
+        [[ ! -f "$tmux_state" && -f "$ANTI_SLEEP_DISABLED_FILE" ]] || fail "legacy anti-sleep runtime was not disabled"
+        if enable_anti_sleep; then fail "retired anti-sleep could still be enabled"; fi
         sync_anti_sleep_runtime
-        [[ ! -f "$tmux_state" ]] || fail "headless reconciliation ignored the disabled preference"
-        [[ "$(wc -l < "$new_session_calls")" -eq 1 ]] \
-            || fail "disabled anti-sleep was restarted during reconciliation"
-
-        enable_anti_sleep
-        anti_sleep_enabled || fail "anti-sleep enable preference was not persisted"
-        [[ -f "$tmux_state" ]] || fail "enabling anti-sleep did not start its runtime"
+        [[ ! -f "$tmux_state" && ! -f "$DATA_DIR/keepalive.sh" ]] || fail "retired keep-alive was recreated"
+        [[ ! -s "$new_session_calls" ]] || fail "retired anti-sleep created a Tmux session"
     )
-    pass "anti-sleep preference survives headless and interactive runtime reconciliation"
+    pass "retired anti-sleep stops the legacy session and cannot be re-enabled"
 }
 
 test_low_overhead_keeps_important_state_logs() {
@@ -3259,6 +3514,46 @@ test_low_overhead_keeps_important_state_logs() {
     grep -Fq "runtime_ready reason=test" "$LOG_FILE" || fail "low overhead suppressed important runtime_ready INFO"
     disable_low_overhead_mode
     pass "low-overhead mode preserves important state-transition INFO logs"
+}
+
+test_anti_sleep_cleanup_failures_do_not_block_runtime() {
+    (
+        reset_runtime_paths
+        local mode resumed marker attempts
+        for mode in marker stop; do
+            resumed="$TMP_ROOT/anti-cleanup-${mode}-continued"
+            marker="$TMP_ROOT/anti-cleanup-${mode}-marker"
+            attempts="$TMP_ROOT/anti-cleanup-${mode}-attempts"
+            mkdir -p "$marker"
+            : > "$LOG_FILE"
+            if ! G2RAY_DATA_DIR="$DATA_DIR" G2RAY_LOG_DIR="$LOG_DIR" bash -c '
+                set -euo pipefail
+                source "$1"
+                ANTI_SLEEP_DISABLED_FILE="$2"
+                ATTEMPT_LOG="$4"
+                CLEANUP_MODE="$5"
+                _atomic_write() { [[ "$CLEANUP_MODE" == stop ]]; }
+                anti_sleep_running() { return 0; }
+                tmux() {
+                    printf "%s\n" "$*" >> "$ATTEMPT_LOG"
+                    [[ "$CLEANUP_MODE" != stop ]]
+                }
+                sync_anti_sleep_runtime
+                printf "continued\n" > "$3"
+            ' bash "$SCRIPT" "$marker" "$resumed" "$attempts" "$mode" > "$TMP_ROOT/anti-cleanup-${mode}.log" 2>&1; then
+                fail "legacy anti-sleep $mode cleanup failure blocked runtime startup"
+            fi
+            [[ -f "$resumed" ]] || fail "runtime did not continue after $mode cleanup failure"
+            grep -Fxq 'kill-session -t =g2ray_keepalive' "$attempts" || fail "legacy cleanup did not attempt the exact owned session"
+            grep -Fq 'legacy_cleanup_incomplete action=continue' "$LOG_FILE" || fail "cleanup failure was not logged"
+            if [[ "$mode" == marker ]]; then
+                grep -Fq 'cleanup_marker_write_failed' "$LOG_FILE" || fail "marker failure was not identified"
+            else
+                grep -Fq 'legacy_session_stop_failed' "$LOG_FILE" || fail "session stop failure was not identified"
+            fi
+        done
+    )
+    pass 'legacy anti-sleep marker and session cleanup failures never block normal runtime startup'
 }
 
 test_latency_focus_mode_suppresses_noncritical_info_but_preserves_warnings() {
@@ -3418,7 +3713,7 @@ test_doctor_json_reports_probe_state() {
     }
     background_supervisor_status() { printf 'pid=1 running=heartbeat version=ok token=present heartbeat_age=1s\n'; }
     output="$(print_doctor_json)"
-    python -m json.tool <<< "$output" >/dev/null || fail "doctor json became invalid when probe reason is present"
+    "$TEST_PYTHON" -m json.tool <<< "$output" >/dev/null || fail "doctor json became invalid when probe reason is present"
     grep -Fq '"codespace": "behavior-space"' <<< "$output" || fail "doctor json missing codespace"
     grep -Fq '"edge_probe": {"http_status": 404' <<< "$output" || fail "doctor json missing edge probe"
     grep -Fq '"next_action_code": "wait_route_or_recover"' <<< "$output" || fail "doctor json missing actionable next_action_code"
@@ -3438,7 +3733,7 @@ test_doctor_json_sanitizes_invalid_port() {
     xhttp_probe_metrics() { printf '0 0\n'; }
     background_supervisor_status() { printf 'pid=none running=false version=missing token=missing heartbeat_age=unknown\n'; }
     output="$(print_doctor_json)"
-    python -m json.tool <<< "$output" >/dev/null || fail "doctor json is invalid with nonnumeric XRAY_PORT"
+    "$TEST_PYTHON" -m json.tool <<< "$output" >/dev/null || fail "doctor json is invalid with nonnumeric XRAY_PORT"
     grep -Fq '"port": 443' <<< "$output" || fail "doctor json did not sanitize invalid XRAY_PORT to 443"
     pass "doctor json remains valid with invalid port input"
 }
@@ -3647,7 +3942,7 @@ test_recover_now_json_reports_ready_contract() {
         output="$(recover_now_json)"
         rc=$?
         [[ "$rc" -eq 0 ]] || fail "ready recover_now_json returned $rc"
-        python -m json.tool <<< "$output" >/dev/null || fail "recover_now_json returned invalid JSON"
+        "$TEST_PYTHON" -m json.tool <<< "$output" >/dev/null || fail "recover_now_json returned invalid JSON"
         grep -Fq '"ok": true' <<< "$output" || fail "recover_now_json did not report ok=true"
         grep -Fq '"status": "ready"' <<< "$output" || fail "recover_now_json did not report ready status"
         grep -Fq '"route_ready": true' <<< "$output" || fail "recover_now_json did not report route_ready=true"
@@ -3677,7 +3972,7 @@ test_recover_now_json_reports_settling_contract() {
             rc=$?
         fi
         [[ "$rc" -ne 0 ]] || fail "settling recover_now_json returned zero"
-        python -m json.tool <<< "$output" >/dev/null || fail "settling recover_now_json returned invalid JSON"
+        "$TEST_PYTHON" -m json.tool <<< "$output" >/dev/null || fail "settling recover_now_json returned invalid JSON"
         grep -Fq '"ok": false' <<< "$output" || fail "recover_now_json did not report ok=false while settling"
         grep -Fq '"status": "settling"' <<< "$output" || fail "recover_now_json did not report settling status"
         grep -Fq '"route_ready": false' <<< "$output" || fail "recover_now_json did not report route_ready=false"
@@ -3701,7 +3996,7 @@ test_recover_now_json_treats_followup_ready_probe_as_success() {
         output="$(recover_now_json)"
         rc=$?
         [[ "$rc" -eq 0 ]] || fail "ready follow-up probe should make recover_now_json exit zero, got $rc"
-        python -m json.tool <<< "$output" >/dev/null || fail "follow-up ready recover_now_json returned invalid JSON"
+        "$TEST_PYTHON" -m json.tool <<< "$output" >/dev/null || fail "follow-up ready recover_now_json returned invalid JSON"
         grep -Fq '"ok": true' <<< "$output" || fail "follow-up ready recover_now_json did not report ok=true"
         grep -Fq '"status": "ready"' <<< "$output" || fail "follow-up ready recover_now_json did not report ready"
         grep -Fq '"exit_code": 0' <<< "$output" || fail "follow-up ready recover_now_json did not expose final exit_code=0"
@@ -3854,7 +4149,7 @@ test_structured_log_jsonl_is_parseable_with_special_chars() {
     reset_runtime_paths
     log_event INFO $'route_unusable detail="bad route" path=C:\\tmp\\x\nnext-line'
     log_event WARN "fallback_route_unusable ip=20.0.0.1 xhttp_probe=404"
-    python - "$STRUCTURED_LOG_FILE" <<'PY' || fail "structured event log contains invalid JSONL"
+    "$TEST_PYTHON" - "$STRUCTURED_LOG_FILE" <<'PY' || fail "structured event log contains invalid JSONL"
 import json
 import sys
 path = sys.argv[1]
@@ -3921,7 +4216,7 @@ test_support_bundle_redacts_sensitive_material() {
     grep -R -Fq '<vless-redacted>' "$extract" || fail "support bundle did not mark redacted VLESS links"
     grep -R -Fq '<codespace-redacted>' "$extract" || fail "support bundle did not mark redacted Codespace identity"
     grep -R -Fq '<ip-redacted>' "$extract" || fail "support bundle did not mark redacted route IPs"
-    python - "$extract/logs/g2ray-events.jsonl" <<'PY' || fail "support bundle redaction corrupted structured JSONL"
+    "$TEST_PYTHON" - "$extract/logs/g2ray-events.jsonl" <<'PY' || fail "support bundle redaction corrupted structured JSONL"
 import json
 import sys
 with open(sys.argv[1], encoding="utf-8") as fh:
@@ -4285,14 +4580,316 @@ test_deadline_preserves_status_without_a_status_write() {
             builtin printf "$@"
         }
         local rc=0 attempt
+        # This fixture checks exit status recovery, not the one-second deadline.
+        # Leave room for process startup and polling on a loaded Windows host.
         for attempt in {1..25}; do
             rc=0
-            run_with_deadline 1 bash -c 'exit 37' || rc=$?
+            run_with_deadline 5 bash -c 'exit 37' || rc=$?
             [[ "$rc" == 37 ]] || fail "a failed status write hid the command failure: $rc"
-            run_with_deadline 1 true || fail 'a failed status write invented a command failure'
+            run_with_deadline 5 true || fail 'a failed status write invented a command failure'
         done
     )
     pass 'deadline preserves command exit status when its status write fails'
+}
+
+test_deadline_result_write_failure_during_liveness_check_preserves_status() {
+    (
+        reset_runtime_paths
+        local release="$TMP_ROOT/deadline-result-release" expected rc
+        printf() {
+            [[ "${1:-}" != '%s\n' ]] || return 1
+            builtin printf "$@"
+        }
+        deadline_result_work() {
+            while [[ ! -e "$release" ]]; do sleep 0.01; done
+            return "$expected"
+        }
+        kill() {
+            if [[ "${1:-}" == -0 && "${2:-}" =~ ^[0-9]+$ && ! -e "$release" ]]; then
+                # The parent saw the ready marker. Finish the child before its
+                # liveness check, forcing the result-write/exit race exactly.
+                : > "$release"
+                wait "$2" 2>/dev/null || true
+            fi
+            builtin kill "$@"
+        }
+        for expected in 0 37; do
+            rm -f "$release"
+            rc=0
+            run_with_deadline 5 deadline_result_work || rc=$?
+            [[ "$rc" == "$expected" ]] || fail "result-write race changed exit $expected to $rc"
+        done
+    )
+    pass 'deadline preserves real exit status when result-write failure races with child exit'
+}
+
+test_deadline_parent_reschedule_uses_actual_completion_time() {
+    (
+        reset_runtime_paths
+        local release="$TMP_ROOT/deadline-parent-release" parent_pid="$BASHPID" original_clock rc=0
+        original_clock=$(declare -f deadline_time_us)
+        eval "${original_clock/deadline_time_us/deadline_fixture_clock}"
+        deadline_parent_work() {
+            while [[ ! -e "$release" ]]; do sleep 0.01; done
+        }
+        deadline_time_us() {
+            if [[ "$BASHPID" == "$parent_pid" && "$1" == now_us ]]; then
+                : > "$release"
+                wait "$pid" 2>/dev/null || true
+                # Model the parent not being scheduled until after its budget.
+                builtin printf -v "$1" '%s' "$((start_us + budget_us + 1))"
+            else
+                deadline_fixture_clock "$@"
+            fi
+        }
+        run_with_deadline 5 deadline_parent_work || rc=$?
+        [[ "$rc" == 0 ]] || fail "parent scheduling delay rejected an in-budget completion: $rc"
+    )
+    pass 'deadline rechecks task completion before treating a delayed parent as a timeout'
+}
+
+test_deadline_child_finishing_after_clock_sample_is_still_bounded() {
+    (
+        reset_runtime_paths
+        local release="$TMP_ROOT/deadline-late-release" parent_pid="$BASHPID" original_clock rc=0
+        original_clock=$(declare -f deadline_time_us)
+        eval "${original_clock/deadline_time_us/deadline_fixture_clock}"
+        deadline_late_work() {
+            while [[ ! -e "$release" ]]; do sleep 0.01; done
+        }
+        deadline_time_us() {
+            if [[ "$1" == completed_us ]]; then
+                builtin printf -v "$1" '%s' "$((start_us + budget_us + 1))"
+            elif [[ "$BASHPID" == "$parent_pid" && "$1" == now_us ]]; then
+                : > "$release"
+                wait "$pid" 2>/dev/null || true
+                # The parent's sample predates the child's late completion.
+                builtin printf -v "$1" '%s' "$((start_us + 1))"
+            else
+                deadline_fixture_clock "$@"
+            fi
+        }
+        run_with_deadline 5 deadline_late_work || rc=$?
+        [[ "$rc" == 124 ]] || fail "a stale parent clock sample allowed late completion: $rc"
+    )
+    pass 'deadline validates completion time even if the child exits between parent checks'
+}
+
+test_deadline_missing_completion_evidence_cannot_report_late_success() {
+    (
+        reset_runtime_paths
+        local release="$TMP_ROOT/deadline-missing-release" parent_pid="$BASHPID" original_clock rc=0
+        original_clock=$(declare -f deadline_time_us)
+        eval "${original_clock/deadline_time_us/deadline_fixture_clock}"
+        printf() {
+            [[ "${1:-}" != '%s\n' ]] || return 1
+            builtin printf "$@"
+        }
+        deadline_missing_work() {
+            while [[ ! -e "$release" ]]; do sleep 0.01; done
+        }
+        kill() {
+            if [[ "${1:-}" == -0 && "${2:-}" =~ ^[0-9]+$ && ! -e "$release" ]]; then
+                : > "$release"
+                wait "$2" 2>/dev/null || true
+            fi
+            builtin kill "$@"
+        }
+        deadline_time_us() {
+            if [[ "$BASHPID" == "$parent_pid" && "$1" == completed_us ]]; then
+                builtin printf -v "$1" '%s' "$((start_us + budget_us + 1))"
+            else
+                deadline_fixture_clock "$@"
+            fi
+        }
+        run_with_deadline 5 deadline_missing_work || rc=$?
+        [[ "$rc" == 124 ]] || fail "missing completion evidence allowed a late success or wrong error: $rc"
+    )
+    pass 'deadline cannot report success without proof of completion inside the budget'
+}
+
+test_deadline_child_clock_failure_remains_an_error() {
+    (
+        reset_runtime_paths
+        local original_clock rc=0
+        original_clock=$(declare -f deadline_time_us)
+        eval "${original_clock/deadline_time_us/deadline_fixture_clock}"
+        deadline_time_us() {
+            [[ "$1" != completed_us ]] || return 1
+            deadline_fixture_clock "$@"
+        }
+        run_with_deadline 5 true || rc=$?
+        [[ "$rc" == 125 ]] || fail "child clock failure was accepted as success: $rc"
+    )
+    pass 'deadline keeps explicit child clock failure distinct from a missing result write'
+}
+
+test_deadline_partial_ready_write_never_launches_work() {
+    (
+        reset_runtime_paths
+        local ran="$TMP_ROOT/deadline-partial-ready-ran" rc=0
+        builtin() {
+            if [[ "${1:-}" == printf && "${2:-}" == 'ready\n' ]]; then
+                command builtin printf r
+                sleep 0.25
+                return 1
+            fi
+            command builtin "$@"
+        }
+        run_with_deadline 5 touch "$ran" || rc=$?
+        [[ "$rc" == 125 ]] || fail "failed ready write returned $rc instead of initialization failure"
+        [[ ! -e "$ran" ]] || fail 'a partial startup marker allowed unverified work to run'
+    )
+    pass 'deadline requires a complete startup marker before launching work'
+}
+
+test_deadline_failed_ready_write_stops_the_isolated_group() {
+    (
+        reset_runtime_paths
+        local child_file="$TMP_ROOT/deadline-ready-descendant" group='' child rc=0
+        trap '[[ -z "$group" ]] || command builtin kill -KILL -- "-$group" 2>/dev/null || true' EXIT
+        deadline_ready_work() {
+            sleep 30 &
+            local spawned=$!
+            command builtin printf '%s\n' "$spawned" > "$child_file"
+            wait "$spawned"
+        }
+        builtin() {
+            if [[ "${1:-}" == printf && "${2:-}" == 'ready\n' ]]; then
+                group="$pid"
+                command builtin "$@"
+                local attempt
+                for attempt in {1..200}; do
+                    [[ -s "$child_file" ]] && break
+                    sleep 0.01
+                done
+                return 1
+            fi
+            command builtin "$@"
+        }
+        run_with_deadline 10 deadline_ready_work || rc=$?
+        [[ "$rc" == 125 ]] || fail "ready-write failure returned unexpected status $rc"
+        child=$(cat "$child_file" 2>/dev/null || true)
+        [[ "$child" =~ ^[0-9]+$ ]] || fail 'ready-write fixture did not reach descendant creation'
+        sleep 0.2
+        ! deadline_fixture_process_running "$child" || fail 'ready-write failure left a descendant running'
+    )
+    pass 'deadline stops all isolated descendants when readiness publication fails'
+}
+
+test_deadline_uses_completion_time_when_parent_is_delayed() {
+    (
+        reset_runtime_paths
+        local delayed=false rc=0
+        deadline_delayed_cleanup() { trap 'sleep 2' EXIT; return 0; }
+        kill() {
+            if [[ "${1:-}" == -0 && "${2:-}" != -- && "$delayed" == false ]]; then
+                delayed=true
+                sleep 3
+            fi
+            builtin kill "$@"
+        }
+        run_with_deadline 1 deadline_delayed_cleanup || rc=$?
+        [[ "$rc" == 124 ]] || fail "a delayed parent accepted cleanup after its deadline: $rc"
+        delayed=false
+        run_with_deadline 1 true || fail 'a delayed parent rejected a task that completed within its deadline'
+    )
+    pass 'deadline distinguishes actual completion from delayed parent scheduling'
+}
+
+test_deadline_fails_closed_without_a_clock() {
+    (
+        reset_runtime_paths
+        deadline_time_us() { return 1; }
+        local rc=0
+        run_with_deadline 1 touch "$TMP_ROOT/deadline-clock-must-not-run" || rc=$?
+        [[ "$rc" == 125 && ! -e "$TMP_ROOT/deadline-clock-must-not-run" ]] \
+            || fail 'deadline ran without a usable clock'
+    )
+    pass 'deadline clock initialization failure never runs an unbounded task'
+}
+
+test_deadline_startup_wait_stops_after_parent_dies() {
+    (
+        reset_runtime_paths
+        local child_file="$TMP_ROOT/deadline-startup-child" owner child alive=true attempt
+        (
+            kill() {
+                if [[ "${1:-}" == -0 && "${2:-}" == -- ]]; then
+                    builtin printf '%s\n' "${3#-}" > "$child_file"
+                    builtin kill -STOP "$BASHPID"
+                fi
+                builtin kill "$@"
+            }
+            run_with_deadline 10 touch "$TMP_ROOT/deadline-orphan-must-not-run"
+        ) &
+        owner=$!
+        for attempt in {1..100}; do
+            [[ -s "$child_file" ]] && break
+            sleep 0.02
+        done
+        child=$(cat "$child_file" 2>/dev/null || true)
+        if [[ ! "$child" =~ ^[0-9]+$ ]]; then
+            builtin kill -KILL "$owner" 2>/dev/null || true
+            wait "$owner" 2>/dev/null || true
+            fail 'deadline startup fixture did not reach the parent barrier'
+        fi
+        builtin kill -KILL "$owner" 2>/dev/null || true
+        wait "$owner" 2>/dev/null || true
+        for attempt in {1..100}; do
+            if ! deadline_fixture_process_running "$child"; then
+                alive=false
+                break
+            fi
+            sleep 0.02
+        done
+        builtin kill -KILL -- "-$child" 2>/dev/null || true
+        [[ "$alive" == false ]] || fail 'deadline startup child kept spinning after its parent died'
+        [[ ! -e "$TMP_ROOT/deadline-orphan-must-not-run" ]] || fail 'orphaned deadline child launched work'
+    )
+    pass 'deadline startup barrier exits when its parent dies without launching work'
+}
+
+test_deadline_startup_wait_is_bounded_if_parent_stalls() {
+    (
+        reset_runtime_paths
+        local child_file="$TMP_ROOT/deadline-stalled-child" owner child alive=true attempt
+        (
+            kill() {
+                if [[ "${1:-}" == -0 && "${2:-}" == -- ]]; then
+                    builtin printf '%s\n' "${3#-}" > "$child_file"
+                    builtin kill -STOP "$BASHPID"
+                fi
+                builtin kill "$@"
+            }
+            local rc=0
+            run_with_deadline 1 touch "$TMP_ROOT/deadline-stalled-must-not-run" || rc=$?
+            [[ "$rc" != 0 ]] || fail 'stalled deadline initialization reported success'
+        ) &
+        owner=$!
+        for attempt in {1..100}; do
+            [[ -s "$child_file" ]] && break
+            sleep 0.02
+        done
+        child=$(cat "$child_file" 2>/dev/null || true)
+        if [[ ! "$child" =~ ^[0-9]+$ ]]; then
+            builtin kill -KILL "$owner" 2>/dev/null || true
+            wait "$owner" 2>/dev/null || true
+            fail 'stalled deadline fixture did not reach the parent barrier'
+        fi
+        sleep 1.3
+        if ! deadline_fixture_process_running "$child"; then
+            alive=false
+        fi
+        builtin kill -KILL -- "-$child" 2>/dev/null || true
+        builtin kill -CONT "$owner" 2>/dev/null || true
+        local rc=0
+        wait "$owner" 2>/dev/null || rc=$?
+        [[ "$alive" == false ]] || fail 'deadline startup child exceeded its budget while its parent was stopped'
+        [[ "$rc" == 0 ]] || fail 'stalled deadline fixture did not observe initialization failure'
+        [[ ! -e "$TMP_ROOT/deadline-stalled-must-not-run" ]] || fail 'late startup barrier launched work'
+    )
+    pass 'deadline startup barrier stays bounded while its parent is stopped'
 }
 
 test_deadline_rejects_unverified_process_group() {
@@ -4304,10 +4901,14 @@ test_deadline_rejects_unverified_process_group() {
             fi
             builtin kill "$@"
         }
-        deadline_test_work() { while :; do :; done; }
+        deadline_test_work() {
+            printf 'started\n' > "$TMP_ROOT/deadline-unverified-started"
+            while :; do :; done
+        }
         local rc=0 started="$SECONDS"
         run_with_deadline 10 deadline_test_work || rc=$?
         [[ "$rc" == 125 ]] || fail "unverified deadline group returned $rc instead of initialization failure"
+        [[ ! -e "$TMP_ROOT/deadline-unverified-started" ]] || fail 'unverified deadline group launched its command'
         (( SECONDS - started < 5 )) || fail 'unverified process group waited for the command deadline'
         grep -Fq 'deadline_group_init_failed' "$LOG_FILE" || fail 'group initialization failure was not reported'
     )
@@ -4326,9 +4927,7 @@ test_deadline_terminates_descendant_processes() {
     child=$(cat "$child_file" 2>/dev/null || true)
     [[ "$child" =~ ^[0-9]+$ ]] || fail "deadline child PID was not recorded"
     sleep 0.2
-    if kill -0 "$child" 2>/dev/null; then
-        [[ "$(ps -o stat= -p "$child" 2>/dev/null)" == Z* ]] || fail "deadline left a descendant process running"
-    fi
+    ! deadline_fixture_process_running "$child" || fail "deadline left a descendant process running"
     pass "deadline wrapper terminates descendant processes"
 }
 
@@ -4833,9 +5432,146 @@ test_runtime_diagnostics_report_deployed_versions_and_policy() {
     pass "runtime diagnostics distinguish installed core, image pin, configured policy, and kernel state"
 }
 
+test_all_config_qr_preserves_links_and_usage_without_touching_runtime() {
+    (
+        reset_runtime_paths
+        local link payload decoded before
+        local QUOTA_CYCLE_FILE="$DATA_DIR/quota_cycle.txt"
+        local TOTAL_UPTIME_FILE="$DATA_DIR/total_uptime_sec.txt"
+        local SESSION_START_FILE="$DATA_DIR/session_start.txt"
+        local G2RAY_QUOTA_SECONDS=216000
+        current_quota_cycle > "$QUOTA_CYCLE_FILE"
+        printf '213660' > "$TOTAL_UPTIME_FILE"
+        date +%s > "$SESSION_START_FILE"
+        before=$(cat "$TOTAL_UPTIME_FILE")
+        link='vless://00000000-0000-0000-0000-000000000001@example.test:443?encryption=none&type=xhttp&extra=%7B%22xmux%22%3A%7B%7D%7D#example'
+        write_codespace_import_bundle "$link" || fail "all-config bundle write failed"
+        payload=$(cat "$QR_DIR/all-configs.txt")
+        [[ "$payload" == g2ray://import/* ]] || fail "all-config QR prefix missing"
+        payload="${payload#g2ray://import/}"
+        while (( ${#payload} % 4 != 0 )); do payload+='='; done
+        decoded=$(printf '%s' "$payload" | tr '_-' '/+' | base64 -d | gzip -dc) || fail "QR decode failed"
+        [[ "$(printf '%s' "$decoded" | jq -r '.configs[0]')" == "$link" ]] || fail "QR lost original tuning"
+        [[ "$(printf '%s' "$decoded" | jq -r '.quota_estimate.budget_seconds')" == 216000 ]] || fail "QR lost quota budget"
+        [[ "$(cat "$TOTAL_UPTIME_FILE")" == "$before" ]] || fail "QR export changed runtime quota"
+        [[ "$(printf '%s' "$decoded" | jq -r '.quota_estimate.used_seconds')" -ge 213660 ]] || fail "QR lost used quota"
+        [[ "$(printf '%s' "$decoded" | jq -r '.quota_estimate.assumed_running')" == true ]] \
+            || fail 'fresh host quota snapshot was marked stopped'
+        printf 'old-cycle' > "$QUOTA_CYCLE_FILE"
+        [[ "$(quota_snapshot_json)" == null ]] || fail "stale quota cycle was presented as current"
+    )
+    pass "all-config QR preserves links, tuning and scoped local usage"
+}
+
+test_quota_snapshot_tracks_host_activity_not_engine_state() {
+    (
+        reset_runtime_paths
+        local QUOTA_CYCLE_FILE="$DATA_DIR/quota_cycle.txt"
+        local TOTAL_UPTIME_FILE="$DATA_DIR/total_uptime_sec.txt"
+        local SESSION_START_FILE="$DATA_DIR/session_start.txt"
+        local snapshot
+        current_quota_cycle > "$QUOTA_CYCLE_FILE"
+        printf '3600' > "$TOTAL_UPTIME_FILE"
+        date +%s > "$SESSION_START_FILE"
+        xray_running() { return 1; }
+        snapshot=$(quota_snapshot_json 2>"$TMP_ROOT/quota-snapshot-errors") || fail 'quota snapshot failed with a stopped engine'
+        [[ ! -s "$TMP_ROOT/quota-snapshot-errors" ]] || fail 'quota snapshot invoked an unavailable helper'
+        [[ "$(printf '%s' "$snapshot" | jq -r '.assumed_running')" == true ]] \
+            || fail 'stopping Xray was treated as stopping the billable host'
+    )
+    pass 'quota snapshot projects host usage independently of the engine state'
+}
+
+test_unchanged_export_repairs_initially_missing_quota_snapshot() {
+    (
+        reset_runtime_paths
+        local calls_file="$TMP_ROOT/quota-export-calls.txt" calls
+        CODESPACE_NAME="behavior-space"
+        PORT_DOMAIN="behavior-space-443.app.github.dev"
+        WS_PORT_DOMAIN="behavior-space-8443.app.github.dev"
+        GITHUB_USER="tester"
+        printf '11111111-2222-4333-8444-555555555555\n' > "$UUID_FILE"
+        write_test_vless_config
+        : > "$calls_file"
+        generate_ordered_links() {
+            printf 'call\n' >> "$calls_file"
+            printf 'vless://example@20.0.0.1:443?encryption=none#one\n'
+        }
+
+        rm -f "$QUOTA_CYCLE_FILE"
+        refresh_config_exports_if_changed >/dev/null || fail 'initial quota-less export failed'
+        [[ "$(jq -r '.quota_estimate' "$CODESPACE_BUNDLE_FILE")" == null ]] \
+            || fail 'uninitialized tracker fabricated a quota estimate'
+        refresh_config_exports_if_changed >/dev/null || fail 'unchanged quota-less export failed'
+        calls=$(wc -l < "$calls_file" | tr -d ' ')
+        [[ "$calls" -eq 1 ]] || fail 'unavailable quota caused repeated export regeneration'
+
+        current_quota_cycle > "$QUOTA_CYCLE_FILE"
+        refresh_config_exports_if_changed >/dev/null || fail 'initialized quota export failed'
+        [[ "$(jq -r '.quota_estimate.cycle' "$CODESPACE_BUNDLE_FILE")" == "$(current_quota_cycle)" ]] \
+            || fail 'initialized quota was not included in the existing bundle'
+        refresh_config_exports_if_changed >/dev/null || fail 'unchanged quota-bearing export failed'
+        calls=$(wc -l < "$calls_file" | tr -d ' ')
+        [[ "$calls" -eq 2 ]] || fail 'quota snapshot repair did not regenerate exactly once'
+
+        jq '.quota_estimate.cycle = "2000-01"' "$CODESPACE_BUNDLE_FILE" > "$TMP_ROOT/old-quota-bundle.json"
+        mv "$TMP_ROOT/old-quota-bundle.json" "$CODESPACE_BUNDLE_FILE"
+        refresh_config_exports_if_changed >/dev/null || fail 'old-cycle quota export failed'
+        [[ "$(jq -r '.quota_estimate.cycle' "$CODESPACE_BUNDLE_FILE")" == "$(current_quota_cycle)" ]] \
+            || fail 'previous-month quota was not replaced'
+        refresh_config_exports_if_changed >/dev/null || fail 'current-cycle quota export failed'
+        calls=$(wc -l < "$calls_file" | tr -d ' ')
+        [[ "$calls" -eq 3 ]] || fail 'old-cycle quota repair did not regenerate exactly once'
+    )
+    pass 'unchanged exports repair newly available or previous-cycle quota snapshots once'
+}
+
+test_all_config_qr_without_encoder_discards_stale_png() {
+    (
+        reset_runtime_paths
+        command() {
+            if [[ "${1:-}" == -v && "${2:-}" == qrencode ]]; then return 1; fi
+            builtin command "$@"
+        }
+        printf 'old config image' > "$QR_DIR/all-configs.png"
+        write_codespace_bundle_qr '{"schema_version":2,"configs":[]}' || fail "QR text fallback failed"
+        [[ -s "$QR_DIR/all-configs.txt" ]] || fail "QR text fallback was lost"
+        [[ ! -e "$QR_DIR/all-configs.png" ]] || fail "missing encoder retained a stale config image"
+    )
+    pass "all-config QR removes stale PNG when the encoder is unavailable"
+}
+
+if [[ -n "${G2RAY_BEHAVIOR_TEST_FILTER:-}" ]]; then
+    matched=0
+    while read -r _declare _flag test_name; do
+        [[ "$test_name" == test_* && "$test_name" =~ $G2RAY_BEHAVIOR_TEST_FILTER ]] || continue
+        # Filtered cases must not leave fixture mocks behind for another case.
+        ( "$test_name" )
+        matched=$((matched + 1))
+    done < <(declare -F)
+    (( matched > 0 )) || fail "No behavior tests matched the requested filter"
+    printf 'Selected behavior checks passed: %s\n' "$matched"
+    exit 0
+fi
+
+test_all_config_qr_without_encoder_discards_stale_png
+test_quota_snapshot_tracks_host_activity_not_engine_state
+test_unchanged_export_repairs_initially_missing_quota_snapshot
+test_all_config_qr_preserves_links_and_usage_without_touching_runtime
 test_xhttp_extra_requires_one_complete_object
 test_deadline_includes_exit_cleanup
 test_deadline_preserves_status_without_a_status_write
+test_deadline_result_write_failure_during_liveness_check_preserves_status
+test_deadline_parent_reschedule_uses_actual_completion_time
+test_deadline_child_finishing_after_clock_sample_is_still_bounded
+test_deadline_missing_completion_evidence_cannot_report_late_success
+test_deadline_child_clock_failure_remains_an_error
+test_deadline_partial_ready_write_never_launches_work
+test_deadline_failed_ready_write_stops_the_isolated_group
+test_deadline_uses_completion_time_when_parent_is_delayed
+test_deadline_fails_closed_without_a_clock
+test_deadline_startup_wait_stops_after_parent_dies
+test_deadline_startup_wait_is_bounded_if_parent_stalls
 test_degraded_probe_keeps_healthy_baseline_at_threshold
 test_optional_legacy_bundle_failure_preserves_current_exports
 test_codespace_bundle_rejects_missing_or_empty_links
@@ -4862,6 +5598,11 @@ test_run_gh_sanitizes_invalid_timeout_env
 test_background_start_reports_lock_failure_without_live_supervisor
 test_background_start_cleans_up_when_pid_state_cannot_be_committed
 test_background_heartbeat_reports_atomic_write_failure
+test_background_restart_cannot_revive_a_stopped_generation
+test_background_watchdog_recovers_dead_owned_supervisors
+test_background_watchdog_reports_pid_commit_failure
+test_background_stop_reports_failed_state_cleanup
+test_background_heartbeat_cannot_override_visible_process_ownership
 test_stale_temp_sweep_removes_only_old_owned_artifacts
 test_logs_reset_when_script_code_changes
 test_cached_route_order_uses_reliability_then_average_latency
@@ -4966,6 +5707,9 @@ test_xhttp_mode_is_persistent_and_link_consistent
 test_xhttp_mode_change_does_not_restart_auto_inbound
 test_xhttp_mode_reports_export_failure
 test_generated_links_use_active_config_mode_over_env_override
+test_xhttp_mode_cache_avoids_reparsing_and_tracks_config_changes
+test_xhttp_mode_cache_preserves_preferences_and_write_failure_fallback
+test_xhttp_mode_cache_does_not_commit_a_concurrent_config_swap
 test_custom_xhttp_extra_json_is_validated
 test_websocket_fallback_is_advanced_opt_in
 test_websocket_fallback_exports_separate_alpn_variants
@@ -4976,7 +5720,8 @@ test_config_metadata_sanitizes_invalid_max_fallback_links
 test_bench_json_reports_deterministic_budgets
 test_low_overhead_mode_suppresses_info_logs
 test_low_overhead_env_can_be_overridden_by_toggle
-test_anti_sleep_preference_persists_across_headless_reconciliation
+test_anti_sleep_is_retired_and_legacy_runtime_is_stopped
+test_anti_sleep_cleanup_failures_do_not_block_runtime
 test_low_overhead_keeps_important_state_logs
 test_latency_focus_mode_suppresses_noncritical_info_but_preserves_warnings
 test_latency_focus_env_can_be_overridden_by_toggle
