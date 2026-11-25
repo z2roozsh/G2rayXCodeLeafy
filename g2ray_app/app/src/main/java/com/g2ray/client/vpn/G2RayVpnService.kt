@@ -10,9 +10,11 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.RouteInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
@@ -172,6 +174,21 @@ class G2RayVpnService : VpnService() {
     private var activeAccountId: String? = null
     @Volatile
     private var underlyingNetwork: Network? = null
+    private var underlyingLinkSnapshot: UnderlyingLinkSnapshot? = null
+
+    private data class UnderlyingLinkSnapshot(
+        val interfaceName: String?,
+        val addresses: Set<Pair<java.net.InetAddress, Int>>,
+        val defaultRoutes: Set<RouteInfo>,
+        val dnsServers: List<java.net.InetAddress>
+    ) {
+        constructor(link: LinkProperties) : this(
+            link.interfaceName,
+            link.linkAddresses.map { it.address to it.prefixLength }.toSet(),
+            link.routes.filter { it.isDefaultRoute }.toSet(),
+            link.dnsServers.toList()
+        )
+    }
     @Volatile
     private var waitingForUnderlyingNetwork = false
     private val underlyingNetworkGeneration = AtomicLong(0)
@@ -3012,6 +3029,19 @@ class G2RayVpnService : VpnService() {
                 )
             }
 
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                synchronized(this@G2RayVpnService) {
+                    if (underlyingNetworkCallback !== this || network != underlyingNetwork || destroyed) return
+                    val previous = underlyingLinkSnapshot
+                    val current = UnderlyingLinkSnapshot(linkProperties)
+                    underlyingLinkSnapshot = current
+                    // A DHCP or carrier reconfiguration can retain the same Network handle.
+                    if (previous != null && previous != current) {
+                        applyUnderlyingNetwork(network, triggerVerification = true, linkChanged = true)
+                    }
+                }
+            }
+
             override fun onLost(network: Network) {
                 if (underlyingNetworkCallback !== this) {
                     return
@@ -3142,28 +3172,30 @@ class G2RayVpnService : VpnService() {
         )
     }
 
+    private fun applyUnderlyingNetwork(network: Network?, triggerVerification: Boolean) =
+        applyUnderlyingNetwork(network, triggerVerification, linkChanged = false)
+
     @Synchronized
-    private fun applyUnderlyingNetwork(network: Network?, triggerVerification: Boolean) {
+    private fun applyUnderlyingNetwork(network: Network?, triggerVerification: Boolean, linkChanged: Boolean) {
         if (destroyed) return
         val previous = underlyingNetwork
         val wasWaiting = waitingForUnderlyingNetwork
-        if (previous == network) {
+        if (previous == network && !linkChanged) {
             waitingForUnderlyingNetwork = network == null
             SocketProtector.updateUnderlyingNetwork(network)
             return
         }
 
         underlyingNetwork = network
+        if (previous != network) underlyingLinkSnapshot = null
         waitingForUnderlyingNetwork = network == null
-        SocketProtector.updateUnderlyingNetwork(network)
+        SocketProtector.updateUnderlyingNetwork(network, linkChanged)
         // Socket errors are generation-scoped. Clearing here can erase a
         // replacement network's first real failure after it is published.
-        if (previous != network) {
-            // Serialized transition verification resets probe connections on
-            // the new network. A separate reset job could retire a newer client.
-            synchronized(sessionProfileHealth) {
-                sessionProfileHealth.clear()
-            }
+        // Serialized transition verification resets probe connections on
+        // the changed link. A separate reset job could retire a newer client.
+        synchronized(sessionProfileHealth) {
+            sessionProfileHealth.clear()
         }
         if (triggerVerification) {
             underlyingNetworkGeneration.incrementAndGet()
@@ -3185,14 +3217,16 @@ class G2RayVpnService : VpnService() {
                 }
             }
         }
-        val underlyingNetworksAccepted = runCatching {
-            setUnderlyingNetworks(network?.let { arrayOf(it) } ?: emptyArray())
-        }.getOrElse { error ->
-            Log.w("G2RayVpnService", "Could not publish the selected underlying network", error)
-            false
-        }
-        if (!underlyingNetworksAccepted) {
-            Log.w("G2RayVpnService", "Android rejected the selected underlying network metadata")
+        if (previous != network) {
+            val underlyingNetworksAccepted = runCatching {
+                setUnderlyingNetworks(network?.let { arrayOf(it) } ?: emptyArray())
+            }.getOrElse { error ->
+                Log.w("G2RayVpnService", "Could not publish the selected underlying network", error)
+                false
+            }
+            if (!underlyingNetworksAccepted) {
+                Log.w("G2RayVpnService", "Android rejected the selected underlying network metadata")
+            }
         }
 
         // Keep wake sockets bound while an error guard is held, but do not
@@ -3295,6 +3329,7 @@ class G2RayVpnService : VpnService() {
         networkHandoffJob?.cancel()
         networkHandoffJob = null
         underlyingNetwork = null
+        underlyingLinkSnapshot = null
         synchronized(availableUnderlyingNetworks) {
             availableUnderlyingNetworks.clear()
             lostUnderlyingNetworks.clear()

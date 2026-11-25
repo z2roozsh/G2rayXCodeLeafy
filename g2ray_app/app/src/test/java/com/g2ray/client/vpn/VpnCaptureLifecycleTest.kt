@@ -3,6 +3,8 @@ package com.g2ray.client.vpn
 import android.app.Service
 import android.app.NotificationManager
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -13,6 +15,8 @@ import com.g2ray.client.data.EncryptedPrefsStore
 import com.g2ray.client.data.AccountRepository
 import com.g2ray.client.parser.VlessUriParser
 import java.io.IOException
+import java.net.InetAddress
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CoroutineScope
@@ -164,6 +168,42 @@ class VpnCaptureLifecycleTest {
             assertEquals(TunnelState.Blocked, VpnStateRepository.state.value.tunnelState)
             assertNotNull("Capture without a working profile must still allow manual wake",
                 field(service, "underlyingNetworkCallback"))
+        }
+    }
+
+    @Test fun onlyMaterialChangesOnTheSelectedLinkInvalidateNetworkWork() = runTest {
+        withService { service ->
+            invoke(service, "registerUnderlyingNetworkMonitor")
+            val callback = field(service, "underlyingNetworkCallback") as ConnectivityManager.NetworkCallback
+            val selected = ShadowNetwork.newInstance(101)
+            val other = ShadowNetwork.newInstance(102)
+            invoke(service, "applyUnderlyingNetwork", selected, false)
+            val generation = field(service, "underlyingNetworkGeneration") as AtomicLong
+            val before = generation.get()
+            val beforeSockets = SocketProtector.underlyingNetworkGeneration()
+            fun link(resolver: String) = LinkProperties().apply {
+                interfaceName = "test0"
+                setDnsServers(listOf(InetAddress.getByName(resolver)))
+            }
+
+            callback.onLinkPropertiesChanged(selected, link("192.0.2.1"))
+            callback.onLinkPropertiesChanged(other, link("192.0.2.2"))
+            callback.onLinkPropertiesChanged(selected, link("192.0.2.1"))
+            assertEquals(before, generation.get())
+            assertEquals(beforeSockets, SocketProtector.underlyingNetworkGeneration())
+
+            callback.onLinkPropertiesChanged(selected, link("192.0.2.2"))
+            callback.onLinkPropertiesChanged(selected, link("192.0.2.2"))
+            assertEquals(before + 1, generation.get())
+            assertEquals(beforeSockets + 1, SocketProtector.underlyingNetworkGeneration())
+            assertEquals(selected, SocketProtector.underlyingNetworks.value)
+            assertNull("A physical link change must not start an idle tunnel", field(service, "networkHandoffJob"))
+
+            invoke(service, "applyUnderlyingNetwork", other, true)
+            val afterSwitch = generation.get()
+            callback.onLinkPropertiesChanged(other, link("192.0.2.3"))
+            callback.onLinkPropertiesChanged(selected, link("192.0.2.4"))
+            assertEquals(afterSwitch, generation.get())
         }
     }
 

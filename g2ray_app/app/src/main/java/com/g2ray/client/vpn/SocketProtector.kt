@@ -65,8 +65,8 @@ object SocketProtector {
     }
 
     @Synchronized
-    fun updateUnderlyingNetwork(network: Network?) {
-        val changed = underlyingNetwork != network
+    fun updateUnderlyingNetwork(network: Network?, linkChanged: Boolean = false) {
+        val changed = underlyingNetwork != network || linkChanged
         if (changed) networkGeneration.incrementAndGet()
         underlyingNetwork = network
         _underlyingNetworks.value = network
