@@ -71,14 +71,15 @@ The authenticated endpoint `POST /api/codespaces` returns only safe fields: sele
 
 ### Optional Wrangler Or KV Registry
 
-Wrangler configuration remains available for automated deployments, but it is not part of the recommended manual setup. The KV registry in [`codespaces.registry.example.json`](codespaces.registry.example.json) remains an advanced option for custom labels, priorities, ports, or more than ten entries. Dashboard variables take effect automatically when no valid KV registry is present.
+Wrangler configuration remains available for automated deployments, but it is not part of the recommended manual setup. The KV registry in [`codespaces.registry.example.json`](codespaces.registry.example.json) remains an advanced option for custom labels, priorities, ports, or more than ten entries. Dashboard variables take effect automatically when no KV registry is stored.
 
 If KV is bound only for optional history and Codespaces are configured with
 dashboard variables, set the optional Plaintext variable
 `CODESPACE_REGISTRY_SOURCE=dashboard` to skip registry storage reads. Leave it
 unset when using a KV registry. Registry operations have a one-second deadline;
-unavailable registry storage returns HTTP 503 instead of silently selecting a
-different Codespace. An unknown explicitly requested ID/name returns HTTP 404,
+unavailable storage or a stored registry with no usable entries returns HTTP 503
+instead of silently selecting a different Codespace. Repair the stored entries
+or explicitly choose dashboard mode. An unknown requested ID/name returns HTTP 404,
 even with one configured Codespace. Update older apps' saved selection to the
 real Codespace name rather than relying on arbitrary legacy IDs.
 

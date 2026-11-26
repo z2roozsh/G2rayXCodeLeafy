@@ -7,10 +7,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import re
+import time
 from urllib.parse import parse_qs, urlsplit
 
 CHUNK = bytes((i * 31 + 17) % 251 for i in range(32768))
 MAX_BYTES = 8 * 1024 * 1024
+STREAM_REQUEST = b'{"prompt":"synthetic stream test"}'
+STREAM_EVENTS = tuple(f"data: delta-{i}\n\n".encode("ascii") for i in range(9)) + (b"data: [DONE]\n\n",)
+STREAM_DELAYS = (6, 8, 8, 8, 18, 8, 8, 8, 8, 8)
 
 
 def digest_for_length(length):
@@ -25,6 +29,7 @@ def digest_for_length(length):
 class IntegrityHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     token = ""
+    stream_enabled = False
 
     def setup(self):
         super().setup()
@@ -81,6 +86,24 @@ class IntegrityHandler(BaseHTTPRequestHandler):
             self.reject(403)
             return
         length = self.headers.get("Content-Length", "")
+        if self.path == "/stream" and self.stream_enabled:
+            if (self.headers.get("Transfer-Encoding") or length != str(len(STREAM_REQUEST)) or
+                    self.rfile.read(len(STREAM_REQUEST)) != STREAM_REQUEST):
+                self.reject(400)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store, no-transform")
+            self.send_header("Content-Length", str(sum(map(len, STREAM_EVENTS))))
+            self.end_headers()
+            try:
+                for delay, event in zip(STREAM_DELAYS, STREAM_EVENTS):
+                    time.sleep(delay)
+                    self.wfile.write(event)
+                    self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                self.close_connection = True
+            return
         expected = self.headers.get("X-Content-SHA256", "")
         if (self.path != "/upload" or self.headers.get("Transfer-Encoding") or
                 not length.isdigit() or not re.fullmatch(r"[a-f0-9]{64}", expected)):
@@ -108,6 +131,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", required=True, type=int)
     parser.add_argument("--token-file", required=True, type=Path)
+    parser.add_argument("--stream", action="store_true", help="Enable the fixed, authenticated SSE test")
     args = parser.parse_args()
     if not 1024 <= args.port <= 65535:
         parser.error("Use a non-privileged port")
@@ -115,6 +139,7 @@ def main():
     if not re.fullmatch(r"[a-f0-9]{64}", token):
         parser.error("Token file must contain 32 random bytes encoded as lowercase hex")
     IntegrityHandler.token = token
+    IntegrityHandler.stream_enabled = args.stream
     with ThreadingHTTPServer(("127.0.0.1", args.port), IntegrityHandler) as server:
         print("Synthetic integrity fixture ready on loopback", flush=True)
         server.serve_forever()

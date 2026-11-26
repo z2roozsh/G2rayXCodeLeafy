@@ -299,7 +299,10 @@ async function handleCodespaces(request, env) {
   if (!auth.ok) return json(auth.body, auth.status, retryHeaders(auth.body));
 
   const registry = await readCodespaceRegistry(env);
-  if (registry.unavailable) return json({ ok: false, error: "codespace_registry_unavailable", retry_after_seconds: 5 }, 503);
+  if (registry.unavailable) {
+    const body = registryUnavailableBody();
+    return json(body, 503, retryHeaders(body));
+  }
   const entries = registry.entries
     .filter((entry) => entry.enabled)
     .map((entry) => ({
@@ -318,6 +321,13 @@ async function handleCodespaces(request, env) {
   });
 }
 
+function registryUnavailableBody() {
+  return {
+    ok: false, error: "codespace_registry_unavailable", retry_after_seconds: 5,
+    next_action: "Registry storage is unavailable or stored entries are invalid. Check the registry; dashboard-only deployments may set CODESPACE_REGISTRY_SOURCE=dashboard."
+  };
+}
+
 async function requireAuthorizedContext(request, env, options = {}) {
   const requireGithubToken = options.githubToken !== false;
   const auth = await requireWakeSecret(request, env);
@@ -326,10 +336,7 @@ async function requireAuthorizedContext(request, env, options = {}) {
   const requestedId = await readRequestedCodespaceId(request);
   const registry = await readCodespaceRegistry(env);
   if (registry.unavailable) {
-    return { ok: false, status: 503, body: {
-      ok: false, error: "codespace_registry_unavailable", retry_after_seconds: 5,
-      next_action: "Registry storage is unavailable. Retry shortly; dashboard-only deployments may set CODESPACE_REGISTRY_SOURCE=dashboard."
-    } };
+    return { ok: false, status: 503, body: registryUnavailableBody() };
   }
   if (!registry.entries.length) {
     return {
@@ -430,7 +437,7 @@ async function readCodespaceRegistry(env) {
   if (env.WAKER_KV && String(env.CODESPACE_REGISTRY_SOURCE || "").trim().toLowerCase() !== "dashboard") {
     try {
       const text = await withKvDeadline(() => env.WAKER_KV.get(CODESPACE_REGISTRY_KEY));
-      if (text) {
+      if (text != null) {
         const parsed = JSON.parse(text);
         const entries = normalizeRegistryEntries(parsed && parsed.codespaces);
         if (entries.length) {
@@ -443,6 +450,8 @@ async function readCodespaceRegistry(env) {
             entries
           };
         }
+        // An explicitly stored registry cannot be replaced by a different identity.
+        return { multi: true, defaultCodespaceId: null, entries: [], unavailable: true };
       }
     } catch (error) {
       console.warn("codespace_registry_read_failed", shortError(error));
@@ -673,6 +682,10 @@ async function sha256Hex(value) {
 }
 
 async function startCodespaceData(name, token, env, priorStatus = null, routePorts = [codespacePort(env)]) {
+  // A definitive status failure must not turn a read into a start attempt.
+  if (priorStatus?.ok === false && [401, 402, 403, 404, 429].includes(priorStatus.status)) {
+    return priorStatus;
+  }
   const endpoint = `https://api.github.com/user/codespaces/${encodeURIComponent(name)}/start`;
   let res, body;
   try {

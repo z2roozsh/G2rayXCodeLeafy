@@ -390,6 +390,14 @@ HTTP protocol names distinguish retained connections from new ones. Wake the
 phone before an awake baseline; the test reports whether the device is interactive.
 
 Use `resumeVpnActivity=false` to resume traffic without reopening the VPN UI.
+For a bounded continuous-stream check, select
+`LiveVpnDeviceTest#selectedProfileSustainsPublicEventStream` with `liveVpn=true`,
+`livePublicEventStream=true`, and `smallProbesOnly=true`. It uses one HTTPS
+connection to Wikimedia EventStreams, requires two minutes of complete events,
+caps the response at 8 MiB, and records timings but not event contents. It does
+not need an additional public port or an AI account. It measures stream delivery,
+not model response time or completion of a chat request.
+
 Separate opt-in checks exercise the real Start VPN action, direct wake, and
 protected recovery while VPN is active; see [the test matrix](PRODUCTION_TEST_MATRIX.md).
 The [13 October device follow-up](../DEVICE_RECOVERY_FOLLOWUP_2026-10-13.md)

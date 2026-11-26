@@ -4,29 +4,43 @@ import android.content.Context
 import android.os.SystemClock
 import com.g2ray.client.G2RayApplication
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
 import okio.BufferedSink
 import org.json.JSONObject
 import org.junit.Assert.*
 import java.io.File
 import java.security.MessageDigest
+import java.util.concurrent.TimeUnit
 
-/** An explicitly provisioned owned fixture, not a public speed-test assumption. */
-internal fun verifySyntheticIntegrity(context: Context, client: OkHttpClient, record: (String) -> Unit) {
+private data class OwnedFixture(val base: HttpUrl, val token: String, val config: JSONObject)
+
+private fun requireTunneledHost(context: Context, host: String) {
+    val settings = VpnEnginePreferences((context.applicationContext as G2RayApplication).secureStore).readSettings()
+    require(settings.routingPolicy.bypassDomains.none { host == it || host.endsWith(".$it") }) {
+        "The test endpoint matches a direct-routing bypass rule"
+    }
+}
+
+private fun readOwnedFixture(context: Context, record: (String) -> Unit): OwnedFixture {
     val fixture = JSONObject(File(context.filesDir, "integrity-fixture.private.json").readText())
     val base = fixture.getString("base_url").toHttpUrl()
     require(base.isHttps && base.port == 443 && base.host.endsWith(".app.github.dev") &&
         base.encodedPath == "/" && base.query == null && base.username.isEmpty() && base.password.isEmpty())
-    val settings = VpnEnginePreferences((context.applicationContext as G2RayApplication).secureStore).readSettings()
-    require(settings.routingPolicy.bypassDomains.none { base.host == it || base.host.endsWith(".$it") }) {
-        "The owned fixture matches a direct-routing bypass rule"
-    }
+    requireTunneledHost(context, base.host)
     record("event=owned_fixture_route proxy_required=true no_matching_domain_bypass=true")
     val token = fixture.getString("token")
     require(token.matches(Regex("[a-f0-9]{64}")))
+    return OwnedFixture(base, token, fixture)
+}
+
+/** An explicitly provisioned owned fixture, not a public speed-test assumption. */
+internal fun verifySyntheticIntegrity(context: Context, client: OkHttpClient, record: (String) -> Unit) {
+    val (base, token, fixture) = readOwnedFixture(context, record)
     val samples = fixture.getInt("samples").also { require(it in 1..5) }
     val chunk = ByteArray(32768) { ((it * 31 + 17) % 251).toByte() }
     fun digest(length: Int): String {
@@ -115,4 +129,77 @@ internal fun verifySyntheticIntegrity(context: Context, client: OkHttpClient, re
         }
     }
     assertTrue("Owned integrity failures: ${failed.joinToString()}", failed.isEmpty())
+}
+
+internal fun verifySyntheticEventStream(context: Context, client: OkHttpClient, record: (String) -> Unit) {
+    val (base, token) = readOwnedFixture(context, record)
+    val streamClient = client.newBuilder().retryOnConnectionFailure(false).followRedirects(false)
+        .readTimeout(30L, TimeUnit.SECONDS).callTimeout(125L, TimeUnit.SECONDS).build()
+    val request = Request.Builder().url(base.newBuilder().addPathSegment("stream").build())
+        .header("Authorization", "Bearer $token")
+        .header("Accept-Encoding", "identity")
+        .post("""{"prompt":"synthetic stream test"}""".toRequestBody("application/json".toMediaType()))
+        .build()
+    val started = SystemClock.elapsedRealtime()
+    streamClient.newCall(request).execute().use { response ->
+        assertEquals(200, response.code)
+        val body = requireNotNull(response.body)
+        assertEquals("text/event-stream", body.contentType()?.toString())
+        val source = body.source()
+        val observed = (0..9).map { index ->
+            assertEquals(if (index == 9) "data: [DONE]" else "data: delta-$index", source.readUtf8LineStrict(80L))
+            assertEquals("", source.readUtf8LineStrict(2L))
+            val elapsed = SystemClock.elapsedRealtime() - started
+            record("event=owned_sse_event index=$index elapsed_ms=$elapsed")
+            elapsed
+        }
+        assertTrue("Unexpected bytes after the final event", source.exhausted())
+        assertTrue("The first event arrived too late for interactive streaming", observed.first() in 5_000L..15_000L)
+        assertTrue("The response was buffered instead of streamed", observed.last() - observed.first() >= 70_000L)
+        assertTrue("The deliberately quiet gap was not observed", observed[4] - observed[3] >= 12_000L)
+        record("event=owned_sse_complete events=10 final_marker=true first_ms=${observed.first()} total_ms=${observed.last()}")
+    }
+}
+
+/** Check one real, continuous SSE connection without deploying a public test port. */
+internal fun verifyPublicEventStream(context: Context, client: OkHttpClient, record: (String) -> Unit) {
+    val endpoint = "https://stream.wikimedia.org/v2/stream/recentchange".toHttpUrl()
+    requireTunneledHost(context, endpoint.host)
+    val streamClient = client.newBuilder().retryOnConnectionFailure(false).followRedirects(false)
+        .readTimeout(20L, TimeUnit.SECONDS).callTimeout(155L, TimeUnit.SECONDS).build()
+    val request = Request.Builder().url(endpoint).header("Accept", "text/event-stream")
+        .header("Accept-Encoding", "identity")
+        .header("User-Agent", "G2RayAndroidAcceptance/1.0 (https://github.com/z2roozsh/G2rayXCodeLeafy)")
+        .build()
+    val started = SystemClock.elapsedRealtime()
+    streamClient.newCall(request).execute().use { response ->
+        assertEquals(200, response.code)
+        val body = requireNotNull(response.body)
+        assertEquals("text/event-stream", body.contentType()?.let { "${it.type}/${it.subtype}" })
+        val source = body.source()
+        var bytes = 0L
+        var completeEvents = 0
+        var firstEvent = -1L
+        var lastEvent = -1L
+        var maxEventGap = 0L
+        var hasData = false
+        do {
+            val line = source.readUtf8LineStrict(32_768L)
+            bytes += line.toByteArray(Charsets.UTF_8).size + 1
+            require(bytes <= 8L * 1024 * 1024) { "Public SSE exceeded the 8 MiB data budget" }
+            if (line.startsWith("data:") && line.substring(5).isNotBlank()) hasData = true
+            if (line.isEmpty() && hasData) {
+                val now = SystemClock.elapsedRealtime() - started
+                if (firstEvent < 0L) firstEvent = now
+                if (lastEvent >= 0L) maxEventGap = maxOf(maxEventGap, now - lastEvent)
+                lastEvent = now
+                completeEvents++
+                hasData = false
+            }
+        } while (firstEvent < 0L || lastEvent - firstEvent < 120_000L)
+        assertTrue("No prompt complete event", firstEvent in 1L..15_000L)
+        assertTrue("Too few events to establish sustained delivery", completeEvents >= 20)
+        record("event=public_sse_complete events=$completeEvents bytes=$bytes first_ms=$firstEvent " +
+            "stream_ms=${lastEvent - firstEvent} max_event_gap_ms=$maxEventGap protocol=${response.protocol}")
+    }
 }

@@ -5,9 +5,10 @@ from pathlib import Path
 import sys
 import threading
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from synthetic_integrity_endpoint import CHUNK, IntegrityHandler, digest_for_length
+from synthetic_integrity_endpoint import CHUNK, STREAM_EVENTS, STREAM_REQUEST, IntegrityHandler, digest_for_length
 from http.server import ThreadingHTTPServer
 
 
@@ -65,6 +66,24 @@ class IntegrityEndpointTest(unittest.TestCase):
         headers = {"Authorization": "Bearer " + IntegrityHandler.token}
         for path, expected in (("/download?bytes=8388609", 413), ("/download?bytes=1&bytes=2", 400), ("/other?bytes=1", 400)):
             self.assertEqual(self.request("GET", path, headers=headers)[0], expected)
+
+    def test_event_stream_is_opt_in_and_rejects_unauthorized_or_wrong_bodies(self):
+        headers = {"Authorization": "Bearer " + IntegrityHandler.token}
+        self.assertEqual(self.request("POST", "/stream", STREAM_REQUEST, headers)[0], 400)
+        with patch.object(IntegrityHandler, "stream_enabled", True):
+            self.assertEqual(self.request("POST", "/stream", STREAM_REQUEST)[0], 403)
+            self.assertEqual(self.request("POST", "/stream", b"x" * len(STREAM_REQUEST), headers)[0], 400)
+
+    def test_event_stream_delivers_every_event_and_terminal_marker(self):
+        headers = {"Authorization": "Bearer " + IntegrityHandler.token}
+        with patch.object(IntegrityHandler, "stream_enabled", True), \
+                patch("synthetic_integrity_endpoint.STREAM_DELAYS", (0,) * len(STREAM_EVENTS)):
+            status, response_headers, body = self.request("POST", "/stream", STREAM_REQUEST, headers)
+        self.assertEqual(status, 200)
+        self.assertEqual(response_headers["Content-Type"], "text/event-stream")
+        self.assertEqual(int(response_headers["Content-Length"]), len(body))
+        self.assertEqual(body, b"".join(STREAM_EVENTS))
+        self.assertTrue(body.endswith(b"data: [DONE]\n\n"))
 
 
 if __name__ == "__main__":

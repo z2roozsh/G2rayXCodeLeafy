@@ -3,6 +3,7 @@ package com.g2ray.client.vpn
 import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.NetworkCapabilities
 import android.net.TrafficStats
 import android.net.Uri
@@ -12,6 +13,7 @@ import android.media.session.MediaSessionManager
 import android.media.session.PlaybackState
 import android.os.Bundle
 import android.os.Build
+import android.os.Parcel
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.os.SystemClock
@@ -47,13 +49,16 @@ import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.net.Proxy
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.Collections
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
@@ -361,6 +366,24 @@ class LiveVpnDeviceTest {
     }
 
     @Test
+    fun selectedProfileCompletesSyntheticEventStream() {
+        assumeTrue("Owned SSE requires explicit liveEventStream=true",
+            InstrumentationRegistry.getArguments().getString("liveEventStream") == "true")
+        runLiveTest(acceptanceCheck = { context, client ->
+            withContext(Dispatchers.IO) { verifySyntheticEventStream(context, client, ::report) }
+        })
+    }
+
+    @Test
+    fun selectedProfileSustainsPublicEventStream() {
+        assumeTrue("Public SSE requires explicit livePublicEventStream=true",
+            InstrumentationRegistry.getArguments().getString("livePublicEventStream") == "true")
+        runLiveTest(acceptanceCheck = { context, client ->
+            withContext(Dispatchers.IO) { verifyPublicEventStream(context, client, ::report) }
+        })
+    }
+
+    @Test
     fun optionalDomainBypassUsesPhysicalExitWithoutChangingDefaultVpnRouting() {
         val args = InstrumentationRegistry.getArguments()
         assumeTrue("Bypass checks require -e liveRouting true and -e liveVpn true",
@@ -485,6 +508,61 @@ class LiveVpnDeviceTest {
         assumeTrue("The on-device restoration script requires Android 12 or newer",
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
         runLiveTest(acceptanceCheck = ::verifyMobileDataOutage)
+    }
+
+    @Test
+    fun selectedProfileReverifiesOnSameNetworkLinkChange() {
+        assumeTrue("Injecting a selected-link callback requires liveLinkChange=true",
+            InstrumentationRegistry.getArguments().getString("liveLinkChange") == "true")
+        assumeTrue("The fixture requires the public LinkProperties setter", Build.VERSION.SDK_INT >= Build.VERSION_CODES.R)
+        runLiveTest(acceptanceCheck = { context, client ->
+            val service = requireNotNull(SocketProtector.vpnService)
+            val network = requireNotNull(SocketProtector.underlyingNetworks.value)
+            val manager = requireNotNull(context.getSystemService(ConnectivityManager::class.java))
+            val original = requireNotNull(manager.getLinkProperties(network))
+            val parcel = Parcel.obtain()
+            val changed = try {
+                original.writeToParcel(parcel, 0)
+                parcel.setDataPosition(0)
+                LinkProperties.CREATOR.createFromParcel(parcel)
+            } finally {
+                parcel.recycle()
+            }
+            val newResolver = InetAddress.getByAddress(byteArrayOf(192.toByte(), 0, 2, 1))
+            changed.setDnsServers(listOf(newResolver) + original.dnsServers.filter { it != newResolver })
+            check(changed.dnsServers != original.dnsServers)
+            fun field(name: String): Any? = G2RayVpnService::class.java.getDeclaredField(name)
+                .apply { isAccessible = true }.get(service)
+
+            val tun = requireNotNull(field("vpnInterface"))
+            val recoveryBefore = field("routeRecoveryJob")
+            val generation = field("underlyingNetworkGeneration") as AtomicLong
+            val callback = field("underlyingNetworkCallback") as ConnectivityManager.NetworkCallback
+            val queued = synchronized(service) {
+                // Reset the test baseline, not the Android network configuration.
+                G2RayVpnService::class.java.getDeclaredField("underlyingLinkSnapshot")
+                    .apply { isAccessible = true }.set(service, null)
+                val before = generation.get()
+                val socketsBefore = SocketProtector.underlyingNetworkGeneration()
+                callback.onLinkPropertiesChanged(network, original)
+                assertEquals(before, generation.get())
+                callback.onLinkPropertiesChanged(network, changed)
+                val job = requireNotNull(field("networkHandoffJob") as? Job)
+                callback.onLinkPropertiesChanged(network, changed)
+                assertEquals(before + 1, generation.get())
+                assertEquals(socketsBefore + 1, SocketProtector.underlyingNetworkGeneration())
+                assertTrue(job === field("networkHandoffJob"))
+                job
+            }
+            withTimeout(30_000L) { queued.join() }
+            assertFalse("Same-network verification was cancelled", queued.isCancelled)
+            assertTrue("A healthy link change replaced the TUN", tun === field("vpnInterface"))
+            assertTrue("A healthy link change requested core recovery", recoveryBefore === field("routeRecoveryJob"))
+            assertTrue("VPN did not stay verified", VpnStateRepository.state.value.tunnelVerified)
+            client.connectionPool.evictAll()
+            assertResponsiveQuorum(probeHttpsQuorum(client, "same_network_link_change"), "same_network_link_change")
+            report("event=selected_link_change_verified same_network=true injected_callback=true tun_retained=true")
+        })
     }
 
     @Test

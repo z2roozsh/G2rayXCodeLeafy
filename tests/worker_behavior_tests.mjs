@@ -25,7 +25,7 @@ function makeKv() {
   let putCalls = 0;
   return {
     async get(key) {
-      return store.get(key) || null;
+      return store.get(key) ?? null;
     },
     async put(key, value, options = undefined) {
       putCalls += 1;
@@ -591,6 +591,27 @@ async function testGithubHttp429Classification() {
   assert.equal(body.retry_after_epoch, 1780000123);
   assert.match(body.next_action, /GitHub is throttling/);
   console.log("PASS: Worker classifies GitHub HTTP 429 rate limits");
+}
+
+async function testDefinitiveStatusFailuresDoNotStartCodespace() {
+  for (const status of [401, 402, 403, 404, 429]) {
+    const requests = [];
+    globalThis.fetch = async (input, init) => {
+      requests.push({ method: init?.method || "GET", url: String(input) });
+      return new Response(JSON.stringify({ message: "GitHub rejected the status request" }), {
+        status,
+        headers: { "content-type": "application/json", ...(status === 429 ? { "retry-after": "60" } : {}) }
+      });
+    };
+    const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({ WAKE_FAST_PATH: "1" }), {});
+    const body = await responseJson(response);
+    assert.equal(response.status, status);
+    assert.equal(body.ok, false);
+    assert.deepEqual(requests.map(request => request.method), ["GET"]);
+    assert.match(requests[0].url, /api\.github\.com\/user\/codespaces\/[^/]+$/);
+    if (status === 429) assert.equal(response.headers.get("retry-after"), "60");
+  }
+  console.log("PASS: Worker keeps definitive GitHub status failures read-only");
 }
 
 async function testGithubStartDoesNotRetryAmbiguousServerFailure() {
@@ -2344,6 +2365,25 @@ async function testStalledKvRegistryCannotSelectAnotherCodespace() {
   }
 }
 
+async function testInvalidStoredRegistryCannotChooseDashboardIdentity() {
+  const kv = makeKv();
+  let githubCalls = 0;
+  globalThis.fetch = async () => { githubCalls += 1; throw new Error("Must not wake a dashboard identity"); };
+  for (const value of ["", JSON.stringify({ codespaces: [] }), JSON.stringify({
+    codespaces: [{ id: "team", name: "team-space", token_binding: "WRONG_BINDING" }]
+  })]) {
+    await kv.put("codespace-registry:v1", value);
+    for (const path of ["/api/wake", "/api/codespaces"]) {
+      const response = await worker.fetch(makeRequest(path), baseEnv({ WAKER_KV: kv }), {});
+      assert.equal(response.status, 503);
+      assert.equal(response.headers.get("retry-after"), "5");
+      assert.equal((await responseJson(response)).error, "codespace_registry_unavailable");
+    }
+  }
+  assert.equal(githubCalls, 0);
+  console.log("PASS: Worker rejects an unusable stored registry without falling back to the dashboard");
+}
+
 async function testExplicitRegistryIdWinsOverAnotherNodesName() {
   const kv = makeKv();
   const entries = [
@@ -2443,6 +2483,7 @@ try {
   await testHealthSkipRoutePreservesGithubFailureGuidance();
   await testAuthorizedWakeCooldownIsOptional();
   await testGithubHttp429Classification();
+  await testDefinitiveStatusFailuresDoNotStartCodespace();
   await testGithubStartDoesNotRetryAmbiguousServerFailure();
   await testQuotaBlockIncludesSurvivalFields();
   await testRetentionMissingFieldsAreUnknown();
@@ -2486,6 +2527,7 @@ try {
   await testMissingSecondaryTokenNeverBorrowsThePrimaryToken();
   await testWorkerRegistrySelectsBoundTokenAndReturnsSafeDirectory();
   await testRegistryAcceptsPrimaryGithubTokenBinding();
+  await testInvalidStoredRegistryCannotChooseDashboardIdentity();
 } finally {
   globalThis.fetch = originalFetch;
 }

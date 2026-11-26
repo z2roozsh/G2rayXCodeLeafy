@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Optional Linux integration check. Validates configs without binding listeners
+# Optional integration check. Validates configs without binding listeners
 # or modifying the real runtime. Supply a separately verified Xray binary.
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CORE="${1:-/usr/local/bin/xray}"
@@ -20,6 +20,10 @@ export G2RAY_LATENCY_FOCUS=0 G2RAY_LOW_OVERHEAD=0
 # shellcheck source=../g2ray.sh
 source "$ROOT_DIR/g2ray.sh"
 XRAY_BIN="$CORE"
+# Git Bash converts command-line paths, not paths embedded in JSON.
+if [[ "$CORE" == *.exe ]] && command -v cygpath >/dev/null 2>&1; then
+    LOG_DIR=$(cygpath -am -- "$LOG_DIR")
+fi
 CODESPACE_NAME=validation-space
 PORT_DOMAIN=validation-space-443.app.github.dev
 WS_PORT_DOMAIN=validation-space-8443.app.github.dev
