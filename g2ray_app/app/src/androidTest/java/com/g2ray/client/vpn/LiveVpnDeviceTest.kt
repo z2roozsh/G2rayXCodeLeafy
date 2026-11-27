@@ -48,10 +48,15 @@ import com.g2ray.client.parser.VlessUriParser
 import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.io.InputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
 import java.net.Proxy
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.PortUnreachableException
 import java.net.Socket
+import java.net.SocketTimeoutException
+import java.nio.ByteBuffer
 import java.util.Collections
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
@@ -419,7 +424,100 @@ class LiveVpnDeviceTest {
         }
     }
 
-    private fun traceIp(input: InputStream): String {
+    @Test
+    fun selectedProfileChangesIpv4EgressAndCapturesUdpDns() {
+        val args = InstrumentationRegistry.getArguments()
+        assumeTrue("Egress checks require -e liveEgress true -e liveVpn true -e smallProbesOnly true",
+            args.getString("liveEgress") == "true" && args.getString("liveVpn") == "true" &&
+                args.getString("smallProbesOnly") == "true")
+        val context = ApplicationProvider.getApplicationContext<G2RayApplication>()
+        val connectivity = context.getSystemService(ConnectivityManager::class.java)
+        val physical = connectivity.getNetworkCapabilities(connectivity.activeNetwork)
+        assertTrue("A VPN-off cellular baseline is required",
+            physical?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true &&
+                !physical.hasTransport(NetworkCapabilities.TRANSPORT_VPN))
+        val physicalClient = OkHttpClient.Builder().proxy(Proxy.NO_PROXY).strictSyntheticRequests()
+            .callTimeout(12, TimeUnit.SECONDS).build()
+        val before = try {
+            observeIpv4Egress(physicalClient)
+        } finally {
+            physicalClient.connectionPool.evictAll()
+        }
+        try {
+            verifyUdpDnsCapture(timeoutMs = 1_500)
+            error("The mobile network also answered the reserved DNS destination; interception cannot be attributed")
+        } catch (_: SocketTimeoutException) {
+            // No matching answer without the VPN.
+        } catch (_: PortUnreachableException) {
+            // Some networks reject a reserved destination instead of dropping it.
+        }
+        runLiveTest(acceptanceCheck = { _, client ->
+            withContext(Dispatchers.IO) {
+                val after = observeIpv4Egress(client)
+                assertTrue("The tunneled request was observed at the same public IPv4 as the cellular baseline",
+                    before.ip != after.ip)
+                val link = requireNotNull(connectivity.getLinkProperties(connectivity.activeNetwork))
+                assertEquals(setOf("1.1.1.1", "8.8.8.8"), link.dnsServers.map { it.hostAddress }.toSet())
+                verifyUdpDnsCapture(timeoutMs = 7_000)
+                report("event=egress_verified physical_ip_reused=false " +
+                    "physical_country=${before.country} vpn_country=${after.country} " +
+                    "vpn_dns_link_configured=true test_net_udp_dns_captured=true")
+            }
+        })
+    }
+
+    private data class Ipv4Egress(val ip: String, val country: String)
+
+    private fun observeIpv4Egress(client: OkHttpClient): Ipv4Egress {
+        // Literal IPv4 separates egress observation from DNS availability and cache state.
+        val request = Request.Builder().url("https://1.1.1.1/cdn-cgi/trace")
+            .header("Cache-Control", "no-store").build()
+        return client.newCall(request).execute().use { response ->
+            assertEquals("IPv4 observer did not return a successful trace", 200, response.code)
+            val fields = requireNotNull(response.body).byteStream().use(::readBoundedTrace)
+            val address = fields.firstOrNull { it.startsWith("ip=") }?.substringAfter("ip=").orEmpty()
+            val octets = address.split('.')
+            require(octets.size == 4 && octets.all { it.matches(Regex("[0-9]{1,3}")) && it.toInt() <= 255 }) {
+                "The trace did not contain a numeric IPv4 address"
+            }
+            val country = fields.firstOrNull { it.startsWith("loc=") }?.substringAfter("loc=")
+                ?.takeIf { it.matches(Regex("[A-Z]{2}")) } ?: "unknown"
+            Ipv4Egress(address, country)
+        }
+    }
+
+    private fun verifyUdpDnsCapture(timeoutMs: Int) {
+        val id = kotlin.random.Random.nextInt(0x10000)
+        val query = ByteBuffer.allocate(64)
+        query.putShort(id.toShort()).putShort(0x0100).putShort(1)
+            .putShort(0).putShort(0).putShort(0)
+        for (label in listOf("example", "com")) {
+            val bytes = label.toByteArray(Charsets.US_ASCII)
+            query.put(bytes.size.toByte()).put(bytes)
+        }
+        query.put(0).putShort(1).putShort(1)
+        DatagramSocket().use { socket ->
+            // TEST-NET-1 has no public DNS service. A valid answer must be intercepted.
+            socket.connect(InetSocketAddress("192.0.2.1", 53))
+            socket.soTimeout = timeoutMs
+            socket.send(DatagramPacket(query.array(), query.position()))
+            val reply = DatagramPacket(ByteArray(512), 512)
+            socket.receive(reply)
+            assertTrue("DNS reply was shorter than its header", reply.length >= 12)
+            val header = ByteBuffer.wrap(reply.data, reply.offset, reply.length)
+            assertEquals("DNS reply transaction ID differs", id, header.getShort().toInt() and 0xffff)
+            assertEquals("DNS response was not a successful untruncated reply", 0x8000,
+                header.getShort().toInt() and 0x820f)
+            assertEquals("DNS response did not include the question", 1, header.getShort().toInt())
+            assertTrue("DNS response omitted its answer", (header.getShort().toInt() and 0xffff) > 0)
+        }
+    }
+
+    private fun traceIp(input: InputStream): String = readBoundedTrace(input)
+        .firstOrNull { it.startsWith("ip=") }?.substringAfter("ip=")
+        ?.takeIf { it.isNotBlank() } ?: error("Trace response omitted its IP")
+
+    private fun readBoundedTrace(input: InputStream): List<String> {
         val bytes = java.io.ByteArrayOutputStream()
         val buffer = ByteArray(1024)
         while (true) {
@@ -428,8 +526,7 @@ class LiveVpnDeviceTest {
             require(bytes.size() + count <= 16_384) { "Trace response exceeded its budget" }
             bytes.write(buffer, 0, count)
         }
-        return bytes.toString(Charsets.UTF_8.name()).lineSequence().firstOrNull { it.startsWith("ip=") }
-            ?.removePrefix("ip=")?.trim()?.takeIf { it.isNotBlank() } ?: error("Trace response omitted its IP")
+        return bytes.toString(Charsets.UTF_8.name()).lineSequence().map { it.trim() }.toList()
     }
 
     @Test

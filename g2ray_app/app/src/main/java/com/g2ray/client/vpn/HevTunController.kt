@@ -133,7 +133,6 @@ class HevTunController private constructor() {
             if (loadAttempted) return
             synchronized(this) {
                 if (loadAttempted) return
-                loadAttempted = true
                 try {
                     System.loadLibrary(LIBRARY_NAME)
                     nativeAvailable = true
@@ -142,6 +141,7 @@ class HevTunController private constructor() {
                     nativeAvailable = false
                     nativeLoadError = error.localizedMessage ?: error.javaClass.simpleName
                 }
+                loadAttempted = true
             }
         }
     }

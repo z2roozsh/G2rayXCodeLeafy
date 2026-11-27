@@ -20,6 +20,10 @@ __pycache__/
 /.env
 /.env.*
 /.dev.vars*
+*.jks
+*.keystore
+*.p12
+*.pfx
 /node_modules/
 /worker/codespace-waker/node_modules/
 /worker/codespace-waker/.wrangler/

@@ -164,6 +164,30 @@ ORIGINAL_RUN_GH="$(declare -f run_gh)"
 ORIGINAL_XRAY_RUNNING="$(declare -f xray_running)"
 reset_runtime_paths
 
+test_waker_panel_reports_typed_results_without_optional_id() (
+    local output fixture='{"ok":true,"status":202,"route_ready":false}'
+    waker_metadata_value() { return 0; }
+    curl() {
+        local header
+        IFS= read -r header || return 1
+        [[ "$header" == 'Authorization: Bearer fixture-secret' ]] || return 1
+        [[ " $* " != *' --data '* ]] || return 1
+        printf '%s' "$fixture"
+    }
+    output=$(test_cloudflare_waker 'https://waker.example/wake' fixture-secret) ||
+        fail "valid settling result with no optional ID failed"
+    [[ "$output" == *"ready=false"* ]] || fail "false route readiness was lost"
+    fixture='{"ok":false,"status":429}'
+    if test_cloudflare_waker 'https://waker.example/wake' fixture-secret >/dev/null; then
+        fail "the panel treated a rejected wake as success"
+    fi
+    fixture='{"ok":"true"}'
+    if test_cloudflare_waker 'https://waker.example/wake' fixture-secret >/dev/null; then
+        fail "the panel accepted an untyped result"
+    fi
+    pass "waker panel preserves typed false and reports failures without an optional ID"
+)
+
 test_tcp_fast_open_requires_explicit_opt_in() {
     (
         reset_runtime_paths
@@ -5646,6 +5670,7 @@ test_deadline_stops_term_resistant_writers
 test_deadline_fails_closed_without_temp_storage
 test_deadline_rejects_unverified_process_group
 test_post_start_propagates_silent_start_failure
+test_waker_panel_reports_typed_results_without_optional_id
 test_tcp_fast_open_requires_explicit_opt_in
 test_existing_config_upgrade_disables_unrequested_origin_tfo
 test_generate_config_respects_runtime_lock_for_entire_transaction

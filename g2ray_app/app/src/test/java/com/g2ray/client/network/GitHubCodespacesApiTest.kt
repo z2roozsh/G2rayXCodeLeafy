@@ -13,6 +13,35 @@ import retrofit2.Response
 
 class GitHubCodespacesApiTest {
     @Test
+    fun malformedStatusDoesNotReportReadinessOrRequestStart() = runTest {
+        for (document in listOf(
+            GitHubCodespaceResponse(name = "other-space", state = "Available"),
+            GitHubCodespaceResponse(name = "demo", state = " ")
+        )) {
+            val api = FakeGitHubApi(ArrayDeque(listOf(Response.success(document))))
+            val result = GitHubCodespaceCoordinator(api, nowMs = { 0L }).ensureAvailable("demo", "token")
+            assertTrue(result is GitHubCodespaceOutcome.Failed && result.controlPlaneUnavailable)
+            assertEquals(1, api.getCalls)
+            assertEquals(0, api.startCalls)
+        }
+    }
+
+    @Test
+    fun mismatchedStartReplyIsReconciledAgainstRequestedCodespace() = runTest {
+        val api = FakeGitHubApi(ArrayDeque(listOf(
+            Response.success(GitHubCodespaceResponse(name = "demo", state = "Shutdown")),
+            Response.success(GitHubCodespaceResponse(name = "demo", state = "Available"))
+        )), ArrayDeque(listOf(
+            Response.success(GitHubCodespaceResponse(name = "other-space", state = "Available"))
+        )))
+        val result = GitHubCodespaceCoordinator(api, nowMs = { 0L })
+            .ensureAvailable("demo", "token") as GitHubCodespaceOutcome.Ready
+        assertEquals("demo", result.response.name)
+        assertEquals(2, api.getCalls)
+        assertEquals(1, api.startCalls)
+    }
+
+    @Test
     fun deletedArchivedAndFailedCodespacesDoNotRetryForever() = runTest {
         for (state in listOf("Deleted", "Archived", "Failed")) {
             val api = FakeGitHubApi(ArrayDeque(listOf(Response.success(GitHubCodespaceResponse(state = state)))))

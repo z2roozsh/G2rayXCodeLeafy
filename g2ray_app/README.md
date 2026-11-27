@@ -41,7 +41,9 @@ The import screen also scans individual or all-config QRs. Select an account
 on Home to switch Codespaces without deleting saved profiles. Usage is a local
 estimate; GitHub billing is authoritative. The G2Ray Quick Settings tile can
 start or stop the selected VPN. Domain and app bypasses intentionally route
-matching traffic outside the tunnel.
+matching traffic outside the tunnel. HTTPS to the exact hosts used for
+connection checks remains tunneled for covered apps so a direct reply cannot
+verify a failing VPN.
 
 Wake setup is optional for an imported profile whose server is already running.
 Start VPN tries that profile directly even when no Worker or GitHub token is

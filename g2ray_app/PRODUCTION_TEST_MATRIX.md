@@ -567,6 +567,23 @@ the observation is not a pass. No video resolution, app settings, account
 data, or lock policy is changed. Repeat controlled visual/video acceptance
 separately before claiming smooth high-resolution or long-session playback.
 
+## Phone Exit and Streaming Acceptance
+
+The opt-in `LiveVpnDeviceTest#selectedProfileChangesIpv4EgressAndCapturesUdpDns`
+check requires a VPN-off cellular baseline. Pass `liveEgress=true`,
+`liveVpn=true`, `smallProbesOnly=true`, and the engine and transport to test.
+It compares HTTPS-observed IPv4 before and after VPN verification and requires
+that the same UDP DNS query to a reserved address receive no answer off VPN
+and a valid answer on VPN. This does not test browser DoH or IPv6 leakage.
+
+On 2026-11-26, the device check passed on HEV/XHTTP and Native/WebSocket.
+The user independently observed a US Microsoft exit in Chrome. BrowserLeaks
+reported only Cloudflare DNS resolvers, no public IPv6 for the phone, and
+the same public IPv4 for WebRTC and HTTPS. The WebRTC local address was
+G2Ray's tunnel interface. The user also reported a successful ChatGPT
+Temporary Chat stream; no timing was recorded. These are results for the
+tested phone and network, not crash, reboot, or dual-stack acceptance.
+
 ## v2rayNG A/B comparison
 
 For each client, run three alternating 15-minute rounds with the same config and physical network. Record median and p95 for:

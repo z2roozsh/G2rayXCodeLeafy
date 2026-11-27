@@ -2204,26 +2204,27 @@ test_cloudflare_waker() {
         return 1
     fi
 
+    if [[ "$wake_secret" =~ [[:cntrl:]] ]]; then
+        printf '  Wake secret contains a control character.\n'
+        return 1
+    fi
+    local -a args=(--request POST --max-time "$WAKER_TEST_TIMEOUT_SEC" --silent --show-error)
+    if [[ -n "$worker_codespace_id" ]]; then
+        args+=(--header "Content-Type: application/json" --data "{\"codespace_id\":\"$worker_codespace_id\"}")
+    fi
     echo -e "  ${DIM}Calling Worker with Authorization: Bearer ...${NC}"
-    response=$({
-        printf 'request = "POST"\n'
-        printf 'url = "%s"\n' "$worker_url"
-        printf 'max-time = "%s"\n' "$WAKER_TEST_TIMEOUT_SEC"
-        printf 'silent\nshow-error\n'
-        printf 'header = "Authorization: Bearer %s"\n' "$wake_secret"
-        [[ -n "$worker_codespace_id" ]] && printf 'header = "Content-Type: application/json"\ndata = "{\\"codespace_id\\":\\"%s\\"}"\n' "$worker_codespace_id"
-    } | curl --config - 2>&1) || {
+    response=$(printf 'Authorization: Bearer %s\n' "$wake_secret" |
+        curl -q "${args[@]}" --header @- --url "$worker_url") || {
         echo -e "  ${RED}Worker call failed.${NC}"
-        printf '%s\n' "$response" | sed 's/^/  /'
         return 1
     }
 
-    if command -v jq >/dev/null 2>&1 && printf '%s' "$response" | jq . >/dev/null 2>&1; then
+    if printf '%s' "$response" | jq -e 'type == "object" and (.ok | type == "boolean")' >/dev/null 2>&1; then
         ok=$(printf '%s' "$response" | jq -r '.ok // false' 2>/dev/null)
         status=$(printf '%s' "$response" | jq -r '.status // empty' 2>/dev/null)
         reason=$(printf '%s' "$response" | jq -r '.reason // empty' 2>/dev/null)
         codespace=$(printf '%s' "$response" | jq -r '.codespace // .body.name // empty' 2>/dev/null)
-        route_ready=$(printf '%s' "$response" | jq -r '.route_ready // empty' 2>/dev/null)
+        route_ready=$(printf '%s' "$response" | jq -r '.route_ready | select(type == "boolean")' 2>/dev/null)
         route_status=$(printf '%s' "$response" | jq -r '.route_probe.http_status // empty' 2>/dev/null)
         route_latency=$(printf '%s' "$response" | jq -r '.route_probe.latency_ms // empty' 2>/dev/null)
         next_action=$(printf '%s' "$response" | jq -r '.next_action // empty' 2>/dev/null)
@@ -2231,9 +2232,11 @@ test_cloudflare_waker() {
         [[ -n "$codespace" ]] && echo -e "  Codespace : ${WHITE}${codespace}${NC}"
         [[ -n "$route_ready" ]] && echo -e "  Route     : ${WHITE}ready=${route_ready} http=${route_status:-unknown} latency=${route_latency:-unknown}ms${NC}"
         [[ -n "$reason" ]] && echo -e "  Reason    : ${YELLOW}${reason}${NC}"
-        [[ -n "$next_action" ]] && echo -e "  Next      : ${WHITE}${next_action}${NC}"
+        [[ -z "$next_action" ]] || printf '  Next      : %s\n' "$next_action"
+        [[ "$ok" == true ]]
     else
-        printf '%s\n' "$response" | sed 's/^/  /'
+        printf '  Worker response could not be verified as a JSON result.\n'
+        return 1
     fi
 }
 
@@ -4304,7 +4307,11 @@ _generate_config_impl() {
         }
         had_previous_config=true
     fi
-    local profile_name handshake conn_idle uplink_only downlink_only buffer_size sniff_quic loglevel sniff_dest key value xhttp_export_mode xhttp_accept_mode
+    local profile_name handshake conn_idle uplink_only downlink_only buffer_size sniff_quic loglevel sniff_dest key value xhttp_export_mode xhttp_accept_mode error_log_json
+    error_log_json=$(jq -Rn --arg path "$LOG_DIR/xray-error.log" '$path') || {
+        rm -f "$previous_config" 2>/dev/null || true
+        return 1
+    }
     while IFS='=' read -r key value; do
         case "$key" in
             name) profile_name="$value" ;;
@@ -4371,7 +4378,7 @@ JSONEOF
     }
     cat > "$candidate_config" << JSONEOF
 {
-  "log": { "loglevel": "${loglevel}", "access": "none", "error": "${LOG_DIR}/xray-error.log" },
+  "log": { "loglevel": "${loglevel}", "access": "none", "error": ${error_log_json} },
   "stats": {},
   "api": { "tag": "api", "services": ["StatsService"] },
   "policy": {

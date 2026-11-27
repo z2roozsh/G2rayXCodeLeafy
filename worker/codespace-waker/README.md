@@ -189,8 +189,9 @@ For automation that only needs GitHub state and wants to avoid an external route
 
 ## Expected Responses
 
-- `200` with `ok: true`: GitHub accepted or handled the start request.
-- `route_ready: true`: the XHTTP route returned HTTP `200` during the Worker wait window, matching the pinned Xray handler's successful `OPTIONS` response and the panel classifier. HTTP `400` is treated as an error, not readiness.
+- `200` with `ok: true`: GitHub status was read successfully. Check `route_ready` separately.
+- `202`: poll health after the indicated delay. Only `start_accepted: true` confirms a new start; a transition or an ambiguous start reply is not a confirmation.
+- `route_ready: true`: the primary XHTTP route returned two stable HTTP `200` responses within the Worker wait window. This checks `OPTIONS`, not authenticated tunnel traffic.
 - `route_ready: false` with HTTP `404`: the Codespace started, but the GitHub route has not settled yet.
 - `route_ready: false` with HTTP `0`: DNS, TLS, or the app route did not answer before the Worker timeout.
 - `route_failure_reason`: machine-readable route reason such as `route_settling_404`, `timeout_or_unreachable`, `dns_tls_or_network_unreachable`, `edge_or_origin_error`, or `ready`.
@@ -210,7 +211,9 @@ For automation that only needs GitHub state and wants to avoid an external route
 - `402`: GitHub quota or billing blocked the start. If the option is available, mark the Codespace as **Keep codespace**, wait for quota reset or adjust GitHub billing settings, then start the same Codespace again. Org-owned or policy-managed Codespaces may have retention rules that override or hide this option.
 - `403`: GitHub token was accepted but cannot access Codespaces, commonly because the `codespace` scope is missing. The response reason may be `github_token_scope_missing`.
 - `404`: Codespace name is wrong or the token cannot access it.
+- `422` on wake: GitHub reported a terminal Codespace state; inspect the workspace before retrying.
 - `429`: Too many wrong wake-secret attempts, optional successful-wake cooldown, or GitHub rate limiting. Check `reason`, `retry_after_seconds`, and any `github_rate_limit_*` fields.
+- `503` on history with `history_unavailable`: optional KV records could not be read or parsed. This does not mean the Codespace is down.
 
 Optional anti-spam setting: with `WAKER_KV` configured, set `WAKE_COOLDOWN_SECONDS` as a **Plaintext** variable if you want a successful wake to block repeated wake calls for a short period. Leave it unset to allow immediate manual retries. Any nonzero value below `60` is treated as `60` because Cloudflare KV expiration TTLs require at least 60 seconds. For strict abuse protection on a public endpoint, use Cloudflare's native rate limiting or a Durable Object gate in addition to KV.
 

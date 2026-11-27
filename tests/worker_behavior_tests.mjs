@@ -403,8 +403,8 @@ async function testWakeSettlingIncludesRetryMetadata() {
   };
 
   const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({
-    ROUTE_WAIT_MS: "1",
-    ROUTE_POLL_INTERVAL_MS: "1"
+    ROUTE_WAIT_MS: "250",
+    ROUTE_POLL_INTERVAL_MS: "500"
   }), {});
   const body = await responseJson(response);
   assert.equal(response.status, 202);
@@ -1084,8 +1084,8 @@ async function testOptionalPortCannotMasqueradeAsPrimaryXhttpReadiness() {
     baseEnv({
       WAKER_KV: kv,
       GITHUB_TOKEN_PRIMARY: "primary-token",
-      ROUTE_WAIT_MS: "1",
-      ROUTE_POLL_INTERVAL_MS: "1"
+      ROUTE_WAIT_MS: "250",
+      ROUTE_POLL_INTERVAL_MS: "500"
     }),
     {}
   );
@@ -1311,7 +1311,7 @@ async function testHealthDoesNotClaimReadyFromSingleDeadlineProbe() {
 
   const response = await worker.fetch(
     makeRequest("/api/health"),
-    baseEnv({ ROUTE_WAIT_MS: "5", ROUTE_READY_STABLE_SLEEP_MS: "25" }),
+    baseEnv({ ROUTE_WAIT_MS: "250", ROUTE_READY_STABLE_SLEEP_MS: "500" }),
     {}
   );
   const body = await responseJson(response);
@@ -1351,7 +1351,7 @@ async function testHealthRequiresStableRouteReadiness() {
 
   const response = await worker.fetch(
     makeRequest("/api/health"),
-    baseEnv({ ROUTE_WAIT_MS: "5", ROUTE_READY_STABLE_SLEEP_MS: "25" }),
+    baseEnv({ ROUTE_WAIT_MS: "250", ROUTE_READY_STABLE_SLEEP_MS: "500" }),
     {}
   );
   const body = await responseJson(response);
@@ -1381,8 +1381,8 @@ async function testColdWakeReturnsAcceptedProgressWithoutHoldingRequestOpen() {
       statusCalls += 1;
       return new Response(JSON.stringify({
         name: "behavior-space",
-        state: "Starting",
-        pending_operation: true,
+        state: "Shutdown",
+        pending_operation: false,
         last_used_at: "2026-05-30T00:00:00Z",
         idle_timeout_minutes: 240
       }), {
@@ -1440,7 +1440,7 @@ async function testHistorySeparatesFailedProbeDurationFromReadyLatency() {
 
   await worker.fetch(
     makeRequest("/api/health"),
-    baseEnv({ WAKER_KV: kv, ROUTE_WAIT_MS: "5", ROUTE_POLL_INTERVAL_MS: "1" }),
+    baseEnv({ WAKER_KV: kv, ROUTE_WAIT_MS: "250", ROUTE_POLL_INTERVAL_MS: "500" }),
     {}
   );
   let history = await responseJson(await worker.fetch(makeRequest("/api/history"), baseEnv({ WAKER_KV: kv }), {}));
@@ -2128,7 +2128,7 @@ async function testWarmWakeCannotConfirmStabilityPastDeadline() {
   const body = await responseJson(response);
   assert.equal(response.status, 202);
   assert.equal(body.route_ready, false);
-  assert.equal(body.route_probe.stable_probes, 1);
+  assert.equal(body.route_probe.stable_probes, 0);
   assert.equal(body.route_probe.route_failure_reason, "route_stability_not_confirmed");
   assert.equal(routeCalls, 1);
   console.log("PASS: warm precheck cannot claim stable readiness after the route deadline");
@@ -2299,7 +2299,7 @@ async function testWorkerRegistrySelectsBoundTokenAndReturnsSafeDirectory() {
     if (url.includes("api.github.com")) {
       authorizations.push(init.headers?.authorization || "");
       return new Response(JSON.stringify({
-        name: "beta-space",
+        name: new URL(url).pathname.split("/").at(-1),
         state: "Available",
         pending_operation: false,
         idle_timeout_minutes: 120
@@ -2457,7 +2457,142 @@ async function testStalledOptionalHistoryCannotHoldAHealthyResponse() {
   }
 }
 
+async function testWakeUsesConfirmedCodespaceState() {
+  const fixtures = [
+    ["<html>Maintenance</html>", 502, "github_status_invalid"],
+    [JSON.stringify({ state: "Available", name: "other-space" }), 502, "github_status_invalid"],
+    [JSON.stringify({ state: "Starting" }), 202, "codespace_transition_pending"],
+    [JSON.stringify({ state: "Shutdown", pending_operation: true }), 202, "codespace_transition_pending"],
+    [JSON.stringify({ state: "Archived" }), 422, "codespace_unavailable"]
+  ];
+  for (const [payload, expectedStatus, reason] of fixtures) {
+    const methods = [];
+    globalThis.fetch = async (_url, init) => {
+      methods.push(init.method);
+      return new Response(payload);
+    };
+    const response = await worker.fetch(makeRequest("/api/wake"), baseEnv(), {});
+    const body = await responseJson(response);
+    assert.equal(response.status, expectedStatus);
+    assert.equal(body.reason, reason);
+    assert.notEqual(body.start_accepted, true);
+    assert.deepEqual(methods, ["GET"]);
+  }
+  const health = await worker.fetch(makeRequest("/api/health?route=false"), baseEnv(), {});
+  // A well-formed terminal state can be reported by the read-only endpoint.
+  assert.equal(health.status, 200);
+  globalThis.fetch = async () => new Response("<html>Maintenance</html>");
+  const invalid = await worker.fetch(makeRequest("/api/health?route=false"), baseEnv(), {});
+  assert.equal(invalid.status, 502);
+  console.log("PASS: wake checks document identity and avoids starting transitioning or terminal Codespaces");
+}
+
+async function testAmbiguousStartOnlyReportsPolling() {
+  for (const [status, payload] of [[304, null], [409, "{}"], [200, "<html>Maintenance</html>"]]) {
+    const kv = makeKv();
+    globalThis.fetch = async (_url, init) => init.method === "POST"
+      ? new Response(payload, { status })
+      : new Response(JSON.stringify({ state: "Shutdown" }));
+    const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({
+      WAKER_KV: kv, WAKE_COOLDOWN_SECONDS: "60"
+    }), {});
+    const body = await responseJson(response);
+    assert.equal(response.status, 202);
+    assert.equal(body.start_accepted, false);
+    assert.equal(body.route_ready, false);
+    assert.ok(body.poll_after_seconds > 0);
+    assert.equal(await kv.get("successful-wake:behavior-space"), null);
+  }
+  console.log("PASS: unconfirmed starts suggest polling without recording a successful start");
+}
+
+async function testGithubServerRetryAfterIsPreserved() {
+  const methods = [];
+  globalThis.fetch = async (_url, init) => {
+    methods.push(init.method);
+    return new Response("Temporarily unavailable", { status: 503, headers: { "retry-after": "90" } });
+  };
+  const response = await worker.fetch(makeRequest("/api/wake"), baseEnv(), {});
+  assert.equal(response.status, 502);
+  assert.equal(response.headers.get("retry-after"), "90");
+  assert.deepEqual(methods, ["GET"]);
+  console.log("PASS: GitHub transient failure with Retry-After does not retry the read or start");
+}
+
+async function testHistoryReadFailuresDoNotOverwriteRecords() {
+  const kv = makeKv();
+  const get = kv.get;
+  for (const unavailable of [true, false]) {
+    kv.get = async (key) => {
+      if (!key.startsWith("history:") && !key.startsWith("quota-incident:")) return get(key);
+      if (unavailable) throw new Error("fixture: read unavailable");
+      return "{";
+    };
+    globalThis.fetch = async () => new Response(JSON.stringify({
+      state: "Available", retention_period_minutes: 1440
+    }));
+    const pending = [];
+    const env = baseEnv({ WAKER_KV: kv });
+    const health = await worker.fetch(makeRequest("/api/health?route=false"), env, {
+      waitUntil(task) { pending.push(task); }
+    });
+    assert.equal(health.status, 200);
+    assert.equal((await responseJson(health)).retention_risk, "unknown");
+    await Promise.all(pending);
+    const history = await worker.fetch(makeRequest("/api/history"), env, {});
+    assert.equal(history.status, 503);
+  }
+  assert.equal(await get("history:behavior-space"), null);
+  assert.equal(await get("quota-incident:behavior-space"), null);
+  console.log("PASS: unavailable or corrupt KV history cannot erase records or misstate retention");
+}
+
+async function testWakeCooldownReturnsOnlyRemainingTime() {
+  const kv = makeKv();
+  await kv.put("successful-wake:behavior-space", new Date(Date.now() - 55_500).toISOString());
+  globalThis.fetch = async () => assert.fail("no upstream request during cooldown");
+  const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({
+    WAKER_KV: kv, WAKE_COOLDOWN_SECONDS: "60"
+  }), {});
+  assert.equal(response.status, 429);
+  assert.ok(Number(response.headers.get("retry-after")) > 0);
+  assert.ok(Number(response.headers.get("retry-after")) <= 5);
+  console.log("PASS: successful-wake cooldown advertises only its remaining interval");
+}
+
+async function testSecondRouteProbeAfterDeadlineIsNotCounted() {
+  const originalNow = Date.now;
+  let now = originalNow();
+  let calls = 0;
+  Date.now = () => now;
+  globalThis.fetch = async (url, init) => {
+    if (String(url).includes("api.github.com")) return new Response(JSON.stringify({ state: "Available" }));
+    assert.equal(init.method, "OPTIONS");
+    now += ++calls === 1 ? 250 : 251;
+    return new Response("", { status: 200 });
+  };
+  try {
+    const response = await worker.fetch(makeRequest("/api/wake"), baseEnv({
+      ROUTE_WAIT_MS: "500", ROUTE_READY_STABLE_SLEEP_MS: "0"
+    }), {});
+    const body = await responseJson(response);
+    assert.equal(response.status, 202);
+    assert.equal(body.route_ready, false);
+    assert.equal(body.route_probe.stable_probes, 1);
+    assert.equal(calls, 2);
+  } finally {
+    Date.now = originalNow;
+  }
+  console.log("PASS: a second successful reply arriving outside the primary budget cannot certify readiness");
+}
+
 try {
+  await testWakeUsesConfirmedCodespaceState();
+  await testAmbiguousStartOnlyReportsPolling();
+  await testGithubServerRetryAfterIsPreserved();
+  await testHistoryReadFailuresDoNotOverwriteRecords();
+  await testWakeCooldownReturnsOnlyRemainingTime();
+  await testSecondRouteProbeAfterDeadlineIsNotCounted();
   await testExistingWakeConfigurationRemainsCompatible();
   await testExplicitRegistryIdWinsOverAnotherNodesName();
   await testOverlappingGithubLimitsRespectTheLaterReset();

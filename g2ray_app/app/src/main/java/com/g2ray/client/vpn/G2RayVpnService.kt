@@ -168,6 +168,7 @@ class G2RayVpnService : VpnService() {
     private var desiredConnected = false
     private var routeReverifyJob: Job? = null
     private var networkHandoffJob: Job? = null
+    private var networkMonitorRetryJob: Job? = null
     @Volatile
     private var routeRecoveryInProgress = false
     private var activeProfile: G2RayProfile? = null
@@ -1549,7 +1550,7 @@ class G2RayVpnService : VpnService() {
         cleanupTunnel(
             finalState = if (retainingInterface) TunnelState.Blocked else TunnelState.Error,
             finalMessage = if (retainingInterface) {
-                "$message Internet remains blocked. Retry after correcting the settings, or disconnect explicitly."
+                "$message Traffic from apps covered by this VPN remains blocked. Retry after correcting the settings, or disconnect explicitly."
             } else {
                 "$message No capture interface is available; enable Android's Block connections without VPN."
             },
@@ -2965,8 +2966,9 @@ class G2RayVpnService : VpnService() {
         }
     }
 
+    @Synchronized
     private fun registerUnderlyingNetworkMonitor() {
-        if (underlyingNetworkCallback != null) {
+        if (destroyed || underlyingNetworkCallback != null) {
             return
         }
         val connectivityManager = getSystemService(ConnectivityManager::class.java)
@@ -2980,19 +2982,20 @@ class G2RayVpnService : VpnService() {
             lostUnderlyingNetworks.clear()
         }
 
+        var mergingInitialSnapshot = true
         val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                if (underlyingNetworkCallback !== this) {
-                    return
+            override fun onAvailable(network: Network) = synchronized(this@G2RayVpnService) {
+                if (underlyingNetworkCallback !== this || destroyed) {
+                    return@synchronized
                 }
                 if (usesPlatformBestUnderlyingNetwork) {
                     applyUnderlyingNetwork(network, triggerVerification = true)
-                    return
+                    return@synchronized
                 }
                 synchronized(availableUnderlyingNetworks) {
                     lostUnderlyingNetworks.remove(network)
                 }
-                if (underlyingNetwork != null) return
+                if (underlyingNetwork != null) return@synchronized
                 // The request itself guarantees INTERNET + NOT_VPN. Use this
                 // provisional network immediately on older Android releases;
                 // onCapabilitiesChanged will score and replace it if needed.
@@ -3002,9 +3005,9 @@ class G2RayVpnService : VpnService() {
             override fun onCapabilitiesChanged(
                 network: Network,
                 networkCapabilities: NetworkCapabilities
-            ) {
-                if (underlyingNetworkCallback !== this) {
-                    return
+            ) = synchronized(this@G2RayVpnService) {
+                if (underlyingNetworkCallback !== this || destroyed) {
+                    return@synchronized
                 }
                 if (usesPlatformBestUnderlyingNetwork) {
                     applyUnderlyingNetwork(
@@ -3013,7 +3016,7 @@ class G2RayVpnService : VpnService() {
                         },
                         triggerVerification = true
                     )
-                    return
+                    return@synchronized
                 }
                 synchronized(availableUnderlyingNetworks) {
                     if (underlyingNetworkScore(networkCapabilities) == Int.MIN_VALUE) {
@@ -3042,18 +3045,18 @@ class G2RayVpnService : VpnService() {
                 }
             }
 
-            override fun onLost(network: Network) {
-                if (underlyingNetworkCallback !== this) {
-                    return
+            override fun onLost(network: Network) = synchronized(this@G2RayVpnService) {
+                if (underlyingNetworkCallback !== this || destroyed) {
+                    return@synchronized
                 }
                 if (usesPlatformBestUnderlyingNetwork) {
                     if (underlyingNetwork == network) {
                         applyUnderlyingNetwork(null, triggerVerification = true)
                     }
-                    return
+                    return@synchronized
                 }
                 synchronized(availableUnderlyingNetworks) {
-                    lostUnderlyingNetworks.add(network)
+                    if (mergingInitialSnapshot) lostUnderlyingNetworks.add(network)
                     availableUnderlyingNetworks.remove(network)
                 }
                 applyUnderlyingNetwork(
@@ -3068,26 +3071,56 @@ class G2RayVpnService : VpnService() {
             .build()
         underlyingNetworkCallback = callback
         usesPlatformBestUnderlyingNetwork = false
-        val callbackRegistered = runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                usesPlatformBestUnderlyingNetwork = true
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            usesPlatformBestUnderlyingNetwork = true
+            val registered = runCatching {
                 registerPlatformBestNetworkCallback(connectivityManager, request, callback)
-            } else {
-                connectivityManager.registerNetworkCallback(request, callback)
-            }
-        }.isSuccess
-        if (!callbackRegistered) {
-            underlyingNetworkCallback = null
+            }.isSuccess
+            if (registered) return
             usesPlatformBestUnderlyingNetwork = false
-            seedUnderlyingNetworks(connectivityManager)
-        } else if (!usesPlatformBestUnderlyingNetwork) {
-            mergeUnderlyingNetworkSnapshot(connectivityManager)
         }
-        if (!callbackRegistered || !usesPlatformBestUnderlyingNetwork) {
-            applyUnderlyingNetwork(
-                network = preferredUnderlyingNetwork(),
-                triggerVerification = false
-            )
+
+        fun registerRegularCallback(): Boolean =
+            runCatching {
+                connectivityManager.registerNetworkCallback(request, callback)
+            }.isSuccess
+
+        fun publishSnapshot(registered: Boolean, verify: Boolean) {
+            try {
+                if (registered) mergeUnderlyingNetworkSnapshot(connectivityManager)
+                else seedUnderlyingNetworks(connectivityManager)
+            } catch (error: RuntimeException) {
+                Log.w("G2RayVpnService", "Unable to read the underlying network snapshot", error)
+                return
+            } finally {
+                mergingInitialSnapshot = false
+                synchronized(availableUnderlyingNetworks) { lostUnderlyingNetworks.clear() }
+            }
+            applyUnderlyingNetwork(preferredUnderlyingNetwork(), triggerVerification = verify)
+        }
+
+        val registered = registerRegularCallback()
+        publishSnapshot(registered, verify = false)
+        if (!registered) {
+            // The first snapshot can be empty when Android is offline.
+            // Poll only until a callback is registered, or this capture ends.
+            networkMonitorRetryJob = scope.launch {
+                while (isActive) {
+                    delay(5_000)
+                    synchronized(this@G2RayVpnService) {
+                        if (destroyed || underlyingNetworkCallback !== callback) return@launch
+                        mergingInitialSnapshot = true
+                        // Do not merge stale candidates from the previous poll.
+                        synchronized(availableUnderlyingNetworks) { availableUnderlyingNetworks.clear() }
+                        val retryRegistered = registerRegularCallback()
+                        publishSnapshot(retryRegistered, verify = true)
+                        if (retryRegistered) {
+                            networkMonitorRetryJob = null
+                            return@launch
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -3322,9 +3355,12 @@ class G2RayVpnService : VpnService() {
         }
     }
 
+    @Synchronized
     private fun unregisterUnderlyingNetworkMonitor() {
         val callback = underlyingNetworkCallback
         underlyingNetworkCallback = null
+        networkMonitorRetryJob?.cancel()
+        networkMonitorRetryJob = null
         usesPlatformBestUnderlyingNetwork = false
         networkHandoffJob?.cancel()
         networkHandoffJob = null

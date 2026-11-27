@@ -14,6 +14,28 @@ import org.robolectric.RobolectricTestRunner
 @RunWith(RobolectricTestRunner::class)
 class XrayConfigBuilderTest {
     @Test
+    fun overlappingDomainBypassesNeverCertifyADirectHealthReply() {
+        val selected = testXhttpProfile().copy(address = "203.0.113.1")
+        for (engine in ActiveVpnEngine.entries) for (balanced in listOf(false, true)) {
+            val root = JSONObject(XrayConfigBuilder.buildVpnConfig(
+                selected, engine = engine,
+                fallbackProfiles = if (balanced) listOf(selected.copy(address = "203.0.113.2")) else emptyList(),
+                routingPolicy = RoutingPolicy(false, listOf("cloudflare.com", "www.gstatic.com", "notapple.com"))
+            ))
+            val rules = root.getJSONObject("routing").getJSONArray("rules")
+            val health = rules.getJSONObject(2)
+            assertEquals("tcp", health.getString("network"))
+            assertEquals("443", health.getString("port"))
+            assertEquals("""["full:cp.cloudflare.com","full:www.gstatic.com"]""", health.getJSONArray("domain").toString())
+            assertTrue(health.getJSONArray("inboundTag").toString().contains(
+                if (engine == ActiveVpnEngine.Hev) "tun-socks" else "tun-in"
+            ))
+            assertTrue(if (balanced) health.has("balancerTag") else health.getString("outboundTag") == "proxy")
+            assertEquals("bypass", rules.getJSONObject(3).getString("outboundTag"))
+        }
+    }
+
+    @Test
     fun explicitDomainBypassIsScopedAndKeepsDnsProxiedAcrossEngines() {
         for (engine in ActiveVpnEngine.entries) for (fakeDns in listOf(false, true)) for (balanced in listOf(false, true)) {
             val profile = testXhttpProfile().copy(address = "203.0.113.1")

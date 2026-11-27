@@ -162,7 +162,25 @@ function wakeFastPathEnabled(env = {}) {
 
 async function alreadyWarmCodespaceData(name, token, env, routePorts = [codespacePort(env)]) {
   const status = await getCodespaceStatus(name, token, env);
-  if (!isCodespaceAvailable(status)) return { status, data: null };
+  if (!status.ok) return { status, data: status };
+  if (!isCodespaceAvailable(status)) {
+    const state = status.state.toLowerCase();
+    if (["deleted", "archived", "failed"].includes(state)) {
+      return { status, data: { ...status, ok: false, status: 422, start_accepted: false,
+        route_ready: false, reason: "codespace_unavailable",
+        next_action: "Inspect the Codespace in GitHub before retrying.",
+        message: `GitHub reports that the Codespace is ${status.state}.` } };
+    }
+    if (["shutdown", "stopped"].includes(state) && !status.pending_operation) {
+      return { status, data: null };
+    }
+    return { status, data: {
+      ...status, route_ready: false, route_checked: false, start_accepted: false,
+      reason: "codespace_transition_pending",
+      next_action_code: "wait_codespace_available",
+      message: `GitHub reports ${status.state}. Check health before requesting another start.`
+    } };
+  }
   // A GitHub start call cannot repair a Codespace that is already Available.
   // Keep that distinction honest: report the existing edge state and let the
   // caller poll rather than issuing a needless /start request.
@@ -281,8 +299,14 @@ async function handleHistory(request, env) {
   const context = await requireAuthorizedContext(request, env, { githubToken: false });
   if (!context.ok) return json(context.body, context.status, retryHeaders(context.body));
 
-  const history = await readHistory(env, context.codespaceName);
-  const quotaIncident = await readQuotaIncident(env, context.codespaceName);
+  let history, quotaIncident;
+  try {
+    [history, quotaIncident] = await Promise.all([
+      readHistory(env, context.codespaceName), readQuotaIncident(env, context.codespaceName)
+    ]);
+  } catch {
+    return json({ ok: false, error: "history_unavailable" }, 503);
+  }
   return json({
     ok: true,
     codespace_id: context.codespaceId,
@@ -608,6 +632,11 @@ async function rateLimitSuccessfulWake(codespaceName, env) {
   try {
     const raw = await withKvDeadline(() => env.WAKER_KV.get(key));
     if (!raw) return null;
+    const startedAt = Date.parse(raw);
+    const remaining = Number.isFinite(startedAt)
+      ? Math.min(seconds, Math.ceil((startedAt + seconds * 1000 - Date.now()) / 1000))
+      : seconds;
+    if (remaining <= 0) return null;
     return {
       ok: false,
       status: 429,
@@ -616,7 +645,7 @@ async function rateLimitSuccessfulWake(codespaceName, env) {
         status: 429,
         codespace: codespaceName,
         reason: "wake_recently_succeeded",
-        retry_after_seconds: seconds,
+        retry_after_seconds: remaining,
         message: "A wake request already succeeded recently. Wait before sending another start request."
       }
     };
@@ -682,10 +711,6 @@ async function sha256Hex(value) {
 }
 
 async function startCodespaceData(name, token, env, priorStatus = null, routePorts = [codespacePort(env)]) {
-  // A definitive status failure must not turn a read into a start attempt.
-  if (priorStatus?.ok === false && [401, 402, 403, 404, 429].includes(priorStatus.status)) {
-    return priorStatus;
-  }
   const endpoint = `https://api.github.com/user/codespaces/${encodeURIComponent(name)}/start`;
   let res, body;
   try {
@@ -728,8 +753,15 @@ async function startCodespaceData(name, token, env, priorStatus = null, routePor
     return githubFailure;
   }
 
-  const accepted = res.ok || res.status === 202 || res.status === 304 || res.status === 409;
-  if (!accepted) {
+  if (res.status === 304 || res.status === 409 || (res.ok && !validCodespaceDocument(body, name))) {
+    return {
+      ok: true, status: res.status, codespace: name, start_accepted: false,
+      route_checked: false, route_ready: false, reason: "codespace_transition_pending",
+      next_action_code: "wait_codespace_available",
+      message: "The start was not confirmed. Poll GitHub state before issuing another start."
+    };
+  }
+  if (!res.ok) {
     return {
       ok: false,
       status: res.status,
@@ -751,7 +783,7 @@ async function startCodespaceData(name, token, env, priorStatus = null, routePor
     start_accepted: true,
     codespace: name,
     reason: "codespace_start_accepted",
-    state: startBody.state || priorStatus?.state || "Starting",
+    state: startBody.state.trim(),
     pending_operation: startBody.pending_operation ?? true,
     last_used_at: startBody.last_used_at || priorStatus?.last_used_at || null,
     idle_timeout_minutes: startBody.idle_timeout_minutes || priorStatus?.idle_timeout_minutes || null,
@@ -782,6 +814,12 @@ async function startCodespaceData(name, token, env, priorStatus = null, routePor
     next_action_code: "wait_codespace_available",
     message: "Codespace start request accepted. Route readiness will be checked separately so this request does not time out."
   };
+}
+
+function validCodespaceDocument(body, name) {
+  return typeof body?.state === "string" && body.state.trim().length > 0 &&
+    (body.name === undefined || body.name === name) &&
+    (body.pending_operation == null || typeof body.pending_operation === "boolean");
 }
 
 async function getCodespaceStatus(codespaceName, token, env) {
@@ -821,11 +859,17 @@ async function getCodespaceStatus(codespaceName, token, env) {
     };
   }
 
+  if (!validCodespaceDocument(body, codespaceName)) {
+    return {
+      ok: false, status: 502, codespace: codespaceName,
+      reason: "github_status_invalid", message: "GitHub returned an invalid Codespace status."
+    };
+  }
   return {
     ok: true,
     status: res.status,
     codespace: codespaceName,
-    state: body && typeof body === "object" ? body.state || null : null,
+    state: body.state.trim(),
     pending_operation: body && typeof body === "object" ? Boolean(body.pending_operation) : null,
     last_used_at: body && typeof body === "object" ? body.last_used_at || null : null,
     idle_timeout_minutes: body && typeof body === "object" ? body.idle_timeout_minutes || null : null,
@@ -838,6 +882,15 @@ async function getCodespaceStatus(codespaceName, token, env) {
 
 function githubFailureForResponse(res, body, codespaceName) {
   const rateFields = githubRateFields(res);
+  if (res.status >= 500 && rateFields.retry_after_seconds > 0) {
+    return {
+      ok: false, status: res.status, codespace: codespaceName,
+      reason: "github_retry_later", retry_after_seconds: rateFields.retry_after_seconds,
+      next_action: "Wait for the retry interval, then check GitHub status.",
+      next_action_code: "wait_github_retry",
+      message: "GitHub is temporarily unavailable. Wait for the requested retry interval."
+    };
+  }
   if (res.status === 429) {
     return {
       ok: false,
@@ -968,6 +1021,7 @@ function githubHeaders(token) {
 }
 
 function responseStatusFor(data) {
+  if (data.ok && data.reason === "codespace_transition_pending") return 202;
   if (data.ok && data.start_accepted && data.route_ready !== true) return 202;
   if (
     data.ok &&
@@ -976,7 +1030,7 @@ function responseStatusFor(data) {
     (isRouteSettlingStatus(data.route_probe) || data.route_probe?.error === "route_stability_not_confirmed")
   ) return 202;
   if (data.ok) return 200;
-  if ([401, 402, 403, 404, 429].includes(data.status)) return data.status;
+  if ([401, 402, 403, 404, 422, 429].includes(data.status)) return data.status;
   return 502;
 }
 
@@ -1013,7 +1067,7 @@ function withSurvivalFields(data, env) {
   const quotaBlocked = data.reason === "quota_or_billing_blocked" || Number(data.status) === 402;
   const retentionPeriod = normalizeNullableNumber(data.retention_period_minutes);
   const retentionExpires = data.retention_expires_at || null;
-  const retentionRisk = retentionRiskFor(retentionExpires, retentionPeriod, now);
+  const retentionRisk = retentionRiskFor(retentionExpires, now);
   const resetEstimate = nextMonthlyQuotaResetIso(now);
   const survivalNextAction = survivalNextActionFor({
     ...data,
@@ -1074,8 +1128,8 @@ function normalizeNullableNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
-function retentionRiskFor(retentionExpiresAt, retentionPeriodMinutes, now) {
-  if (!retentionExpiresAt) return retentionPeriodMinutes == null ? "unknown" : "safe";
+function retentionRiskFor(retentionExpiresAt, now) {
+  if (!retentionExpiresAt) return "unknown";
   const expires = Date.parse(retentionExpiresAt);
   if (!Number.isFinite(expires)) return "unknown";
   const remaining = expires - now.getTime();
@@ -1418,26 +1472,20 @@ function shouldWriteQuotaIncident(env, existing, incident, nowIso) {
 
 async function readHistory(env, codespace) {
   if (!env.WAKER_KV) return [];
-
-  try {
-    const text = await withKvDeadline(() => env.WAKER_KV.get(historyKey(codespace)));
-    const parsed = text ? JSON.parse(text) : [];
-    return Array.isArray(parsed) ? parsed.slice(0, HISTORY_LIMIT) : [];
-  } catch {
-    return [];
-  }
+  const text = await withKvDeadline(() => env.WAKER_KV.get(historyKey(codespace)));
+  const parsed = text == null ? [] : JSON.parse(text);
+  if (!Array.isArray(parsed)) throw new Error("invalid_history");
+  return parsed.slice(0, HISTORY_LIMIT);
 }
 
 async function readQuotaIncident(env, codespace) {
   if (!env.WAKER_KV) return null;
 
-  try {
-    const text = await withKvDeadline(() => env.WAKER_KV.get(quotaIncidentKey(codespace)));
-    const parsed = text ? JSON.parse(text) : null;
-    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
+  const text = await withKvDeadline(() => env.WAKER_KV.get(quotaIncidentKey(codespace)));
+  if (text == null) return null;
+  const parsed = JSON.parse(text);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid_quota_incident");
+  return parsed;
 }
 
 function historyKey(codespace) {
@@ -1625,7 +1673,7 @@ async function probeCodespaceRoutes(name, routePorts, env, options = {}) {
     if (index > 0) {
       probe = await probeXhttpRoute(name, port, 1, startedAt, env);
     } else if (options.warm === true) {
-      const firstProbe = await probeXhttpRoute(name, port, 1, startedAt, env);
+      const firstProbe = await probeXhttpRoute(name, port, 1, startedAt, env, routeDeadline(env, startedAt));
       // Confirm concurrently with optional diagnostics, on this port's budget.
       probe = firstProbe.usable
         ? await waitForXhttpRoute(name, port, env, firstProbe, startedAt)
@@ -1652,11 +1700,14 @@ async function probeCodespaceRoutes(name, routePorts, env, options = {}) {
   };
 }
 
+function routeDeadline(env, startedAt) {
+  return startedAt + configuredMs(env, "ROUTE_WAIT_MS", ROUTE_WAIT_MS, 1, 300000);
+}
+
 async function waitForXhttpRoute(name, port, env, initialProbe = null, startedAt = Date.now()) {
-  const routeWaitMs = configuredMs(env, "ROUTE_WAIT_MS", ROUTE_WAIT_MS, 1, 300000);
   const pollIntervalMs = configuredMs(env, "ROUTE_POLL_INTERVAL_MS", ROUTE_POLL_INTERVAL_MS, 1, 60000);
   const stableSleepMs = configuredMs(env, "ROUTE_READY_STABLE_SLEEP_MS", ROUTE_READY_STABLE_SLEEP_MS, 0, 10000);
-  const deadline = startedAt + routeWaitMs;
+  const deadline = routeDeadline(env, startedAt);
   let attempts = 0;
   let stableProbes = 0;
   let last = {
@@ -1674,8 +1725,11 @@ async function waitForXhttpRoute(name, port, env, initialProbe = null, startedAt
     attempts += 1;
     last = initialProbe
       ? { ...initialProbe, attempts, waited_ms: Date.now() - startedAt }
-      : await probeXhttpRoute(name, port, attempts, startedAt, env);
+      : await probeXhttpRoute(name, port, attempts, startedAt, env, deadline);
     initialProbe = null;
+    if (last.error === "route_stability_not_confirmed") {
+      return { ...last, stable_probes: stableProbes };
+    }
     if (last.usable) {
       stableProbes += 1;
       last.stable_probes = stableProbes;
@@ -1704,12 +1758,22 @@ async function waitForXhttpRoute(name, port, env, initialProbe = null, startedAt
   return last;
 }
 
-async function probeXhttpRoute(name, port, attempts = 1, startedAt = Date.now(), env = {}) {
+async function probeXhttpRoute(name, port, attempts = 1, startedAt = Date.now(), env = {}, deadline = Infinity) {
   const url = routeUrl(name, port, env);
   const probeStartedAt = Date.now();
+  const timedOut = {
+    url, usable: false, http_status: 0, latency_ms: null, attempts, stable_probes: 0,
+    error: "route_stability_not_confirmed",
+    route_failure_reason: "route_stability_not_confirmed"
+  };
+  const remaining = deadline - probeStartedAt;
+  if (remaining <= 0) return { ...timedOut, waited_ms: probeStartedAt - startedAt };
   try {
-    const timeoutMs = configuredMs(env, "ROUTE_FETCH_TIMEOUT_MS", ROUTE_FETCH_TIMEOUT_MS, 100, 30000);
+    const timeoutMs = Math.min(remaining, configuredMs(env, "ROUTE_FETCH_TIMEOUT_MS", ROUTE_FETCH_TIMEOUT_MS, 100, 30000));
     const res = await fetchWithTimeout(url, { method: "OPTIONS", redirect: "manual" }, timeoutMs);
+    if (isRouteStatusUsable(res.status) && Date.now() >= deadline) {
+      return { ...timedOut, http_status: res.status, waited_ms: Date.now() - startedAt };
+    }
     return {
       url,
       usable: isRouteStatusUsable(res.status),
@@ -1786,6 +1850,7 @@ async function githubFetchWithRetry(input, init = {}, timeoutMs = FETCH_TIMEOUT_
 }
 
 function shouldRetryGithubResponse(response) {
+  if (parseNullableInt(response?.headers.get("retry-after")) > 0) return false;
   const status = Number(response && response.status || 0);
   return status === 502 || status === 503 || status === 504;
 }

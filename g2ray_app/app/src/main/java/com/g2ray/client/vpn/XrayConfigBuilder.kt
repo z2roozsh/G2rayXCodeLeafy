@@ -3,6 +3,7 @@ package com.g2ray.client.vpn
 import com.g2ray.client.model.G2RayProfile
 import com.g2ray.client.model.ActiveVpnEngine
 import com.g2ray.client.model.Transport
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -200,15 +201,30 @@ object XrayConfigBuilder {
                     put("inboundTag", JSONArray().put(DNS_INBOUND_TAG))
                     putProxyTarget(balancedRoutes)
                 })
-                if (routingPolicy.hasDomainBypass) put(JSONObject().apply {
-                    put("type", "field")
-                    put("inboundTag", dnsIngressTags)
-                    put("domain", JSONArray().apply {
-                        if (routingPolicy.bypassIranianDomains) put("domain:ir")
-                        routingPolicy.bypassDomains.forEach { put("domain:$it") }
+                if (routingPolicy.hasDomainBypass) {
+                    val verificationHosts = SocksRunningRouteProbe.HEALTH_URLS.map { it.toHttpUrl().host }
+                        .filter { host ->
+                            routingPolicy.bypassDomains.any { host == it || host.endsWith(".$it") }
+                        }
+                    // A successful direct reply must not verify the VPN path.
+                    if (verificationHosts.isNotEmpty()) put(JSONObject().apply {
+                        put("type", "field")
+                        put("inboundTag", dnsIngressTags)
+                        put("network", "tcp")
+                        put("port", "443")
+                        put("domain", JSONArray(verificationHosts.map { "full:$it" }))
+                        putProxyTarget(balancedRoutes)
                     })
-                    put("outboundTag", "bypass")
-                })
+                    put(JSONObject().apply {
+                        put("type", "field")
+                        put("inboundTag", dnsIngressTags)
+                        put("domain", JSONArray().apply {
+                            if (routingPolicy.bypassIranianDomains) put("domain:ir")
+                            routingPolicy.bypassDomains.forEach { put("domain:$it") }
+                        })
+                        put("outboundTag", "bypass")
+                    })
+                }
                 // Codespaces XHTTP is a TCP-oriented path. Force browser QUIC
                 // to fall back to the same TCP transport used by the server.
                 put(JSONObject().apply {

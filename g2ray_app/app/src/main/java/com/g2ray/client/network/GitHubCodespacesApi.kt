@@ -1,5 +1,7 @@
 package com.g2ray.client.network
 
+import com.squareup.moshi.JsonDataException
+
 import com.squareup.moshi.Moshi
 import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import kotlinx.coroutines.delay
@@ -151,6 +153,11 @@ class GitHubCodespaceCoordinator(
         var uncertainStartFailure: String? = if (reconcileUncertainWorkerWake) "Worker wake response was lost" else null
         var uncertainStoppedChecks = 0
         var consecutiveServerErrors = 0
+        suspend fun sleepBeforePoll(requestedMs: Long) {
+            val remainingMs = (maxWaitMs - (nowMs() - startedAt)).coerceAtLeast(0L)
+            val delayMs = minOf(requestedMs, remainingMs)
+            if (delayMs > 0) sleep(delayMs)
+        }
 
         while (attempts < maxAttempts && nowMs() - startedAt < maxWaitMs) {
             attempts++
@@ -168,6 +175,11 @@ class GitHubCodespaceCoordinator(
 
             val statusResponse = try {
                 apiService.getCodespace(normalizedName, authorization)
+            } catch (_: JsonDataException) {
+                return GitHubCodespaceOutcome.Failed(
+                    "GitHub returned an invalid Codespace status.",
+                    controlPlaneUnavailable = true
+                )
             } catch (error: IOException) {
                 currentCoroutineContext().ensureActive()
                 return GitHubCodespaceOutcome.Failed(
@@ -182,7 +194,7 @@ class GitHubCodespaceCoordinator(
                     if (consecutiveServerErrors >= 3 || statusResponse.headers()["Retry-After"] != null) {
                         return failureFrom(statusResponse, controlPlaneUnavailable = true)
                     }
-                    sleep((consecutiveServerErrors * 1_000L).coerceAtMost(3_000L))
+                    sleepBeforePoll((consecutiveServerErrors * 1_000L).coerceAtMost(3_000L))
                     continue
                 }
                 return failureFrom(statusResponse)
@@ -190,11 +202,17 @@ class GitHubCodespaceCoordinator(
             consecutiveServerErrors = 0
 
             val codespace = statusResponse.body()
-                ?: return GitHubCodespaceOutcome.Failed("GitHub returned an empty Codespace response.")
+            if (codespace == null || !identifiesCodespace(codespace, normalizedName)) {
+                return GitHubCodespaceOutcome.Failed(
+                    "GitHub status did not identify the requested Codespace state.",
+                    controlPlaneUnavailable = true
+                )
+            }
+            val state = codespace.state.orEmpty().trim().lowercase()
             if (uncertainStartFailure != null &&
-                (codespace.pending_operation == true || codespace.state.orEmpty().lowercase() !in setOf("shutdown", "stopped"))
+                (codespace.pending_operation == true || state !in setOf("shutdown", "stopped"))
             ) uncertainStoppedChecks = 0
-            when (codespace.state.orEmpty().lowercase()) {
+            when (state) {
                 "available" -> if (codespace.pending_operation != true) {
                     return GitHubCodespaceOutcome.Ready(codespace)
                 }
@@ -230,21 +248,27 @@ class GitHubCodespaceCoordinator(
                         )
                         val startResponse = try {
                             apiService.startCodespace(normalizedName, authorization)
+                        } catch (_: JsonDataException) {
+                            startRequested = true
+                            uncertainStartFailure = "GitHub returned an invalid start response"
+                            sleepBeforePoll(POLL_INTERVAL_MS)
+                            continue
                         } catch (error: IOException) {
                             currentCoroutineContext().ensureActive()
                             // The server may have accepted the POST even if its response was lost.
                             // Check status before allowing a later recovery attempt to retry it.
                             uncertainStartFailure = error.localizedMessage ?: "network unavailable"
                             startRequested = true
-                            sleep(minOf(POLL_INTERVAL_MS, (maxWaitMs - (nowMs() - startedAt)).coerceAtLeast(0L)))
+                            sleepBeforePoll(POLL_INTERVAL_MS)
                             continue
                         }
                         if (startResponse.isSuccessful) {
                             startRequested = true
                             val started = startResponse.body()
-                            if (
-                                started != null &&
-                                started.state.equals("available", ignoreCase = true) &&
+                            if (started == null || !identifiesCodespace(started, normalizedName)) {
+                                uncertainStartFailure = "GitHub returned an unconfirmed start response"
+                            } else if (
+                                started.state?.trim().equals("available", ignoreCase = true) &&
                                 started.pending_operation != true
                             ) {
                                 return GitHubCodespaceOutcome.Ready(started)
@@ -260,7 +284,7 @@ class GitHubCodespaceCoordinator(
                             if (startResponse.headers()["Retry-After"] != null) {
                                 return failureFrom(startResponse, controlPlaneUnavailable = true)
                             }
-                            sleep(POLL_INTERVAL_MS)
+                            sleepBeforePoll(POLL_INTERVAL_MS)
                             continue
                         } else {
                             return failureFrom(startResponse)
@@ -269,13 +293,16 @@ class GitHubCodespaceCoordinator(
                 }
             }
 
-            sleep(POLL_INTERVAL_MS)
+            sleepBeforePoll(POLL_INTERVAL_MS)
         }
 
         return GitHubCodespaceOutcome.TimedOut(
             "GitHub did not make the Codespace available within ${maxWaitMs / 1000}s."
         )
     }
+
+    private fun identifiesCodespace(response: GitHubCodespaceResponse, expectedName: String): Boolean =
+        !response.state.isNullOrBlank() && (response.name == null || response.name == expectedName)
 
     private fun failureFrom(
         response: Response<GitHubCodespaceResponse>,
